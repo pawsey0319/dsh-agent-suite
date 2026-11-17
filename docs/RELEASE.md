@@ -75,3 +75,18 @@ plugin_manager remove_bundle @local/dsh-task-radar   # 其余三个同理
 - WorkBuddy 驱动需要重启它的实例（单实例锁），会提示你确认；「需要人确认」会自动推到胶囊。
 - 阶段/进度只对声明了阶段计划的任务有意义；普通会话在 DSH 里没有结构化阶段字段。
 - R4 的「内嵌原生视图」已按用户裁定退役，只保留 OS 级 takeover 与 CLI。
+
+## 六、0.8.1 验收记录（2026-11-17）
+
+- 发布源：`release/agent-suite/bundle/`（git `3eff69b` + tag `v0.8.1`）；`/tmp/release` 已改成纯构建产物目录。
+- tarball：`dist/pawsey0319-dsh-agent-suite-0.8.1.tgz`，355298 字节 / 41 个文件，
+  sha256 `8ef67db28987a857a5091ba8ad1bb4923da9db6835c8a595c95f48c58b76c1bb`；
+  含 `client.js`、`members.json`、`cordis.patch.yml`、`lib/{bridge,judge,office,radar}/**`、
+  `lib/radar/native/{RadarHUD(已编译),RadarHUD.swift,build.sh}`、`lib/bridge/bin/dsh-bridge`（0755）。
+- Release：<https://github.com/pawsey0319/dsh-agent-suite/releases/tag/v0.8.1>；
+  `curl -I` 附件直链 → `HTTP/2 200`、`content-length: 355298`，下载件 sha256 与本地一致。
+- 两条安装路径（`/tmp/release` 已改名移走，全程不依赖 /tmp）：
+  1. `file:` 本地 tarball → 装进隔离 profile 后启动宿主：`/agent-suite/health` **200**、`ok:true`、四成员 `mounted`；
+  2. GitHub Release 直链 URL → 同上 **200**、四成员 `mounted`。
+- 换包（`link:` → `file:`、或换版本）**必须重启宿主**：否则 `/agent-suite`、`/x-radar`、`/agent-bridge` 全部 404 且无 `native/RadarHUD` 进程（见第二节第 0 条）。
+
