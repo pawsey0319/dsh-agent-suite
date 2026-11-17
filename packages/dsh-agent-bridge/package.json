@@ -1,0 +1,49 @@
+{
+  "name": "@pawsey0319/dsh-agent-bridge",
+  "version": "0.6.1",
+  "private": true,
+  "type": "module",
+  "description": "Drive Codex / Claude Code / WorkBuddy from DSH chats — external runs, approval bridging, aggregate API passthrough, dsh-bridge CLI.",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "locale",
+    "icon.svg",
+    "docs",
+    "assets",
+    "pty_helper.py",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "author": "pawsey0319",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git",
+    "directory": "packages/dsh-agent-bridge"
+  },
+  "homepage": "https://github.com/pawsey0319/dsh-agent-suite#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "codex",
+    "claude-code"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": []
+}

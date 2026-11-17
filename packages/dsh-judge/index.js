@@ -1,0 +1,440 @@
+/**
+ * dsh-judge —— R8 的 L1 验收判别层（P2.5a–c 的最小可运行实现）。
+ *
+ * 职责边界（见 docs/PRD.md §5.9）：
+ *   - 只读核验 + 结构化裁决 + 整改单；不授权、不改 DoD、不直接面对用户。
+ *   - 无 contract 不得 verified；确定性检查失败不烧 LLM token。
+ *
+ * 数据面（全部落在 ~/.dsh/agent-bridge/verify/ 下）：
+ *   <runId>/contract.json    任务契约（一旦签发不可变）
+ *   <runId>/verdict.json     最近一次裁决
+ *   <runId>/history.jsonl    每次裁决追加一行（审计）
+ *   <runId>/rounds.json      返工轮次计数
+ */
+import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, statSync } from 'node:fs'
+import { join, dirname, isAbsolute, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { execFileSync } from 'node:child_process'
+
+export const name = 'dsh-judge'
+export const inject = ['webServer']
+
+const ROOT = join(homedir(), '.dsh', 'agent-bridge')
+const VERIFY = join(ROOT, 'verify')
+const CONFIG = join(ROOT, 'judge.json')
+const PREFIXES = ['/dsh-judge', '/dsh-judge-b', '/dsh-judge-c']
+
+const DEFAULTS = {
+  autonomy: 'L2',          // L0 关 / L1 只建议 / L2 自动返工 / L3 自动返工+主动推进
+  maxRounds: 2,            // 默认最多打回 2 轮
+  driftThreshold: 0.4,
+  judge: null,             // {protocol:'openai'|'anthropic', baseUrl, model, apiKeyEnv}
+}
+
+function ensureDir(p) { mkdirSync(p, { recursive: true }) }
+function readJson(p, fallback) {
+  try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return fallback }
+}
+function writeJson(p, v) { ensureDir(dirname(p)); writeFileSync(p, JSON.stringify(v, null, 2)) }
+
+function readConfig() {
+  const raw = readJson(CONFIG, {})
+  return { ...DEFAULTS, ...raw, judge: raw.judge ?? DEFAULTS.judge }
+}
+
+function runPaths(runId) {
+  const dir = join(VERIFY, runId)
+  return {
+    dir,
+    contract: join(dir, 'contract.json'),
+    verdict: join(dir, 'verdict.json'),
+    history: join(dir, 'history.jsonl'),
+    rounds: join(dir, 'rounds.json'),
+  }
+}
+
+/* ---------------------------------------------------------------- 确定性检查 */
+
+function checkFileExists(spec) {
+  const p = isAbsolute(spec.path) ? spec.path : resolve(spec.cwd ?? process.cwd(), spec.path)
+  const ok = existsSync(p)
+  if (!ok) return { ok, detail: `文件不存在：${p}` }
+  const st = statSync(p)
+  if (spec.minBytes && st.size < spec.minBytes) {
+    return { ok: false, detail: `文件过小：${p} ${st.size}B < ${spec.minBytes}B` }
+  }
+  return { ok: true, detail: `${p} (${st.size}B)` }
+}
+
+function checkCommand(spec) {
+  const cwd = spec.cwd ?? process.cwd()
+  const argv = Array.isArray(spec.argv) ? spec.argv : null
+  if (!argv || argv.length === 0) return { ok: false, detail: '检查项缺少 argv（不允许 shell 字符串，避免注入）' }
+  const timeout = Math.min(Math.max(spec.timeoutMs ?? 120000, 1000), 600000)
+  try {
+    const out = execFileSync(argv[0], argv.slice(1), {
+      cwd, timeout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return { ok: true, detail: (out ?? '').slice(-400).trim() || 'ok' }
+  } catch (err) {
+    const tail = `${err.stdout ?? ''}${err.stderr ?? ''}`.slice(-400).trim()
+    return { ok: false, detail: tail || String(err.message ?? err) }
+  }
+}
+
+function checkMinLines(spec) {
+  const p = isAbsolute(spec.path) ? spec.path : resolve(spec.cwd ?? process.cwd(), spec.path)
+  if (!existsSync(p)) return { ok: false, detail: `文件不存在：${p}` }
+  const lines = readFileSync(p, 'utf8').split('\n').filter((l) => l.trim() !== '').length
+  const ok = lines >= (spec.minLines ?? 1)
+  return { ok, detail: `${p} 非空行 ${lines} / 要求 ${spec.minLines}` }
+}
+
+function runDeterministic(contract) {
+  const checks = Array.isArray(contract.checks) ? contract.checks : []
+  const results = checks.map((c) => {
+    const base = { type: c.type, label: c.label ?? c.type }
+    try {
+      if (c.type === 'file-exists') return { ...base, ...checkFileExists(c) }
+      if (c.type === 'command') return { ...base, ...checkCommand(c) }
+      if (c.type === 'min-lines') return { ...base, ...checkMinLines(c) }
+      return { ...base, ok: false, detail: `不支持的检查类型：${c.type}` }
+    } catch (err) {
+      return { ...base, ok: false, detail: String(err?.message ?? err) }
+    }
+  })
+  return { results, failed: results.filter((r) => !r.ok) }
+}
+
+/* ---------------------------------------------------------------- LLM 判别 */
+
+function judgePrompt(contract, evidence) {
+  return [
+    '你是只读验收判别器。你只能依据下面的「任务契约」与「产物证据」判断任务是否真的完成。',
+    '规则：',
+    '1. 不得假定未提供的内容存在；worker 自述不算证据。',
+    '2. 缺少验收清单里的任一项 → needs_revision，并给出可执行的 required_fixes。',
+    '3. 需要用户授权、方向有歧义、或契约本身不成立 → blocked，并给出 user_questions。',
+    '4. 只在全部满足时给 verified。',
+    '输出必须是**单个 JSON 对象**，不要 Markdown 代码块，字段：',
+    '{"verdict":"verified|needs_revision|blocked","confidence":0-1,"met":[],"missing":[],"evidence":[],"required_fixes":[],"user_questions":[]}',
+    '',
+    '## 任务契约',
+    JSON.stringify(contract, null, 2),
+    '',
+    '## 产物证据',
+    JSON.stringify(evidence, null, 2),
+  ].join('\n')
+}
+
+function parseVerdict(text) {
+  if (!text) return null
+  const trimmed = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()
+  const start = trimmed.indexOf('{')
+  const end = trimmed.lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  try {
+    const v = JSON.parse(trimmed.slice(start, end + 1))
+    if (!['verified', 'needs_revision', 'blocked'].includes(v.verdict)) return null
+    return {
+      verdict: v.verdict,
+      confidence: typeof v.confidence === 'number' ? v.confidence : 0.5,
+      met: Array.isArray(v.met) ? v.met : [],
+      missing: Array.isArray(v.missing) ? v.missing : [],
+      evidence: Array.isArray(v.evidence) ? v.evidence : [],
+      required_fixes: Array.isArray(v.required_fixes) ? v.required_fixes : [],
+      user_questions: Array.isArray(v.user_questions) ? v.user_questions : [],
+    }
+  } catch { return null }
+}
+
+/** 取密钥：先看宿主环境变量，再回落到 DSH 凭据文件 ~/.dsh/.credentials.yaml 的 refs 段。 */
+function resolveApiKey(judge) {
+  const envName = judge?.apiKeyEnv
+  if (!envName) return judge?.apiKey ?? undefined
+  if (process.env[envName]) return process.env[envName]
+  try {
+    const text = readFileSync(join(homedir(), '.dsh', '.credentials.yaml'), 'utf8')
+    const m = text.match(new RegExp(`^\\s*${envName}\\s*:\\s*(\\S+)\\s*$`, 'm'))
+    if (m) return m[1].replace(/^["']|["']$/g, '')
+  } catch {}
+  return judge?.apiKey ?? undefined
+}
+
+async function callJudge(cfg, contract, evidence) {
+  const judge = cfg.judge
+  const apiKey = resolveApiKey(judge)
+  if (!judge?.baseUrl || !judge?.model || !apiKey) return { skipped: 'judge_not_configured' }
+  const prompt = judgePrompt(contract, evidence)
+  const isAnthropic = (judge.protocol ?? 'openai') === 'anthropic'
+  // 网关的 baseUrl 常常已经带 /v1，不能再拼一次（否则 /v1/v1/... 404）。
+  const base = judge.baseUrl.replace(/\/$/, '')
+  const root = /\/v1$/.test(base) ? base : `${base}/v1`
+  const url = isAnthropic ? `${root}/messages` : `${root}/chat/completions`
+  const headers = isAnthropic
+    ? { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+    : { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` }
+  const body = isAnthropic
+    ? { model: judge.model, max_tokens: 1200, messages: [{ role: 'user', content: prompt }] }
+    : { model: judge.model, temperature: 0, messages: [{ role: 'user', content: prompt }] }
+  try {
+    const res = await fetch(url, {
+      method: 'POST', headers, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(judge.timeoutMs ?? 45000),
+    })
+    const raw = await res.text()
+    if (!res.ok) return { skipped: 'judge_http_error', detail: `${res.status} ${raw.slice(0, 300)}` }
+    const data = JSON.parse(raw)
+    const text = isAnthropic
+      ? (data.content ?? []).map((c) => c.text ?? '').join('')
+      : (data.choices?.[0]?.message?.content ?? '')
+    const verdict = parseVerdict(text)
+    return verdict ? { verdict } : { skipped: 'judge_unparsable', detail: String(text).slice(0, 300) }
+  } catch (err) {
+    return { skipped: 'judge_error', detail: String(err?.message ?? err) }
+  }
+}
+
+/* ---------------------------------------------------------------- 证据与主流程 */
+
+async function fetchRun(port, runId) {
+  if (!port) return null
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/agent-bridge/runs/${runId}?limit=400`, {
+      signal: AbortSignal.timeout(2500),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch { return null }
+}
+
+function summarizeEvidence(runPayload) {
+  const run = runPayload?.run ?? {}
+  const events = runPayload?.events ?? []
+  const kinds = {}
+  for (const e of events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1
+  return {
+    runId: run.id,
+    agent: run.agent,
+    status: run.status,
+    durationMs: run.durationMs ?? null,
+    finalAnswer: run.finalAnswer ?? null,
+    usage: run.usage ?? null,
+    eventCount: events.length,
+    kinds,
+    tail: events.slice(-12).map((e) => ({ seq: e.seq, kind: e.kind, text: e.text ?? e.title ?? '' })),
+  }
+}
+
+async function verifyRun({ runId, port, contractOverride }) {
+  const cfg = readConfig()
+  const paths = runPaths(runId)
+  const contract = contractOverride ?? readJson(paths.contract, null)
+
+  if (!contract) {
+    const verdict = {
+      verdict: 'blocked', confidence: 1,
+      met: [], missing: ['没有任务契约（contract.json）'],
+      evidence: [], required_fixes: [],
+      user_questions: ['这条任务没有验收标准，我先不判定它「完成」。要我按你的原话生成一份 DoD 吗？'],
+      reason: 'no_contract', at: Date.now(),
+    }
+    persist(runId, verdict)
+    return verdict
+  }
+
+  const det = runDeterministic(contract)
+  if (det.failed.length > 0) {
+    // 确定性检查失败：直接打回，不烧判别 token。
+    const verdict = {
+      verdict: 'needs_revision', confidence: 1,
+      met: det.results.filter((r) => r.ok).map((r) => r.label),
+      missing: det.failed.map((r) => `${r.label}: ${r.detail}`),
+      evidence: det.results.map((r) => ({ check: r.label, ok: r.ok, detail: r.detail })),
+      required_fixes: det.failed.map((r) => `修复检查项「${r.label}」：${r.detail}`),
+      user_questions: [], reason: 'deterministic_failed', at: Date.now(),
+    }
+    persist(runId, verdict)
+    return verdict
+  }
+
+  const payload = await fetchRun(port, runId)
+  const evidence = summarizeEvidence(payload)
+  const judged = await callJudge(cfg, contract, { deterministic: det.results, run: evidence })
+  if (judged.skipped) {
+    const verdict = {
+      verdict: 'unverified', confidence: 0,
+      met: det.results.map((r) => r.label),
+      missing: ['缺少 LLM 判别（未配置判别模型）'],
+      evidence: [{ deterministic: det.results }],
+      required_fixes: [],
+      user_questions: [`判别模型还没配，先按「未验证完成」处理。要在 ${CONFIG} 里填 judge 配置吗？`],
+      reason: judged.skipped, detail: judged.detail ?? null, at: Date.now(),
+    }
+    persist(runId, verdict)
+    return verdict
+  }
+  const verdict = { ...judged.verdict, reason: 'judged', at: Date.now() }
+  persist(runId, verdict)
+  return verdict
+}
+
+function persist(runId, verdict) {
+  const paths = runPaths(runId)
+  writeJson(paths.verdict, verdict)
+  appendFileSync(paths.history, JSON.stringify({ at: Date.now(), ...verdict }) + '\n')
+}
+
+/* ---------------------------------------------------------------- 返工回灌 */
+
+async function rework({ runId, port, verdict, prompt }) {
+  const cfg = readConfig()
+  if (cfg.autonomy === 'L0' || cfg.autonomy === 'L1') {
+    return { reworked: false, reason: `autonomy_${cfg.autonomy}` }
+  }
+  const paths = runPaths(runId)
+  const rounds = readJson(paths.rounds, { round: 0 })
+  if (rounds.round >= cfg.maxRounds) {
+    return { reworked: false, reason: 'max_rounds', round: rounds.round }
+  }
+  const fixes = (verdict.required_fixes ?? []).map((f, i) => `${i + 1}. ${f}`).join('\n')
+  const missing = (verdict.missing ?? []).map((m) => `- ${m}`).join('\n')
+  const nextRound = rounds.round + 1
+  const body = {
+    agent: rounds.agent ?? 'codex',
+    prompt: [prompt ?? '', '', '上一轮未通过验收，请只补齐下面这些点后重新交付：', fixes, '', '还缺：', missing, '', '不要解释，直接改。'].join('\n'),
+    cwd: rounds.cwd ?? process.cwd(),
+    reworkOf: runId,
+    round: nextRound,
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/agent-bridge/runs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) return { reworked: false, reason: 'dispatch_failed', detail: data }
+    writeJson(paths.rounds, { ...rounds, round: nextRound, lastRunId: data.runId })
+    appendFileSync(paths.history, JSON.stringify({ at: Date.now(), event: 'rework', round: nextRound, runId: data.runId }) + '\n')
+    return { reworked: true, round: nextRound, runId: data.runId }
+  } catch (err) {
+    return { reworked: false, reason: 'dispatch_error', detail: String(err?.message ?? err) }
+  }
+}
+
+/* ---------------------------------------------------------------- HTTP */
+
+function json(res, status, body) {
+  const text = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(text)
+}
+
+function readBody(req) {
+  return new Promise((resolveBody) => {
+    let data = ''
+    req.on('data', (c) => { data += c; if (data.length > 1e6) req.destroy() })
+    req.on('end', () => {
+      try { resolveBody(data ? JSON.parse(data) : {}) } catch { resolveBody({}) }
+    })
+    req.on('error', () => resolveBody({}))
+  })
+}
+
+function log(message) {
+  process.stderr.write(`[dsh-judge] ${message}\n`)
+}
+
+export function apply(ctx) {
+  const port = ctx.webServer?.port ?? null
+  const handler = async (req, res) => {
+    const url = new URL(req.url, 'http://local')
+    const tail = url.pathname.replace(/^\/(dsh-judge)(-[a-z])?\/?/, '')
+
+    if (req.method === 'GET' && (tail === '' || tail === 'health')) {
+      const cfg = readConfig()
+      return json(res, 200, { ok: true, autonomy: cfg.autonomy, maxRounds: cfg.maxRounds, judge: cfg.judge ? { model: cfg.judge.model, protocol: cfg.judge.protocol ?? 'openai' } : null })
+    }
+
+    if (req.method === 'GET' && tail === 'contract') {
+      const runId = url.searchParams.get('run')
+      if (!runId) return json(res, 400, { error: 'run required' })
+      return json(res, 200, readJson(runPaths(runId).contract, null) ?? { missing: true })
+    }
+
+    if (req.method === 'POST' && tail === 'contract') {
+      const body = await readBody(req)
+      if (!body.runId) return json(res, 400, { error: 'runId required' })
+      const paths = runPaths(body.runId)
+      if (existsSync(paths.contract)) {
+        return json(res, 409, { error: 'contract_immutable', detail: '契约一旦签发不可修改；扩范围请新建任务' })
+      }
+      const contract = {
+        runId: body.runId,
+        issuedAt: Date.now(),
+        issuedBy: body.issuedBy ?? 'user',
+        originalAsk: body.originalAsk ?? '',
+        checks: Array.isArray(body.checks) ? body.checks : [],
+        expectations: Array.isArray(body.expectations) ? body.expectations : [],
+        artifacts: Array.isArray(body.artifacts) ? body.artifacts : [],
+        risk: body.risk ?? 'normal',
+        cwd: body.cwd ?? null,
+      }
+      writeJson(paths.contract, contract)
+      return json(res, 200, { ok: true, contract })
+    }
+
+    if (req.method === 'GET' && tail === 'verdict') {
+      const runId = url.searchParams.get('run')
+      if (!runId) return json(res, 400, { error: 'run required' })
+      return json(res, 200, readJson(runPaths(runId).verdict, null) ?? { missing: true })
+    }
+
+    if (req.method === 'POST' && tail === 'verify') {
+      const body = await readBody(req)
+      if (!body.runId) return json(res, 400, { error: 'runId required' })
+      const verdict = await verifyRun({ runId: body.runId, port: ctx.webServer?.port ?? port })
+      let reworkResult = null
+      if (verdict.verdict === 'needs_revision' && body.rework !== false) {
+        reworkResult = await rework({ runId: body.runId, port: ctx.webServer?.port ?? port, verdict, prompt: body.prompt })
+      }
+      return json(res, 200, { ok: true, verdict, rework: reworkResult })
+    }
+
+    if (req.method === 'GET' && tail === 'list') {
+      const dir = VERIFY
+      const ids = existsSync(dir) ? readdirSyncSafe(dir) : []
+      const rows = ids.map((id) => ({
+        runId: id,
+        verdict: readJson(join(dir, id, 'verdict.json'), null)?.verdict ?? null,
+        rounds: readJson(join(dir, id, 'rounds.json'), { round: 0 }).round,
+      }))
+      return json(res, 200, { ok: true, count: rows.length, rows })
+    }
+
+    return json(res, 404, { error: 'not found', path: url.pathname })
+  }
+
+  ctx.effect(() => {
+    for (const prefix of PREFIXES) {
+      const safeHandler = async (request, response) => {
+        try {
+          await handler(request, response)
+        } catch (error) {
+          log(`judge route error ${prefix}: ${error && error.message}`)
+          try {
+            response.writeHead(500, { 'content-type': 'application/json' })
+            response.end(JSON.stringify({ ok: false, error: String(error && error.message) }))
+          } catch {}
+        }
+      }
+      const dispose = ctx.webServer.register({ kind: 'prefix', path: prefix, handler: safeHandler })
+      if (dispose) return () => dispose()
+    }
+    return () => {}
+  })
+}
+
+function readdirSyncSafe(p) {
+  try { return require('node:fs').readdirSync(p) } catch { return [] }
+}

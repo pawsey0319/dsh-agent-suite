@@ -1,0 +1,9 @@
+{
+  "name": "任务雷达",
+  "description": "右上角常驻小面板：跨会话汇总运行中 / 待处理的 agent 任务，一键跳转到对应会话。",
+  "meta": {
+    "title": "任务雷达",
+    "description": "右上角常驻小面板：跨会话汇总运行中 / 待处理的 agent 任务，一键跳转到对应会话。",
+    "detail": "docs/DETAIL.md"
+  }
+}

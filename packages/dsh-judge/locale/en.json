@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Verification gate (L1)",
+    "description": "Task contracts, deterministic checks, LLM verdicts and the notification gate",
+    "detail": "docs/DETAIL.md"
+  }
+}

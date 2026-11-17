@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Office artifacts",
+    "description": "Collects newly created docx / xlsx / pptx / pdf files in the workspace",
+    "detail": "docs/DETAIL.md"
+  }
+}

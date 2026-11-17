@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-judge
+      name: '@local/dsh-judge'

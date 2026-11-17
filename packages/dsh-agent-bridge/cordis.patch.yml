@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-agent-bridge
+      name: '@local/dsh-agent-bridge'

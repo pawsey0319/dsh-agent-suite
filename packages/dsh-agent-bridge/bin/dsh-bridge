@@ -1,0 +1,198 @@
+#!/usr/bin/env node
+/**
+ * dsh-bridge —— 让 DSH 里的 Agent（或人）把任务交给外部 agent 执行，结果回到对话。
+ *
+ *   dsh-bridge run --agent codex --prompt "..." [--cwd DIR] [--model M] [--timeout 180]
+ *   dsh-bridge list [--limit 10]
+ *   dsh-bridge show <runId>
+ *   dsh-bridge approve <approvalId> accept|decline
+ *
+ * 端口从 ~/.dsh/agent-bridge/bridge-url.json 读取（宿主每次启动都会刷新）。
+ */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+const HOME = process.env.HOME ?? '/tmp'
+const URL_FILE = join(HOME, '.dsh', 'agent-bridge', 'bridge-url.json')
+
+function baseUrl() {
+  const override = process.env.DSH_BRIDGE_URL
+  if (override) return override.replace(/\/$/, '')
+  try {
+    const parsed = JSON.parse(readFileSync(URL_FILE, 'utf8'))
+    if (parsed?.url) return String(parsed.url).replace(/\/$/, '')
+  } catch {}
+  throw new Error('找不到 bridge-url.json：宿主没在运行，或插件未启用')
+}
+
+async function call(path, init) {
+  const response = await fetch(baseUrl() + path, init)
+  const text = await response.text()
+  let body = null
+  try { body = JSON.parse(text) } catch { body = { raw: text } }
+  if (!response.ok) throw new Error(`${path} -> ${response.status} ${text.slice(0, 300)}`)
+  return body
+}
+
+function parseArgs(argv) {
+  const options = { _: [] }
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i]
+    if (token.startsWith('--')) {
+      const key = token.slice(2)
+      const next = argv[i + 1]
+      if (next && !next.startsWith('--')) { options[key] = next; i += 1 } else { options[key] = true }
+    } else {
+      options._.push(token)
+    }
+  }
+  return options
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function waitRun(runId, timeoutSeconds) {
+  const deadline = Date.now() + timeoutSeconds * 1000
+  let lastStatus = ''
+  while (Date.now() < deadline) {
+    const data = await call(`/agent-bridge/runs/${runId}?limit=1`)
+    const run = data?.run ?? {}
+    const status = run.status ?? 'unknown'
+    if (status !== lastStatus) {
+      lastStatus = status
+      process.stderr.write(`[dsh-bridge] ${runId.slice(0, 8)} ${status}${status === 'needs-approval' ? '（等待批准，去胶囊面板处理）' : ''}\n`)
+    }
+    if (status === 'done' || status === 'failed' || status === 'cancelled') return data
+    await sleep(1500)
+  }
+  const final = await call(`/agent-bridge/runs/${runId}?limit=1`)
+  return { ...final, timeout: true }
+}
+
+function answerFrom(events) {
+  const list = Array.isArray(events) ? events : []
+  const turnEnd = [...list].reverse().find((event) => event.kind === 'turn.end')
+  if (turnEnd?.finalAnswer) return String(turnEnd.finalAnswer)
+  const texts = list.filter((event) => event.kind === 'text' && event.text).map((event) => String(event.text))
+  return texts.join('').trim()
+}
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2)
+  const options = parseArgs(rest)
+
+  if (command === 'doctor') {
+    // 聚合 API 的唯一事实来源就是 DSH 自己在用的那个 provider（profile/cordis.patch.yml）。
+    const payload = await call('/agent-bridge/upstream?probe=1')
+    const up = payload?.upstream ?? {}
+    const probe = payload?.probe
+    process.stdout.write(`provider   ${up.provider ?? '-'}  (${up.api ?? '-'})\n`)
+    process.stdout.write(`baseURL    ${up.baseURL ?? '-'}\n`)
+    process.stdout.write(`apiKeyEnv  ${up.apiKeyEnv ?? '-'}\n`)
+    process.stdout.write(`models     ${(up.models ?? []).join(', ') || '-'}\n`)
+    process.stdout.write(`probe      ${probe ? (probe.ok ? `OK ${probe.ms}ms model=${probe.model}` : `FAIL ${probe.reason ?? probe.status}`) : 'skipped'}\n`)
+    return probe?.ok ? 0 : 1
+  }
+
+  if (!command || command === 'help' || command === '--help') {
+    process.stdout.write(`dsh-bridge <run|list|show|approve|doctor>\n\n  run --agent codex|claude|workbuddy --prompt "..." [--cwd DIR] [--timeout 180]\n  list [--limit 10]\n  show <runId>\n  approve <approvalId> accept|decline\n  doctor   # 打印当前实际使用的聚合 API 与连通性\n`)
+    return 0
+  }
+
+  if (command === 'run' && options.agent === 'workbuddy') {
+    // WorkBuddy 走它自己的桌面通道（无任何 DSH 面板）：确保已带调试端口启动 → 发消息 → 等回复。
+    const prompt = typeof options.prompt === 'string' ? options.prompt : options._.join(' ')
+    if (!prompt) throw new Error('缺少 --prompt')
+    const timeout = Number(options.timeout ?? 180) * 1000
+    const before = await call('/agent-bridge/workbuddy/last').catch(() => null)
+    if (!before?.ok) {
+      const launched = await call('/agent-bridge/workbuddy/launch', { method: 'POST' })
+      if (!launched?.ok) throw new Error(`WorkBuddy 启动失败：${launched?.error ?? 'unknown'}`)
+      process.stderr.write(`[dsh-bridge] workbuddy relaunched=${launched.relaunched} cdp=${launched.cdpPort}\n`)
+    }
+    const sent = await call('/agent-bridge/workbuddy/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: prompt }),
+    })
+    if (!sent?.ok) {
+      process.stderr.write(`[dsh-bridge] workbuddy send 未成功：${sent?.reason ?? 'unknown'}${sent?.card ? ` (${sent.card})` : ''}\n`)
+      return 2
+    }
+    const started = Date.now()
+    let last = before?.last ?? null
+    while (Date.now() - started < timeout) {
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      const now = await call('/agent-bridge/workbuddy/last').catch(() => null)
+      if (now?.ok && now.last && now.last !== last) {
+        last = now.last
+        if (!/准备中|生成中|思考中/.test(now.last)) break
+      }
+    }
+    process.stdout.write(`${last || '(没有读到回复)'}\n`)
+    process.stderr.write(`[dsh-bridge] workbuddy status=done duration=${Date.now() - started}ms\n`)
+    return last ? 0 : 1
+  }
+
+  if (command === 'run') {
+    const agent = options.agent === 'claude' ? 'claude' : 'codex'
+    const prompt = typeof options.prompt === 'string' ? options.prompt : options._.join(' ')
+    if (!prompt) throw new Error('缺少 --prompt')
+    const cwd = typeof options.cwd === 'string' && options.cwd
+      ? options.cwd
+      : (process.env.DSH_WORKSPACE || process.env.DSH_AGENT_BRIDGE_CWD || process.cwd())
+    const started = await call('/agent-bridge/runs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agent, prompt, cwd, model: options.model }),
+    })
+    const runId = started?.runId ?? started?.id
+    process.stderr.write(`[dsh-bridge] run ${runId} agent=${agent} cwd=${cwd}\n`)
+    const finished = await waitRun(runId, Number(options.timeout ?? 180))
+    const answer = answerFrom(finished?.events)
+    const run = finished?.run ?? {}
+    process.stdout.write(`${answer || '(没有文本输出)'}\n`)
+    process.stderr.write(`[dsh-bridge] status=${run.status} duration=${run.durationMs ?? '?'}ms tokens=${run.usage?.total?.totalTokens ?? '?'}${finished?.timeout ? ' TIMEOUT' : ''}\n`)
+    return run.status === 'done' ? 0 : 1
+  }
+
+  if (command === 'list') {
+    const data = await call('/agent-bridge/runs')
+    const runs = (data?.runs ?? []).slice(0, Number(options.limit ?? 10))
+    for (const run of runs) {
+      process.stdout.write(`${run.id.slice(0, 8)}  ${String(run.agent).padEnd(6)} ${String(run.status).padEnd(15)} ${String(run.prompt ?? '').replace(/\s+/g, ' ').slice(0, 70)}\n`)
+    }
+    return 0
+  }
+
+  if (command === 'show') {
+    const runId = options._[0]
+    if (!runId) throw new Error('缺少 runId')
+    const data = await call(`/agent-bridge/runs/${runId}?limit=200`)
+    process.stdout.write(`${answerFrom(data?.events)}\n\n--- 事件 ---\n`)
+    for (const event of data?.events ?? []) {
+      process.stdout.write(`${String(event.seq).padStart(4)} ${String(event.kind).padEnd(12)} ${String(event.text ?? event.status ?? '').replace(/\s+/g, ' ').slice(0, 90)}\n`)
+    }
+    return 0
+  }
+
+  if (command === 'approve') {
+    const approvalId = options._[0]
+    const decision = options._[1] === 'decline' ? 'decline' : 'accept'
+    if (!approvalId) throw new Error('缺少 approvalId')
+    const result = await call(`/agent-bridge/approvals/${approvalId}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    })
+    process.stdout.write(`${JSON.stringify(result)}\n`)
+    return 0
+  }
+
+  throw new Error(`未知命令：${command}`)
+}
+
+main().then((code) => process.exit(code)).catch((error) => {
+  process.stderr.write(`[dsh-bridge] ${error?.message ?? error}\n`)
+  process.exit(1)
+})

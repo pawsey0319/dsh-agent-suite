@@ -1,0 +1,39 @@
+{
+  "name": "@pawsey0319/dsh-judge",
+  "version": "0.1.3",
+  "private": true,
+  "type": "module",
+  "description": "L1 acceptance judge for DSH: task contracts, deterministic checks, LLM verdicts, notification gate and rework loop.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "author": "pawsey0319",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git",
+    "directory": "packages/dsh-judge"
+  },
+  "homepage": "https://github.com/pawsey0319/dsh-agent-suite#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "codex",
+    "claude-code"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": []
+}

@@ -1,0 +1,45 @@
+{
+  "name": "@pawsey0319/dsh-office-artifacts",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Scan workspaces for office artifacts (docx/xlsx/pptx/pdf) and reveal them in Finder.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "locale",
+    "docs",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "author": "pawsey0319",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git",
+    "directory": "packages/dsh-office-artifacts"
+  },
+  "homepage": "https://github.com/pawsey0319/dsh-agent-suite#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "codex",
+    "claude-code"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": []
+}
