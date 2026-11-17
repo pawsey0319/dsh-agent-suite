@@ -1,8 +1,9 @@
 {
-  "name": "@pawsey/dsh-task-radar",
+  "name": "@local/dsh-task-radar",
   "version": "0.5.0",
+  "private": true,
   "type": "module",
-  "description": "Desktop floating radar for DSH — native AppKit capsule showing running sessions, approvals, finished tasks and office artifacts.",
+  "description": "桌面任务雷达：跨会话汇总运行中任务的小圆圈 HUD（悬停展开、双击跳转、待批准红色脉冲 + 面板内直接批准/拒绝、点会话行跳回 DSH）",
   "icon": "icon.svg",
   "exports": {
     ".": "./index.js",
@@ -32,29 +33,5 @@
       "inject": []
     }
   },
-  "license": "MIT",
-  "author": "pawsey0319",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git",
-    "directory": "packages/dsh-task-radar"
-  },
-  "homepage": "https://github.com/pawsey0319/dsh-agent-suite#readme",
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "dsh-plugin",
-    "agent",
-    "codex",
-    "claude-code"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ]
+  "license": "MIT"
 }

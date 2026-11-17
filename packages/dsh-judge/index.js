@@ -11,7 +11,7 @@
  *   <runId>/history.jsonl    每次裁决追加一行（审计）
  *   <runId>/rounds.json      返工轮次计数
  */
-import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, statSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, statSync } from 'node:fs'
 import { join, dirname, isAbsolute, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
@@ -33,7 +33,14 @@ const DEFAULTS = {
 
 function ensureDir(p) { mkdirSync(p, { recursive: true }) }
 function readJson(p, fallback) {
-  try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return fallback }
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'))
+  } catch (error) {
+    // 文件不存在是正常的；存在但读不动/解析不了必须留痕，否则配置写坏了
+    // 会表现为「判别层莫名其妙不工作」（F-19）。
+    if (existsSync(p)) log(`json unreadable ${p}: ${String(error && error.message ? error.message : error)}`)
+    return fallback
+  }
 }
 function writeJson(p, v) { ensureDir(dirname(p)); writeFileSync(p, JSON.stringify(v, null, 2)) }
 
@@ -94,6 +101,11 @@ function runDeterministic(contract) {
   const checks = Array.isArray(contract.checks) ? contract.checks : []
   const results = checks.map((c) => {
     const base = { type: c.type, label: c.label ?? c.type }
+    // 契约里的 cwd 是「这次任务的工作目录」：检查项没写 cwd 时必须继承它，
+    // 否则相对路径会落到宿主进程的 cwd 上，把正确的产物判成缺失（F-05）。
+    if (c.cwd === undefined && typeof contract.cwd === 'string' && contract.cwd !== '') {
+      c = { ...c, cwd: contract.cwd }
+    }
     try {
       if (c.type === 'file-exists') return { ...base, ...checkFileExists(c) }
       if (c.type === 'command') return { ...base, ...checkCommand(c) }
@@ -342,7 +354,13 @@ function readBody(req) {
 }
 
 function log(message) {
-  process.stderr.write(`[dsh-judge] ${message}\n`)
+  const line = `${new Date().toISOString()} [dsh-judge] ${message}`
+  process.stderr.write(`${line}\n`)
+  // 判别层以前只写 stderr，宿主不重定向就全丢（F-10）。
+  try {
+    mkdirSync(ROOT, { recursive: true })
+    appendFileSync(join(ROOT, 'judge.log'), `${line}\n`)
+  } catch {}
 }
 
 export function apply(ctx) {
@@ -358,13 +376,13 @@ export function apply(ctx) {
 
     if (req.method === 'GET' && tail === 'contract') {
       const runId = url.searchParams.get('run')
-      if (!runId) return json(res, 400, { error: 'run required' })
+      if (!runId) return json(res, 400, { ok: false, error: 'run required', code: 'run_required' })
       return json(res, 200, readJson(runPaths(runId).contract, null) ?? { missing: true })
     }
 
     if (req.method === 'POST' && tail === 'contract') {
       const body = await readBody(req)
-      if (!body.runId) return json(res, 400, { error: 'runId required' })
+      if (!body.runId) return json(res, 400, { ok: false, error: 'runId required', code: 'run_required' })
       const paths = runPaths(body.runId)
       if (existsSync(paths.contract)) {
         return json(res, 409, { error: 'contract_immutable', detail: '契约一旦签发不可修改；扩范围请新建任务' })
@@ -386,13 +404,13 @@ export function apply(ctx) {
 
     if (req.method === 'GET' && tail === 'verdict') {
       const runId = url.searchParams.get('run')
-      if (!runId) return json(res, 400, { error: 'run required' })
+      if (!runId) return json(res, 400, { ok: false, error: 'run required', code: 'run_required' })
       return json(res, 200, readJson(runPaths(runId).verdict, null) ?? { missing: true })
     }
 
     if (req.method === 'POST' && tail === 'verify') {
       const body = await readBody(req)
-      if (!body.runId) return json(res, 400, { error: 'runId required' })
+      if (!body.runId) return json(res, 400, { ok: false, error: 'runId required', code: 'run_required' })
       const verdict = await verifyRun({ runId: body.runId, port: ctx.webServer?.port ?? port })
       let reworkResult = null
       if (verdict.verdict === 'needs_revision' && body.rework !== false) {
@@ -412,7 +430,7 @@ export function apply(ctx) {
       return json(res, 200, { ok: true, count: rows.length, rows })
     }
 
-    return json(res, 404, { error: 'not found', path: url.pathname })
+    return json(res, 404, { ok: false, error: 'not found', path: url.pathname })
   }
 
   ctx.effect(() => {
@@ -428,13 +446,25 @@ export function apply(ctx) {
           } catch {}
         }
       }
-      const dispose = ctx.webServer.register({ kind: 'prefix', path: prefix, handler: safeHandler })
-      if (dispose) return () => dispose()
+      let dispose
+      try {
+        dispose = ctx.webServer.register({ kind: 'prefix', path: prefix, handler: safeHandler })
+      } catch (error) {
+        // 前缀被别的插件占了就换下一个，而不是让 apply 整个炸掉（F-22）。
+        log(`judge prefix unavailable ${prefix}: ${error && error.message}`)
+        continue
+      }
+      if (dispose) {
+        log(`judge routes at ${prefix}`)
+        return () => dispose()
+      }
     }
+    log('judge: no prefix could be registered')
     return () => {}
   })
 }
 
 function readdirSyncSafe(p) {
-  try { return require('node:fs').readdirSync(p) } catch { return [] }
+  // ESM 里没有 require()：旧实现在这里静默返回 []，于是 /list 永远是 0 条（F-04）。
+  try { return readdirSync(p) } catch { return [] }
 }

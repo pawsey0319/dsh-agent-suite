@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { extname, join, resolve } from 'node:path'
+import { extname, isAbsolute, join, resolve } from 'node:path'
 
 const NAME = 'dsh-office-artifacts'
 export const name = NAME
@@ -125,6 +125,29 @@ function json(res, status, body) {
   res.end(`${JSON.stringify(body)}\n`)
 }
 
+/**
+ * 「能不能对这个路径执行 open / 审核」：只允许工作区、显式指名的 cwd 和
+ * 用户常用目录。旧实现接受任意绝对路径，任何本机页面都能让 Finder 去
+ * 定位 /etc 之类的位置（F-14）。
+ */
+function pathAllowed(target, url) {
+  if (typeof target !== 'string' || !isAbsolute(target)) return false
+  const roots = new Set()
+  try { roots.add(resolve(workspaceOf(url))) } catch {}
+  const cwd = url?.searchParams?.get('cwd')
+  if (typeof cwd === 'string' && isAbsolute(cwd)) roots.add(resolve(cwd))
+  for (const dir of ['Documents', 'Desktop', 'Downloads', 'Projects', 'dev', 'src', 'tmp']) {
+    roots.add(join(homedir(), dir))
+  }
+  roots.add('/tmp')
+  const resolved = resolve(target)
+  for (const root of roots) {
+    if (resolved === root) return true
+    if (resolved.startsWith(root.endsWith('/') ? root : `${root}/`)) return true
+  }
+  return false
+}
+
 let ctxRef = null
 const beacons = []
 
@@ -133,14 +156,17 @@ export function apply(ctx) {
   ctx.effect(() => {
     const disposers = []
     const prefixes = ['/office-artifacts', '/office-artifacts-b', '/office-artifacts-c']
+    let bound = null
     for (const prefix of prefixes) {
-      disposers.push(ctx.webServer.register({
+      const dispose = ctx.webServer.register({
         kind: 'prefix',
         path: prefix,
         handler: async (request, response) => {
-          const url = new URL(request.url ?? '/', 'http://127.0.0.1')
-          const tail = url.pathname.replace(/^\/office-artifacts(-[a-z])?\/?/, '')
           try {
+            // URL 解析必须在 try 里：畸形 URL 在旧实现中会在 try 之外抛错，
+            // 变成宿主里的未捕获异常（只有 Node 兜底，没有结构化 5xx）。
+            const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+            const tail = url.pathname.replace(/^\/office-artifacts(-[a-z])?\/?/, '')
             if (tail === 'beacon') {
               beacons.push({ e: url.searchParams.get('e') ?? '', at: Date.now() })
               while (beacons.length > 100) beacons.shift()
@@ -156,19 +182,32 @@ export function apply(ctx) {
                 if (detected !== null) cwd = detected
               }
               const sinceHours = Number(url.searchParams.get('hours') ?? 72)
+              if (!existsSync(cwd)) {
+                return json(response, 400, { ok: false, error: `cwd does not exist: ${cwd}`, code: 'cwd_missing' })
+              }
               const files = []
               await walk(cwd, 0, files)
               const since = Date.now() - Math.max(1, sinceHours) * 3600 * 1000
-              const items = files
-                .filter((file) => file.mtime >= since)
-                .sort(recentFirst)
-                .slice(0, 60)
+              const matching = files.filter((file) => file.mtime >= since).sort(recentFirst)
+              // 以前硬切 60 条且不说，调用方以为那就是全部（F-15）。
+              const LIMIT = 200
+              const items = matching
+                .slice(0, LIMIT)
                 .map((file) => ({
                   ...file,
                   relative: file.path.slice(cwd.length + 1),
                   updatedAt: Math.round(file.mtime),
                 }))
-              const payload = { ok: true, cwd, sinceHours, count: items.length, items, generatedAt: Date.now() }
+              const payload = {
+                ok: true,
+                cwd,
+                sinceHours,
+                count: items.length,
+                total: matching.length,
+                truncated: matching.length > items.length,
+                items,
+                generatedAt: Date.now(),
+              }
               try {
                 mkdirSync(BRIDGE_DIR, { recursive: true })
                 writeFileSync(LIST_FILE, `${JSON.stringify(payload, null, 2)}\n`)
@@ -189,6 +228,7 @@ export function apply(ctx) {
               const action = url.searchParams.get('action') ?? ''
               const feedback = (url.searchParams.get('feedback') ?? '').slice(0, 600)
               if (!target || !existsSync(target)) return json(response, 404, { ok: false, error: 'file not found' })
+              if (!pathAllowed(target, url)) return json(response, 403, { ok: false, error: 'path outside allowed roots', code: 'path_denied' })
               if (action !== 'accept' && action !== 'reject') return json(response, 400, { ok: false, error: 'action must be accept|reject' })
               const state = readState()
               if (action === 'accept') {
@@ -227,6 +267,7 @@ export function apply(ctx) {
             if (tail === 'open') {
               const target = url.searchParams.get('path') ?? ''
               if (!target || !existsSync(target)) return json(response, 404, { ok: false, error: 'file not found' })
+              if (!pathAllowed(target, url)) return json(response, 403, { ok: false, error: 'path outside allowed roots', code: 'path_denied' })
               execFile('/usr/bin/open', ['-R', target], () => {})
               log(`open -R ${target}`)
               return json(response, 200, { ok: true })
@@ -237,8 +278,18 @@ export function apply(ctx) {
             return json(response, 500, { ok: false, error: String(error?.message ?? error) })
           }
         },
-      }))
+      })
+      // 只注册第一个可用的前缀：旧实现无条件注册三个，一旦 profile 里还留着
+      // 别的 office 版本，就会一直撞 duplicate prefix route（F-22）。
+      if (dispose) {
+        bound = { prefix, dispose }
+        disposers.push(dispose)
+        break
+      }
+      log(`prefix unavailable, trying next: ${prefix}`)
     }
+    if (bound === null) log('no prefix could be registered for /office-artifacts')
+    else log(`route bound ${bound.prefix}`)
     return () => {
       for (const dispose of disposers) {
         try { dispose() } catch {}

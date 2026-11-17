@@ -15,9 +15,17 @@
 
 ## 安装（macOS arm64）
 
-1. 从 [Releases](../../releases) 下载四个 `.tgz`；
-2. 在 DSH 里逐个安装（插件管理 → 安装本地包，或 `plugin_manager install_bundle <绝对路径>`）；
-3. **重启 DSH**（宿主侧插件要换新一代模块；前端只要 Cmd+R）；
+**一次装一个包**：整合包内含四个成员与原生胶囊二进制，不再需要逐个安装、也不需要本机编译 Swift。
+
+1. 从 [Releases](https://github.com/pawsey0319/dsh-agent-suite/releases) 下载 `pawsey0319-dsh-agent-suite-<版本>.tgz`，
+   或本机构建：`bash scripts/build-tarball.sh`（产物在 `dist/`）。
+2. 在 DSH 里安装（插件管理 → 安装 bundle → 粘贴本地绝对路径或 Release 直链）：
+   ```
+   plugin_manager install_bundle /绝对路径/pawsey0319-dsh-agent-suite-0.8.1.tgz
+   # 或直链
+   plugin_manager install_bundle https://github.com/pawsey0319/dsh-agent-suite/releases/download/v0.8.1/pawsey0319-dsh-agent-suite-0.8.1.tgz
+   ```
+3. **重启 DSH**（宿主侧插件要换新一代模块；前端只要 Cmd+R）。
 4. 验收：
 
 ```bash
@@ -25,6 +33,17 @@ bash scripts/smoke.sh
 ```
 
 期望五项全 ✅：雷达 feed / `doctor` probe / codex 一句话 / claude 一句话 / 办公产物。
+
+装完可用 `curl -s localhost:<端口>/agent-suite/health` 看四个成员是否都 `mounted`。
+
+### 从源码更新整合包
+
+`bundle/` 是唯一发布源，`bundle/lib/*` 由 `packages/*` 同步而来。改完成员源码后：
+
+```bash
+bash ../scripts/sync-suite-bundle.sh   # 在 DSH 工作区根执行：packages → bundle/lib + members.json
+bash scripts/build-tarball.sh          # 重新打包
+```
 
 ## 胶囊怎么用
 

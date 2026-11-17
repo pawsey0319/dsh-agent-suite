@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent Bridge",
+    "description": "Run Codex / Claude Code / WorkBuddy as external runs inside DSH with verbatim event streaming (P1)",
+    "detail": "docs/DETAIL.md"
+  }
+}

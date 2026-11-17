@@ -1,0 +1,9 @@
+{
+  "name": "Task Radar",
+  "description": "Always-on overlay that aggregates running and waiting agent tasks across sessions, with one-click jump.",
+  "meta": {
+    "title": "Task radar",
+    "description": "A corner panel that rolls up running and waiting agent tasks across sessions, with one-click jump to the session.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "manifestVersion": 1,
+  "name": "@pawsey0319/dsh-agent-suite",
+  "version": "0.8.1",
+  "generatedAt": "2026-11-17T09:48:42Z",
+  "platform": {
+    "os": [
+      "darwin"
+    ],
+    "cpu": [
+      "arm64"
+    ]
+  },
+  "bundle": {
+    "entry": "index.js",
+    "patch": "cordis.patch.yml",
+    "client": "client.js"
+  },
+  "health": {
+    "route": "/agent-suite/health"
+  },
+  "native": {
+    "hud": "lib/radar/native/RadarHUD",
+    "source": "lib/radar/native/RadarHUD.swift",
+    "build": "lib/radar/native/build.sh"
+  },
+  "members": [
+    {
+      "label": "bridge",
+      "name": "@local/dsh-agent-bridge",
+      "version": "0.6.1",
+      "description": "把 Codex（app-server）作为外部 run 接入 DSH：结构化事件原样落盘 + HTTP/SSE 事件出口 + 审批队列（DSH one-console P1）",
+      "package": "lib/bridge/package.json",
+      "entry": "lib/bridge/index.js",
+      "server": true,
+      "routes": "/agent-bridge"
+    },
+    {
+      "label": "judge",
+      "name": "@local/dsh-judge",
+      "version": "0.1.3",
+      "description": "R8 L1 验收判别层：任务契约 + 确定性检查 + LLM 裁决 + 通知门",
+      "package": "lib/judge/package.json",
+      "entry": "lib/judge/index.js",
+      "server": true,
+      "routes": "/dsh-judge"
+    },
+    {
+      "label": "office",
+      "name": "@local/dsh-office-artifacts",
+      "version": "0.1.1",
+      "description": "把工作区里新生成的办公产物（docx/xlsx/pptx/pdf）汇总成清单，供 HUD 与对话使用",
+      "package": "lib/office/package.json",
+      "entry": "lib/office/index.js",
+      "server": true,
+      "routes": "/office-artifacts"
+    },
+    {
+      "label": "radar",
+      "name": "@local/dsh-task-radar",
+      "version": "0.5.0",
+      "description": "桌面任务雷达：跨会话汇总运行中任务的小圆圈 HUD（悬停展开、双击跳转、待批准红色脉冲 + 面板内直接批准/拒绝、点会话行跳回 DSH）",
+      "package": "lib/radar/package.json",
+      "entry": "lib/radar/index.js",
+      "server": true,
+      "routes": "/x-radar"
+    }
+  ]
+}

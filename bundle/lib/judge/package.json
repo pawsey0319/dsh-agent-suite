@@ -1,0 +1,19 @@
+{
+  "name": "@local/dsh-judge",
+  "version": "0.1.3",
+  "private": true,
+  "type": "module",
+  "description": "R8 L1 验收判别层：任务契约 + 确定性检查 + LLM 裁决 + 通知门",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  }
+}

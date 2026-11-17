@@ -1,0 +1,30 @@
+{
+  "name": "@local/dsh-agent-bridge",
+  "version": "0.6.1",
+  "private": true,
+  "type": "module",
+  "description": "把 Codex（app-server）作为外部 run 接入 DSH：结构化事件原样落盘 + HTTP/SSE 事件出口 + 审批队列（DSH one-console P1）",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "locale",
+    "icon.svg",
+    "docs",
+    "assets",
+    "pty_helper.py",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -85,6 +85,77 @@ function internalDecision(decision) {
 }
 
 /** 生成待审批 id：进程内单调，重启后也不会和旧条目撞车。 */
+/**
+ * 审批凭据：只有拿到「看到这条审批的人」手上的 token 才能下决策。
+ * 桥和 HUD 同机，本来靠 127.0.0.1 兜底，但任何本机进程都能 POST 一个 id
+ * 放行别人的审批（F-02），所以队列里的每一项都配一个一次性 token。
+ */
+function makeApprovalToken() {
+  return randomUUID().replace(/-/g, '').slice(0, 24)
+}
+
+/** 常量时间比较，避免 token 通过计时差异泄漏。 */
+function sameToken(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+/**
+ * N-03：`GET /approvals` 默认不回一次性 token —— 面板只需要展示，真正下决定时
+ * 由雷达带同一 token 转发。需要原样的调用方（同机雷达）显式带 `?include_token=1`。
+ */
+function redactToken(token) {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  return `${token.slice(0, 4)}…${token.slice(-2)}`
+}
+
+/**
+ * N-03：清理队列的运维凭据。
+ *
+ * 一次性 approval token 只存在于活 waiter 上（`snapshotPending` 故意不落盘），
+ * 宿主重启后遗留的 stale 条目没有任何 token 可以核对 —— 所以给「清理」单独一把
+ * 落盘凭据：文件 0600，只有本机同用户可读。HTTP 层因此仍要求 token，拿到 403 的
+ * 匿名进程无法凭一个 GET 就把别人的审批队列清空。
+ */
+const CLEAR_TOKEN_FILE = join(ROOT, 'clear.token')
+let clearTokenCache
+
+function clearToken() {
+  if (typeof clearTokenCache === 'string' && clearTokenCache.length > 0) return clearTokenCache
+  try {
+    if (existsSync(CLEAR_TOKEN_FILE)) {
+      const saved = readFileSync(CLEAR_TOKEN_FILE, 'utf8').trim()
+      if (saved.length >= 16) {
+        clearTokenCache = saved
+        return clearTokenCache
+      }
+    }
+  } catch { /* 读不到就重新生成 */ }
+  clearTokenCache = randomUUID().replace(/-/g, '')
+  try {
+    mkdirSync(ROOT, { recursive: true })
+    writeFileSync(CLEAR_TOKEN_FILE, `${clearTokenCache}\n`, { mode: 0o600 })
+  } catch (error) {
+    log(`clear token write failed: ${String(error && error.message ? error.message : error)}`)
+  }
+  return clearTokenCache
+}
+
+/**
+ * 按 token 过滤待处理队列：返回调用方有权处置的条目。
+ * - 带 id：必须是该条目的 token，否则不匹配；
+ * - 不带 id：只返回 token 与调用方一致的那些条目。
+ */
+function entriesOwnedByToken(list, token, id) {
+  if (typeof token !== 'string' || token.length === 0) return []
+  return list.filter((entry) => {
+    if (id !== undefined && entry.id !== id) return false
+    return sameToken(entry.token, token)
+  })
+}
+
 function makeApprovalId(prefix, seq, now = Date.now()) {
   const base = String(prefix ?? 'approval').replace(/[^a-zA-Z0-9_-]/g, '') || 'approval'
   const n = Math.max(1, Math.floor(Number(seq) || 1))
@@ -349,6 +420,32 @@ function claudeRows(event, state) {
 }
 
 /** One `codex app-server` child process, shared by every run. */
+/** 提问类 serverRequest：与审批分流（kind=question）。 */
+const isQuestionMethod = (method) =>
+  typeof method === 'string' && /requestUserInput|request_user_input|AskUserQuestion|ask_user|question/i.test(method)
+const approvalKind = (method) => (isQuestionMethod(method) ? 'question' : 'approval')
+
+/**
+ * 提问回执的线形状由 codex 的 ToolRequestUserInputResponse 固定：
+ * `{ answers: { <questionId>: { answers: ["<label>"] } } }`（值是对象，内层
+ * answers 数组必填）。调用方（HUD/面板/curl）习惯发裸 label，裸字符串透传会
+ * 让 codex 收到「empty answers」并丢掉用户的选择，所以在桥这一层统一收敛。
+ */
+const normalizeAnswers = (answers) => {
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null
+  const out = {}
+  for (const [questionId, value] of Object.entries(answers)) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && Array.isArray(value.answers)) {
+      out[questionId] = { answers: value.answers.map((entry) => String(entry)) }
+    } else if (Array.isArray(value)) {
+      out[questionId] = { answers: value.map((entry) => String(entry)) }
+    } else if (value !== undefined && value !== null) {
+      out[questionId] = { answers: [String(value)] }
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
 class CodexHost {
   constructor() {
     this.child = null
@@ -359,6 +456,9 @@ class CodexHost {
     this.startedAt = null
     this.ready = false
     this.lastError = null
+    /** 单飞：并发的两次 POST /runs 必须共用同一次启动，否则会 spawn 两个
+     *  app-server，后启动的覆盖 this.child，先启动的成为没人回收的孤儿（F-01）。 */
+    this.starting = null
   }
 
   onNotification(listener) {
@@ -368,6 +468,14 @@ class CodexHost {
 
   async start() {
     if (this.child && this.ready) return
+    if (this.starting) return this.starting
+    this.starting = this.startOnce().finally(() => {
+      this.starting = null
+    })
+    return this.starting
+  }
+
+  async startOnce() {
     const binary = codexBinary()
     if (!binary) throw new Error('codex binary not found (set DSH_AGENT_BRIDGE_CODEX)')
     this.child = spawn(process.execPath, [binary, 'app-server', '--listen', 'stdio://'], {
@@ -377,9 +485,14 @@ class CodexHost {
     this.child.stderr.on('data', (chunk) => {
       this.lastError = chunk.toString().slice(0, 400)
     })
-    this.child.on('exit', () => {
+    this.child.on('error', (error) => {
+      this.lastError = String(error && error.message ? error.message : error).slice(0, 400)
+      this.ready = false
+    })
+    this.child.on('exit', (code, signal) => {
       this.ready = false
       this.child = null
+      this.lastError = this.lastError ?? `app-server exited code=${code ?? 'null'} signal=${signal ?? 'null'}`
       for (const [, waiter] of this.pending) waiter.reject(new Error('codex app-server exited'))
       this.pending.clear()
       this.emit({ type: 'host/exit' })
@@ -463,6 +576,19 @@ class CodexHost {
 
   respond(id, result) {
     this.write({ id, result })
+  }
+
+  /** codex 的 server→client 请求按方法分流：审批回 {decision}，
+   * 提问回 {answers}。旧实现一律回 {decision}，提问类请求必然被对方判为无效（R-05）。 */
+  respondApproval(id, decision, method = '', answers = null) {
+    if (isQuestionMethod(method)) {
+      // 提问不是审批：回执必须是 {answers: {<questionId>: <option>}}，
+      // 回 {decision} 会让上游把它当成批准结果，追问永远看不到（2.20）。
+      const out = answers && typeof answers === 'object' && !Array.isArray(answers) ? answers : {}
+      this.write({ id, result: { answers: out, declined: decision !== 'accept' } })
+      return
+    }
+    this.write({ id, result: { decision: decision === 'accept' ? 'accept' : 'decline' } })
   }
 }
 
@@ -683,6 +809,36 @@ function json(res, status, body) {
   res.end?.(text)
 }
 
+function badRequest(code, message) {
+  const error = new Error(message)
+  error.status = 400
+  error.code = code
+  return error
+}
+
+/**
+ * 严格版 readBody：body 不是合法 JSON 时抛 400，而不是静默变成 {}。
+ * 旧实现让「JSON 写错」表现为 prompt is required，排查时完全看不出真因。
+ */
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    let data = ''
+    request.on('data', (chunk) => {
+      data += chunk
+      if (data.length > 1_000_000) request.destroy()
+    })
+    request.on('end', () => {
+      if (!data.trim()) return resolve({})
+      try {
+        resolve(JSON.parse(data))
+      } catch (error) {
+        reject(badRequest('invalid_json', `invalid JSON body: ${error.message}`))
+      }
+    })
+    request.on('error', (error) => reject(badRequest('read_failed', `failed to read body: ${error.message}`)))
+  })
+}
+
 function readBody(request) {
   return new Promise((resolve) => {
     let data = ''
@@ -795,6 +951,8 @@ export function apply(ctx) {
   try {
     const port = ctx.webServer?.port
     if (port) {
+      // 新 profile 首次运行时 ROOT 还不存在：不 mkdir 会静默丢文件（F-12）。
+      mkdirSync(ROOT, { recursive: true })
       writeFileSync(join(ROOT, 'bridge-url.json'), `${JSON.stringify({ url: `http://127.0.0.1:${port}`, port, updatedAt: Date.now() }, null, 2)}\n`)
     }
   } catch (error) {
@@ -840,11 +998,14 @@ export function apply(ctx) {
       const turn = event.params?.turn ?? {}
       const items = Array.isArray(turn.items) ? turn.items : []
       const final = items.find((entry) => entry?.type === 'agentMessage' && entry?.phase === 'final_answer') ?? null
-      store.setStatus(run, turn.status === 'completed' ? 'done' : 'failed', {
+      const status = turn.status === 'completed' ? 'done' : 'failed'
+      store.setStatus(run, status, {
         finalAnswer: final?.text ?? null,
         durationMs: turn.durationMs ?? null,
         error: turn.error ?? null,
       })
+      // bridge.log 要能回答「这个 run 什么时候结束、成没成」（F-10）。
+      log(`run ${status} id=${run.id.slice(0, 8)} agent=codex duration=${turn.durationMs ?? '-'} error=${turn.error ? String(turn.error).slice(0, 120) : '-'}`)
     }
   })
 
@@ -855,8 +1016,10 @@ export function apply(ctx) {
       runId: run?.id ?? null,
       agent: run?.agent ?? 'codex',
       method: event.method,
+      kind: approvalKind(event.method),
       params: event.params ?? null,
       at: new Date().toISOString(),
+      token: makeApprovalToken(),
       timer: setTimeout(() => settleApproval(approval.id, 'decline', 'timeout'), APPROVAL_TIMEOUT_MS),
     }
     approvals.set(approval.id, approval)
@@ -865,16 +1028,40 @@ export function apply(ctx) {
       runId: approval.runId,
       agent: approval.agent,
       method: approval.method,
+      kind: approval.kind,
       params: approval.params,
       at: approval.at,
+      token: approval.token,
     })
+    log(`approval request id=${approval.id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} agent=${approval.agent} method=${approval.method}`)
     if (run) {
       store.append(run, { kind: 'approval.request', notification: event.method, raw: event.params })
       store.setStatus(run, 'needs-approval')
     }
   }
 
-  const settleApproval = (id, decision, reason) => {
+  /**
+   * 把 {questionId: optionId|label} 还原成人能看懂的「问题 → 选项」，仅用于日志与事件，
+   * 保证 HUD/查日志能确认「选了哪一问的哪个选项」（PRD 2.20 的可审计要求）。
+   */
+  const describeAnswer = (approval, answers) => {
+    const list = []
+    const questions = approval?.params?.questions ?? approval?.params?.input?.questions
+    const entries = answers && typeof answers === 'object' ? Object.entries(answers) : []
+    for (const [questionId, value] of entries) {
+      // 线形状是 {answers:[label]}；这里拆出可读值再和选项标签比对。
+      const rawValue = value && typeof value === 'object' && Array.isArray(value.answers) ? value.answers.join(' / ') : value
+      const question = Array.isArray(questions) ? questions.find((q) => String(q?.id) === String(questionId)) : null
+      const options = Array.isArray(question?.options) ? question.options : []
+      const picked = options.find((o) => String(o?.id ?? o?.label ?? o) === String(rawValue))
+      const label = picked ? String(picked.label ?? picked.id ?? picked) : String(rawValue)
+      const text = String(question?.question ?? question?.text ?? '').replace(/\s+/g, ' ').slice(0, 60)
+      list.push(`${questionId}=${label}${text ? ` («${text}»)` : ''}`)
+    }
+    return list.length ? list.join(', ') : '-'
+  }
+
+  const settleApproval = (id, decision, reason, answers = null) => {
     const approval = approvals.get(id)
     if (!approval) return false
     approvals.delete(id)
@@ -886,15 +1073,31 @@ export function apply(ctx) {
       } catch {}
     } else {
       try {
-        // TODO(protocol): Codex app-server 的审批应答枚举无法从已编译二进制里确认，
-        // 这里按既有约定回 {decision:'accept'|'decline'}；若上游实际用
-        // acceptForSession / cancel，需要在 handleServerRequest 里按 method 分流。
-        host.respond(Number(id), { decision })
-      } catch {}
+        // Codex 的审批与提问是两种 serverRequest：审批回 {decision}，提问回
+        // {answers}。按 method 分流，否则提问类请求会被上游判为无效（R-05）。
+        host.respondApproval(Number(id), decision, approval.method, answers)
+      } catch (error) {
+        log(`approval respond failed id=${id.slice(0, 8)} ${String(error && error.message ? error.message : error)}`)
+      }
+    }
+    if (/timeout/.test(String(reason ?? ''))) {
+      // 超时必须是拒绝：旧行为等于静默放行，审计已实测到 hook 被自动 allow。
+      log(`approval timeout -> deny id=${id.slice(0, 8)} method=${approval.method} reason=${reason}`)
+    }
+    log(`approval settle id=${id.slice(0, 8)} decision=${decision} reason=${reason ?? '-'} run=${(approval.runId ?? '-').slice(0, 8)}`)
+    // 用审批自带的 kind（claude 的 AskUserQuestion 在创建时已按工具名分类），
+    // 仅看 method 会把它当成普通审批，question answered 日志就永远不出现。
+    const approvalIsQuestion = (approval.kind ?? approvalKind(approval.method)) === 'question'
+    if (approvalIsQuestion) {
+      // 提问通道单独一条可 grep 的日志：question answered … option=…
+      log(`question answered id=${id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} decision=${decision} option=${describeAnswer(approval, answers)}`)
     }
     const run = approval.runId ? store.runs.get(approval.runId) : null
     if (run) {
-      store.append(run, { kind: 'approval.decision', decision, reason: reason ?? null })
+      const isQuestion = approvalIsQuestion
+      store.append(run, isQuestion
+        ? { kind: 'question.answer', decision, reason: reason ?? null, answers: answers ?? null, picked: describeAnswer(approval, answers) }
+        : { kind: 'approval.decision', decision, reason: reason ?? null, answers: answers ?? null })
       store.setStatus(run, 'running')
     }
     return true
@@ -904,26 +1107,61 @@ export function apply(ctx) {
    * 外部（HUD / 面板）唯一决策入口：`allow|deny` 在这里换成子进程协议词。
    * 返回 false 表示没有活 waiter（调用方可回 404 或按 stale 条目处理）。
    */
-  const decide = (id, decision, note) => settleApproval(String(id), internalDecision(decision), note)
+  const decide = (id, decision, note, token, answers = null) => {
+    const approval = approvals.get(String(id))
+    if (!approval) return false
+    if (typeof approval.token === 'string' && !sameToken(token, approval.token)) {
+      log(`approval rejected id=${String(id).slice(0, 8)} reason=bad_token`)
+      return 'forbidden'
+    }
+    // 提问的回答也走这里：带 answers 就等价于「已采纳」，decision 记为 accept。
+    const wireAnswers = normalizeAnswers(answers)
+    const answersProvided = wireAnswers !== null
+    return settleApproval(String(id), answersProvided ? 'accept' : internalDecision(decision), note, wireAnswers)
+  }
 
   const startRun = async (body) => {
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    if (!prompt) throw new Error('prompt is required')
+    if (!prompt) {
+      // 客户端错误不能算 500：给 400 + code，调用方和日志都能分清是谁的问题（F-13）。
+      const error = new Error('prompt is required')
+      error.status = 400
+      error.code = 'prompt_required'
+      throw error
+    }
     const agent = body.agent === 'claude' ? 'claude' : 'codex'
     const fallbackCwd = process.env.DSH_AGENT_BRIDGE_CWD ?? process.env.DSH_WORKSPACE ?? process.cwd()
     const cwd = typeof body.cwd === 'string' && body.cwd ? body.cwd : fallbackCwd
     // 发起 run 的 DSH 会话 id（可选）；/resume 会优先 fork 它回到最后一个 completed-turn。
     const dshSessionId = typeof body.sessionId === 'string' ? body.sessionId : typeof body.dshSessionId === 'string' ? body.dshSessionId : null
     if (agent === 'claude') {
+      // 先确认二进制存在再建 run：旧实现先 create 再 throw，用户拿到一个
+      // 永远停在 starting 的 run，也没有任何可诊断的错误（F-06）。
+      if (!claudeBinary()) {
+        const error = new Error('claude binary not found (set DSH_AGENT_BRIDGE_CLAUDE)')
+        error.status = 503
+        error.code = 'claude_binary_missing'
+        throw error
+      }
       const run = store.create({ agent: 'claude', prompt, cwd, model: body.model ?? null, dshSessionId })
       store.append(run, { kind: 'run.created', prompt })
-      const child = spawnClaude(run, { prompt, cwd, model: body.model ?? null, port: ctx.webServer.port })
-      store.setStatus(run, 'running')
-      return { runId: run.id, agent: 'claude', pid: child.pid ?? null, model: run.model, cwd }
+      try {
+        const child = spawnClaude(run, { prompt, cwd, model: body.model ?? null, port: ctx.webServer.port })
+        store.setStatus(run, 'running')
+        log(`run start id=${run.id.slice(0, 8)} agent=claude pid=${child.pid ?? 'unknown'} cwd=${cwd}`)
+        return { runId: run.id, agent: 'claude', pid: child.pid ?? null, model: run.model, cwd }
+      } catch (error) {
+        store.setStatus(run, 'failed', { error: String(error && error.message ? error.message : error) })
+        log(`run failed id=${run.id.slice(0, 8)} agent=claude reason=${String(error && error.message ? error.message : error)}`)
+        error.status = 500
+        error.runId = run.id
+        throw error
+      }
     }
     await host.start()
     const run = store.create({ agent: 'codex', prompt, cwd, model: body.model ?? null, dshSessionId })
     store.append(run, { kind: 'run.created', prompt })
+    log(`run start id=${run.id.slice(0, 8)} agent=codex cwd=${cwd}`)
     const thread = await host.request('thread/start', { cwd, ...(body.model ? { model: body.model } : {}) })
     run.threadId = thread.thread.id
     run.model = thread.model ?? run.model
@@ -932,10 +1170,18 @@ export function apply(ctx) {
     const turn = await host.request('turn/start', {
       threadId: run.threadId,
       input: [{ type: 'text', text: prompt }],
+      // 直问通道（PRD 2.20）：codex 的 `request_user_input` 只在 plan 协作模式下暴露，
+      // 默认模式调用会被系统拒绝（实测「request_user_input 在当前 Default 模式下不可用」）。
+      // 需要 agent 向人提问时传 plan:true 即可走 plan 模式，从而真实触发
+      // `item/tool/requestUserInput`，由 kind=question 通道收集 {answers}。
+      ...(body.plan === true
+        ? { collaborationMode: { mode: 'plan', settings: { model: run.model ?? 'DeepSeek-V4.1-Flash' } } }
+        : {}),
     })
     run.turnId = turn.turn?.id ?? null
     store.setStatus(run, 'running')
-    return { runId: run.id, threadId: run.threadId, turnId: run.turnId, model: run.model, cwd }
+    if (body.plan === true) log(`run plan-mode id=${run.id.slice(0, 8)} model=${run.model ?? '-'} (request_user_input enabled)`)
+    return { runId: run.id, threadId: run.threadId, turnId: run.turnId, model: run.model, cwd, plan: body.plan === true }
   }
 
   /** Claude Code runs: one `claude -p` child per run, stream-json in, our rows out. */
@@ -1018,7 +1264,11 @@ export function apply(ctx) {
       stderr = `${stderr}${chunk}`.slice(-4000)
     })
     child.on('error', (error) => {
+      // 子进程根本没起来也必须从 claudeChildren 里摘掉，否则 /health 的
+      // running 计数会一直显示一个已经死掉的进程（F-11）。
+      claudeChildren.delete(run.id)
       store.setStatus(run, 'failed', { error: String(error && error.message) })
+      log(`claude spawn error run=${run.id.slice(0, 8)} ${String(error && error.message)}`)
     })
     child.on('exit', (code, signal) => {
       claudeChildren.delete(run.id)
@@ -1201,11 +1451,29 @@ export function apply(ctx) {
     const method = request.method ?? 'GET'
 
     if (method === 'GET' && (path === '' || path === 'health')) {
-      return json(response, 200, {
-        ok: true,
-        codex: { running: Boolean(host.ready), userAgent: host.userAgent ?? null, codexHome: host.codexHome ?? null, lastError: host.lastError },
-        claude: { binary: claudeBinary() ?? null, running: claudeChildren.size },
+      // ok 不再恒为 true：app-server 起不来 / 子进程死光时要说实话，
+      // 否则 doctor 和 smoke 永远绿（F-11）。
+      const claudeBinaryPath = claudeBinary() ?? null
+      const codexBinaryPath = codexBinary() ?? null
+      const problems = []
+      if (!codexBinaryPath) problems.push('codex binary not found')
+      if (!claudeBinaryPath) problems.push('claude binary not found')
+      if (host.lastError && host.ready === false) problems.push(`codex: ${host.lastError}`)
+      const failedRuns = [...store.runs.values()].filter((run) => run.status === 'failed').length
+      return json(response, problems.length === 0 ? 200 : 503, {
+        ok: problems.length === 0,
+        problems,
+        codex: {
+          running: Boolean(host.ready),
+          starting: Boolean(host.starting),
+          binary: codexBinaryPath,
+          version: host.userAgent ?? null,
+          codexHome: host.codexHome ?? null,
+          lastError: host.lastError ?? null,
+        },
+        claude: { binary: claudeBinaryPath, running: claudeChildren.size },
         runs: store.runs.size,
+        failedRuns,
         pendingApprovals: pendingApprovals.list().length,
         approvals: approvals.size,
         root: ROOT,
@@ -1277,9 +1545,15 @@ export function apply(ctx) {
     }
     if (method === 'POST' && parts[0] === 'runs' && parts.length === 1) {
       try {
-        return json(response, 200, await startRun(await readBody(request)))
+        return json(response, 200, await startRun((await readJsonBody(request)) ?? {}))
       } catch (error) {
-        return json(response, 500, { error: String(error && error.message) })
+        // 结构化 4xx/5xx：带 code/runId，日志里有同一条记录，客户端能据此诊断（F-06/F-13）。
+        const status = Number.isFinite(error?.status) ? error.status : 500
+        const payload = { ok: false, error: String(error && error.message ? error.message : error) }
+        if (typeof error?.code === 'string') payload.code = error.code
+        if (typeof error?.runId === 'string') payload.runId = error.runId
+        log(`run start failed status=${status} ${payload.error}`)
+        return json(response, status, payload)
       }
     }
     if (method === 'GET' && parts[0] === 'runs' && parts[2] === 'stream') {
@@ -1346,10 +1620,16 @@ export function apply(ctx) {
           runId: run?.id ?? null,
           agent: run?.agent ?? 'claude',
           method: 'claude/PreToolUse',
+          // 工具名也要参与分类：claude 的 AskUserQuestion 走同一个 PreToolUse hook，
+          // 只看 method 会把它降级成普通审批，提问回执与日志都会走错分支。
+          kind: approvalKind(`claude/PreToolUse ${toolName}`),
           params: { tool: toolName, input: body.tool_input ?? null, sessionId: body.session_id ?? null },
           at: new Date().toISOString(),
+          token: makeApprovalToken(),
           resolve,
-          timer: setTimeout(() => settleApproval(id, 'decline', 'timeout'), 25000),
+          // 钩子客户端 25s 就会放弃等待：服务端必须更早自己收口（20s），
+          // 否则「用户点批准」和「钩子超时」会互相覆盖（F-09）。
+          timer: setTimeout(() => settleApproval(id, 'decline', 'hook-timeout'), 20000),
         }
         approvals.set(id, approval)
         pendingApprovals.upsert({
@@ -1357,9 +1637,12 @@ export function apply(ctx) {
           runId: approval.runId,
           agent: approval.agent,
           method: approval.method,
+          kind: approval.kind,
           params: approval.params,
           at: approval.at,
+          token: approval.token,
         })
+        log(`approval request id=${id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} agent=claude method=PreToolUse tool=${toolName}`)
         if (run) {
           store.append(run, { kind: 'approval.request', notification: 'claude/PreToolUse', raw: { tool: toolName, input: body.tool_input ?? null } })
           store.setStatus(run, 'needs-approval')
@@ -1387,38 +1670,71 @@ export function apply(ctx) {
       return json(response, 200, { ok: true, agent, cwd, binary: bin })
     }
     if (method === 'GET' && parts[0] === 'approvals' && parts.length === 1) {
+      // 活的 waiter 必须在列表里（旧实现只要 WorkBuddy 有待确认卡，就只回
+      // WorkBuddy + 持久化条目，codex/claude 的实时审批整批消失）。
+      // N-03：默认脱敏 token；只有显式 ?include_token=1 的同机调用方（雷达/HUD 代理）
+      // 才拿到原值，避免任何本机进程从列表里捡走凭据。
+      const includeToken = url.searchParams.get('include_token') === '1'
+      const expose = (entry) => {
+        const withKind = { ...entry, kind: entry.kind ?? approvalKind(entry.method) }
+        if (includeToken) return withKind
+        const { token, ...rest } = withKind
+        return { ...rest, tokenRedacted: redactToken(token), hasToken: typeof token === 'string' && token.length > 0 }
+      }
+      const live = [...approvals.values()].map(({ timer, ...rest }) => expose(rest))
+      const liveIds = new Set(live.map((entry) => entry.id))
+      const stale = pendingApprovals
+        .list()
+        .filter((entry) => !liveIds.has(entry.id))
+        .map((entry) => expose(entry))
+      const list = [...live, ...stale]
       const pending = wbPending()
       if (pending && !pending.cleared) {
-        return json(response, 200, {
-          approvals: [
-            { id: 'workbuddy', agent: 'workbuddy', method: 'workbuddy/confirm', title: pending.card || 'WorkBuddy 等你确认', createdAt: pending.at },
-            ...pendingApprovals.list(),
-          ],
+        list.unshift({
+          id: 'workbuddy',
+          agent: 'workbuddy',
+          method: 'workbuddy/confirm',
+          title: pending.card || 'WorkBuddy 等你确认',
+          at: pending.at,
+          createdAt: pending.at,
         })
       }
-      return json(response, 200, {
-        approvals: [...approvals.values()].map(({ timer, ...rest }) => rest),
-      })
+      return json(response, 200, { approvals: list })
     }
     if (method === 'POST' && parts[0] === 'approvals' && parts.length === 2 && parts[1] === 'workbuddy') {
+      // WorkBuddy 的确认卡不是「命令批准」：accept = 激活应用让人去点确认；
+      // decline = 只清掉这条待确认，绝不擅自打开 WorkBuddy（R-04）。
+      const body = (await readJsonBody(request)) ?? {}
+      const decision = normalizeDecision(body.decision)
+      if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny' })
+      if (decision === 'deny') {
+        wbClearPending()
+        log('approval workbuddy -> declined (app not opened)')
+        return json(response, 200, { ok: true, decision: 'deny', agent: 'workbuddy' })
+      }
       await new Promise((resolve) => {
         execFile('/usr/bin/open', ['-a', 'WorkBuddy'], () => resolve())
       })
       wbClearPending()
       log('approval workbuddy -> activate')
-      return json(response, 200, { ok: true, decision: 'activate', agent: 'workbuddy' })
+      return json(response, 200, { ok: true, decision: 'allow', action: 'activate', agent: 'workbuddy' })
     }
     if (method === 'POST' && parts[0] === 'approvals' && parts.length === 2) {
-      const body = await readBody(request)
-      const decision = normalizeDecision(body.decision)
-      if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny' })
-      const ok = decide(parts[1], decision, typeof body.note === 'string' ? body.note.slice(0, 500) : null)
-      return json(response, ok ? 200 : 404, { ok, decision })
+      const body = (await readJsonBody(request)) ?? {}
+      const answers = body.answers && typeof body.answers === 'object' ? body.answers : null
+      // 提问回执没有 allow/deny：带 answers 即视为已采纳，decision 只为兼容旧客户端。
+      const decision = answers ? 'allow' : normalizeDecision(body.decision)
+      if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny (or pass answers)', code: 'bad_decision' })
+      const result = decide(parts[1], decision, typeof body.note === 'string' ? body.note.slice(0, 500) : null, body.token, answers)
+      if (result === 'forbidden') return json(response, 403, { ok: false, error: 'approval token mismatch', id: parts[1] })
+      // N-04：404 不能再回 decision:"allow" —— 只看 body 的调用方会把「未兑现」当「已批准」。
+      if (!result) return json(response, 404, { ok: false, decision: null, reason: 'not_found', id: parts[1] })
+      return json(response, 200, { ok: true, decision, answers: answers ?? null, id: parts[1] })
     }
     // ── P2 审批聚合：HUD / 面板用 GET + query（prefix 资源只服务 GET/HEAD） ──
     if (method === 'GET' && parts[0] === 'pending' && parts.length === 1) {
       try {
-        const pending = pendingApprovals.list()
+        const pending = pendingApprovals.list().map(({ token, ...rest }) => rest)
         return json(response, 200, { ok: true, count: pending.length, pending })
       } catch (error) {
         return json(response, 500, { ok: false, error: String(error?.message ?? error) })
@@ -1431,7 +1747,13 @@ export function apply(ctx) {
         const note = (url.searchParams.get('note') ?? '').slice(0, 500)
         if (id === '') return json(response, 400, { ok: false, error: 'id is required' })
         if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny' })
-        if (decide(id, decision, note)) {
+        const token = url.searchParams.get('token') ?? ''
+        const applied = decide(id, decision, note, token)
+        if (applied === 'forbidden') {
+          log(`approval ${id} rejected: token mismatch`)
+          return json(response, 403, { ok: false, error: 'approval token mismatch', id })
+        }
+        if (applied) {
           log(`approval ${id} ${decision}${note === '' ? '' : ` note=${note.slice(0, 80)}`}`)
           return json(response, 200, { ok: true, id, decision, delivered: true })
         }
@@ -1450,16 +1772,35 @@ export function apply(ctx) {
         // mode=stale（默认）只清重载遗留；mode=all 会把活 waiter 一律按 deny 结掉，
         // 避免子进程一直挂着等审批。
         const mode = url.searchParams.get('mode') === 'all' ? 'all' : 'stale'
+        // N-03：清理是破坏性动作（mode=all 会真的 deny 掉别人的 waiter），必须持 token。
+        const token = url.searchParams.get('token') ?? ''
+        const onlyId = (url.searchParams.get('id') ?? '').trim()
+        // 两把钥匙：条目自己的活 token（HUD 代理用），或 ~/.dsh/agent-bridge/clear.token（运维清理）。
+        // 活 waiter 的 token 只在 approvals Map 里（快照故意不落盘），所以候选集合要合并两边。
+        const liveEntries = [...approvals.values()].map(({ timer, ...rest }) => ({ ...rest, kind: rest.kind ?? approvalKind(rest.method) }))
+        const liveIds = new Set(liveEntries.map((entry) => entry.id))
+        const candidates = [...liveEntries, ...pendingApprovals.list().filter((entry) => !liveIds.has(entry.id))]
+        const operator = sameToken(token, clearToken())
+        const owned = operator
+          ? candidates.filter((entry) => onlyId === '' || entry.id === onlyId)
+          : entriesOwnedByToken(candidates, token, onlyId === '' ? undefined : onlyId)
+        if (owned.length === 0) {
+          log(`pending clear rejected: token missing or not owned (mode=${mode} id=${onlyId === '' ? '-' : onlyId})`)
+          return json(response, 403, { ok: false, error: 'approval token required and must match a queued approval or the operator clear token', code: 'approval_token_mismatch' })
+        }
+        const ownedIds = new Set(owned.map((entry) => entry.id))
         let cleared = 0
         let denied = 0
-        for (const entry of pendingApprovals.list()) {
+        for (const entry of candidates) {
+          if (!ownedIds.has(entry.id)) continue
           if (mode !== 'all' && entry.stale !== true) continue
           // 活 waiter 会先被 decide() 结掉（它自己会从队列移除），所以两种都要计数。
-          const decided = mode === 'all' ? decide(entry.id, 'deny', 'cleared') : false
+          // 内部维护路径：不经过 token 校验（它本来就是桥自己的清理动作）。
+          const decided = mode === 'all' ? settleApproval(entry.id, 'decline', 'cleared') : false
           if (decided) denied += 1
           if (pendingApprovals.remove(entry.id) || decided) cleared += 1
         }
-        if (cleared > 0) log(`pending approvals cleared mode=${mode} cleared=${cleared} denied=${denied}`)
+        if (cleared > 0) log(`pending approvals cleared mode=${mode} cleared=${cleared} denied=${denied} by=${operator ? 'operator-token' : 'entry-token'}`)
         return json(response, 200, { ok: true, mode, cleared, denied })
       } catch (error) {
         return json(response, 500, { ok: false, error: String(error?.message ?? error) })
@@ -1477,7 +1818,7 @@ export function apply(ctx) {
         return json(response, 500, { ok: false, error: String(error?.message ?? error) })
       }
     }
-    return json(response, 404, { error: 'not found', path })
+    return json(response, 404, { ok: false, error: 'not found', path })
   }
 
   ctx.effect(() => {
@@ -1493,8 +1834,13 @@ export function apply(ctx) {
             try {
               await handler(request, response)
             } catch (error) {
+              // 任何路由级异常都要留下结构化响应 + 一条日志（F-03/F-10）。
+              const status = Number.isFinite(error?.status) ? error.status : 500
+              const payload = { ok: false, error: String(error && error.message ? error.message : error) }
+              if (typeof error?.code === 'string') payload.code = error.code
+              log(`route error status=${status} ${String(error && error.stack ? error.stack.split('\n')[0] : error)}`)
               try {
-                json(response, 500, { error: String(error && error.message) })
+                json(response, status, payload)
               } catch {}
             }
           },

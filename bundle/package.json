@@ -1,18 +1,56 @@
 {
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "One install for the DSH agent suite: desktop radar HUD, external agent bridge, L1 judge and office artifact scanner.",
   "type": "module",
   "license": "MIT",
   "author": "pawsey0319",
-  "os": ["darwin"],
-  "cpu": ["arm64"],
-  "keywords": ["dsh", "deepseek-harness", "plugin", "bundle", "agent", "radar", "codex", "claude"],
-  "publishConfig": { "access": "public" },
-  "repository": { "type": "git", "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git" },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "agent",
+    "radar",
+    "codex",
+    "claude"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git"
+  },
   "homepage": "https://github.com/pawsey0319/dsh-agent-suite",
   "main": "index.js",
-  "exports": { ".": "./index.js" },
-  "files": ["index.js", "cordis.patch.yml", "lib/"],
-  "dsh": { "manifestVersion": 1, "bundle": { "patch": "./cordis.patch.yml" } }
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "members.json",
+    "README.md",
+    "lib/"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
 }

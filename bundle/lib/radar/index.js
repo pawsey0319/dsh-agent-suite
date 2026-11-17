@@ -13,7 +13,7 @@
  * releases them; the fixed fallback path list keeps a live page working when an
  * older generation still owns the preferred prefix.
  */
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 
 const TASK_STATUS_ZH = {
   pending: '待处理', in_progress: '进行中', completed: '已完成',
@@ -425,7 +425,8 @@ async function sessionItems(ctx) {
 async function pendingApprovals(port) {
   if (!port) return []
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/agent-bridge/approvals`, {
+    // include_token=1：桥默认对列表脱敏 token（N-03），雷达要替用户下决定，必须显式索取。
+    const response = await fetch(`http://127.0.0.1:${port}/agent-bridge/approvals?include_token=1`, {
       signal: AbortSignal.timeout(1200),
     })
     if (!response.ok) return []
@@ -436,9 +437,103 @@ async function pendingApprovals(port) {
   }
 }
 
+/**
+ * 桥侧两类「需要人」的事件共用一条队列：审批（requestApproval）和提问
+ * （requestUserInput / workbuddy 待确认卡）。它们的应答格式不同，所以在雷达
+ * 上分成 kind=approval / kind=question，避免把提问也画成「等你批准」。
+ */
+function approvalKind(approval) {
+  const method = String(approval?.method ?? '')
+  // claude 的 PreToolUse 把工具名放在 params.tool 里（AskUserQuestion /
+  // request_user_input），只看 method 会把它当成普通工具放行——那样用户的
+  // 问题只会以「批准/拒绝」出现，文案完全没有题干。
+  const tool = String(approval?.params?.tool ?? approval?.params?.toolName ?? '')
+  const hint = `${method} ${tool}`
+  return /requestUserInput|request_user_input|AskUserQuestion|question/i.test(hint) ? 'question' : 'approval'
+}
+
+/** 提问类事件的题干（codex 的 questions[] / 单条 prompt）。 */
+function questionText(approval) {
+  const params = approval?.params
+  // claude 的 AskUserQuestion 把问题放在 params.input.questions 里，codex 的
+  // requestUserInput 放在 params.questions 里，两处都认。
+  const list = params?.questions ?? params?.input?.questions
+  if (Array.isArray(list)) {
+    const texts = list
+      .map((entry) => {
+        if (typeof entry === 'string') return entry
+        const text = entry?.question ?? entry?.text ?? entry?.header ?? entry?.prompt
+        if (typeof text !== 'string') return undefined
+        const options = Array.isArray(entry?.options)
+          ? entry.options.map((o) => (typeof o === 'string' ? o : o?.label ?? o?.value)).filter(Boolean)
+          : []
+        return options.length ? `${text}（${options.join(' / ')}）` : text
+      })
+      .filter((text) => typeof text === 'string' && text.trim())
+    if (texts.length) {
+      // 标题只放问题原文：选项由面板逐条渲染（2.20），塞进标题会挤掉题干。
+      const first = (list[0]?.question ?? list[0]?.text ?? list[0]?.prompt ?? list[0] ?? '').toString().trim().replace(/\s+/g, ' ')
+      // 标题就是问题原文（t5 验收④）：不再加「等你回答：」前缀，行内副标题已经说明是提问。
+      return texts.length > 1 ? `${first.slice(0, 52)}（等 ${texts.length} 问）` : first.slice(0, 60)
+    }
+  }
+  const single = params?.prompt ?? params?.question ?? params?.input?.question
+  if (typeof single === 'string' && single.trim()) return single.trim().replace(/\s+/g, ' ').slice(0, 60)
+  return undefined
+}
+
+/** 提问的结构化形态：每问带 id 与 options，供 HUD 逐条渲染可点选项（2.20）。 */
+function questionsOf(approval) {
+  const params = approval?.params
+  const list = params?.questions ?? params?.input?.questions
+  if (!Array.isArray(list)) return []
+  return list
+    .map((entry, index) => {
+      if (typeof entry === 'string') return { id: String(index), question: entry, options: [] }
+      const text = entry?.question ?? entry?.text ?? entry?.header ?? entry?.prompt
+      const id = entry?.id ?? entry?.questionId ?? `q${index}`
+      const raw = Array.isArray(entry?.options) ? entry.options : []
+      const options = raw.map((option, oi) =>
+        typeof option === 'string'
+          ? { id: option, label: option }
+          : {
+              id: String(option?.id ?? option?.value ?? option?.label ?? `o${oi}`),
+              label: String(option?.label ?? option?.value ?? option?.id ?? `选项${oi + 1}`),
+              description: typeof option?.description === 'string' ? option.description : undefined,
+            })
+      if (typeof text !== 'string' || !text.trim()) return null
+      return { id: String(id), question: text.trim(), options }
+    })
+    .filter(Boolean)
+}
+
+/**
+ * 提问回执的线形状由 codex 的 ToolRequestUserInputResponse 定死：
+ * `{ answers: { <questionId>: { answers: ["<label>"] } } }`（值本身是对象，
+ * 且内层 answers 数组必填）。HUD 只发 label，若直接透传裸字符串，codex 会
+ * 在 events 里记「returned empty answers」，用户的选择被彻底丢掉（实测）。
+ * 这里做一次归一化：字符串/数组/已嵌套对象都能收敛到线形状。
+ */
+function normalizeQuestionAnswers(answers) {
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null
+  const out = {}
+  for (const [questionId, value] of Object.entries(answers)) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && Array.isArray(value.answers)) {
+      out[questionId] = { answers: value.answers.map((entry) => String(entry)) }
+    } else if (Array.isArray(value)) {
+      out[questionId] = { answers: value.map((entry) => String(entry)) }
+    } else if (value !== undefined && value !== null) {
+      out[questionId] = { answers: [String(value)] }
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
 function describeApproval(approval) {
   const params = approval?.params ?? {}
   const input = params.input ?? {}
+  const asked = questionText(approval)
+  if (asked) return asked
   const direct =
     (typeof approval?.title === 'string' ? approval.title : undefined) ??
     params.command ??
@@ -494,14 +589,23 @@ async function buildRadar(ctx) {
   const items = []
 
   for (const approval of approvals) {
+    const kind = approvalKind(approval)
     items.push({
-      kind: 'approval',
+      kind,
       id: `approval:${approval.id}`,
       approvalId: String(approval.id),
+      // 桥每次审批都发一个一次性的 token：HUD 的 accept/decline 要回传它，
+      // 否则任何人都能凭 id 替别人放行（F-02）。
+      approvalToken: typeof approval.token === 'string' ? approval.token : null,
+      // 宿主重启后遗留的审批没有活 waiter：HUD 要说明「已无法处理」，
+      // 而不是给用户一个点了必然失败的按钮。
+      stale: approval.stale === true,
       runId: approval.runId ?? null,
       agent: typeof approval.agent === 'string' ? approval.agent : 'codex',
       title: describeApproval(approval),
-      status: 'needs-approval',
+      // 提问把结构化选项原样透传给 HUD：面板逐条渲染、选中即回执（2.20）。
+      questions: kind === 'question' ? questionsOf(approval) : undefined,
+      status: kind === 'question' ? 'needs-answer' : 'needs-approval',
       updatedAt: Date.parse(approval.at ?? '') || Date.now(),
     })
   }
@@ -515,7 +619,7 @@ async function buildRadar(ctx) {
     const recent = Date.now() - Number(run.updatedAt ?? 0) <= 60 * 60 * 1000
     if (!active && run.hasContract !== true && !recent) continue
     let status = run.status
-    if (status === 'done' && run.seen) status = 'idle'
+    if ((status === 'done' || status === 'failed') && run.seen) status = 'idle'
     if (status === 'idle' || status === 'unknown') {
       status = run.verdict === 'needs_revision'
         ? 'rework'
@@ -526,7 +630,7 @@ async function buildRadar(ctx) {
             : 'idle'
     }
     if (status === 'idle') continue
-    if (run.seen === true && (status === 'done' || status === 'unverified')) continue
+    if (run.seen === true && (status === 'done' || status === 'failed' || status === 'unverified')) continue
     items.push({ ...run, kind: 'run', status })
   }
   // 会话完成后的保留：running→idle 的瞬间记一笔，60 分钟内且没看过就留在胶囊里可点。
@@ -599,7 +703,10 @@ async function buildRadar(ctx) {
   // 子智能体/子会话不计入，审批与完成未看只作为次要提示。
   const counts = {
     running: items.filter((item) => item.kind === 'session' && item.status === 'running').length,
-    approvals: items.filter((item) => item.kind === 'approval').length,
+    // 审批与提问都算「等你处理」：胶囊红呼吸 + 告警横幅都看这个数。
+    approvals: items.filter((item) => item.kind === 'approval' || item.kind === 'question').length,
+    questions: items.filter((item) => item.kind === 'question').length,
+    failed: items.filter((item) => item.kind === 'run' && item.status === 'failed').length,
     doneUnread: items.filter((item) => item.status === 'done').length,
   }
   counts.pending = counts.running
@@ -621,8 +728,11 @@ async function buildRadar(ctx) {
   }
 
   // 审批有时限（桥侧 5 分钟无响应即自动拒绝），所以排最前。
-  const rank = { 'needs-approval': 0, done: 1, running: 2, idle: 3 }
-  items.sort((left, right) => (rank[left.status] - rank[right.status]) || (right.updatedAt - left.updatedAt))
+  // 旧版直接用 rank[status] 相减：failed/starting 这类没登记的 status 会让
+  // 比较函数返回 NaN，整张面板的顺序就变得不可预测（R-13）。
+  const rank = { 'needs-answer': 0, 'needs-approval': 0, done: 1, failed: 1, running: 2, rework: 2, verifying: 2, idle: 3 }
+  const rankOf = (status) => (Object.hasOwn(rank, status) ? rank[status] : 4)
+  items.sort((left, right) => (rankOf(left.status) - rankOf(right.status)) || ((right.updatedAt ?? 0) - (left.updatedAt ?? 0)))
 
   return {
     ok: true,
@@ -661,11 +771,20 @@ function radarRoute(ctx) {
       // HUD 点了某条会话行：落一个信箱文件，页面侧的 client 半下一次轮询时消费。
       const sessionId = url.searchParams.get('session') ?? ''
       if (sessionId) {
+        const stamp = Date.now()
         try {
           mkdirSync(BRIDGE_DIR, { recursive: true })
-          writeFileSync(JUMP_FILE, JSON.stringify({ sessionId, at: Date.now() }))
+          writeFileSync(JUMP_FILE, JSON.stringify({ sessionId, at: stamp }))
         } catch {}
-        log(`jump requested session=${sessionId.slice(0, 8)}`)
+        const clientAge = lastClientBeaconAt ? `${Math.round((Date.now() - lastClientBeaconAt) / 1000)}s ago` : 'never'
+        log(`jump requested session=${sessionId.slice(0, 8)} client=${clientBeacons > 0 ? `yes(${clientAge})` : 'MISSING'}`)
+        // 15s 内没人取走 = 页面侧 client 半没加载（或页面没开），记一条可诊断的孤儿跳转。
+        setTimeout(() => {
+          try {
+            const raw = JSON.parse(readFileSync(JUMP_FILE, 'utf8'))
+            if (raw && Number(raw.at ?? 0) === stamp) log(`jump.unconsumed session=${sessionId.slice(0, 8)} (client half not running?)`)
+          } catch {}
+        }, 15000).unref?.()
       }
       return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } })
     }
@@ -724,7 +843,28 @@ function radarRoute(ctx) {
     if (tail === 'approval-decide') {
       // HUD 内联审批：代理到桥的审批队列（桥是同一宿主进程里的另一个插件）。
       const approvalId = url.searchParams.get('id') ?? ''
+      const token = url.searchParams.get('token') ?? ''
       const decision = url.searchParams.get('decision') === 'accept' ? 'accept' : 'decline'
+      // 提问的回执是 {answers:{<questionId>:<option>}}，不是 allow/deny（2.20）：
+      // HUD 把「选了哪个选项」编码进 answers（JSON），同时兼容 answer=qid:label。
+      let answers = null
+      const rawAnswers = url.searchParams.get('answers')
+      if (rawAnswers) {
+        try {
+          const parsed = JSON.parse(rawAnswers)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) answers = parsed
+        } catch (error) {
+          log(`approval decide bad answers json: ${String(error?.message ?? error)}`)
+        }
+      }
+      const single = url.searchParams.get('answer')
+      if (!answers && single && single.includes(':')) {
+        const at = single.indexOf(':')
+        answers = { [single.slice(0, at)]: single.slice(at + 1) }
+      }
+      // 归一化成 codex 要的线形状（{qid:{answers:[label]}}），否则选择会丢。
+      const rawAnswerMap = answers
+      answers = normalizeQuestionAnswers(answers)
       if (!approvalId) {
         return new Response(JSON.stringify({ ok: false, error: 'missing id' }), {
           status: 400,
@@ -737,16 +877,24 @@ function radarRoute(ctx) {
         const response = await fetch(`http://127.0.0.1:${port}/agent-bridge/approvals/${encodeURIComponent(approvalId)}`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ decision }),
+          // token 是桥发的一次性凭据：缺失/不匹配时桥回 403，HUD 会保留详情并提示重试。
+          body: JSON.stringify(answers ? { answers, token } : { decision, token }),
           signal: AbortSignal.timeout(2500),
         })
         result = await response.json().catch(() => ({ ok: response.ok }))
+        result.status = response.status
       } catch (error) {
         result = { ok: false, error: String(error?.message ?? error) }
       }
-      log(`approval decide id=${approvalId.slice(0, 8)} decision=${decision} ok=${result.ok === true}`)
+      const answersNote = answers ? JSON.stringify(answers) : '-'
+      const rawNote = answers && rawAnswerMap !== answers ? ` raw=${JSON.stringify(rawAnswerMap)}` : ''
+      log(`approval decide id=${approvalId.slice(0, 8)} decision=${decision} answers=${answersNote}${rawNote} ok=${result.ok === true} status=${result.status ?? '-'}`)
+      // 桥回 404（审批不存在/已过期）和 403（token 不匹配）都要原样透出，
+      // 不能一律 502 —— HUD 靠状态码区分「过时」和「桥挂了」。
+      const passthrough = [400, 403, 404, 409]
+      const status = result.ok ? 200 : passthrough.includes(result.status) ? result.status : 502
       return new Response(JSON.stringify(result), {
-        status: result.ok ? 200 : 502,
+        status,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
     }
@@ -767,7 +915,10 @@ function radarRoute(ctx) {
       }
       return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } })
     }
-    return new Response('radar', { status: 404 })
+    return new Response(JSON.stringify({ ok: false, error: 'not found', path: tail }), {
+      status: 404,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    })
   }
   return async (request) => {
     try {
@@ -782,9 +933,18 @@ function radarRoute(ctx) {
   }
 }
 
+// 客户端半边是否真的加载过：0.8.0 的整合包漏掉 client.js 时，HUD 点了行只会
+// 写信箱没人消费，所以 jump 的日志里要能看出「页面侧在不在」（R-01 诊断）。
+let clientBeacons = 0
+let lastClientBeaconAt = 0
+
 function beaconResponse(url) {
   const event = url.searchParams.get('e') ?? 'unknown'
   const detail = url.searchParams.get('d') ?? ''
+  if (event.startsWith('client.') || event === 'apply') {
+    clientBeacons += 1
+    lastClientBeaconAt = Date.now()
+  }
   log(`client.${event}${detail ? ` ${detail}` : ''}`)
   return new Response('ok', {
     status: 200,
@@ -801,51 +961,162 @@ function beaconResponse(url) {
  * The HUD owns a single-instance lock, so a second generation launching it is a
  * no-op; we only kill a child we started ourselves.
  */
-function killStaleHud() {
+const HUD_PID_FILE = join(BRIDGE_DIR, 'hud.pid')
+
+/** 只信 pid 文件里的数字还不够：必须确认那个 pid 现在真的是 RadarHUD，
+ * 否则一个被用户手改/复用的 pid 文件会让我们 SIGTERM 掉无关进程（R-03）。 */
+function isRadarProcess(pid) {
   try {
-    const pidFile = join(BRIDGE_DIR, 'hud.pid')
-    if (!existsSync(pidFile)) return
-    const pid = Number(String(readFileSync(pidFile, 'utf8')).trim())
-    if (Number.isFinite(pid) && pid > 1) {
-      process.kill(pid, 'SIGTERM')
-      log(`host.hud.stale_killed pid=${pid}`)
-    }
-    rmSync(pidFile, { force: true })
-  } catch {}
+    const command = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return command.includes('RadarHUD')
+  } catch {
+    return false
+  }
 }
 
-function startHud(port) {
+function hudPid() {
   try {
-    if (existsSync(HUD_BIN)) chmodSync(HUD_BIN, 0o755)
-  } catch {}
-  // 2026-11-13: 用户要求只保留 DSH 窗口内右上角胶囊；桌面 HUD 与胶囊重叠且
-  // 是原生窗口（不响应悬停/点击），默认不再自启，仅在 DSH_TASK_RADAR_HUD=1 时启用。
-  killStaleHud()
-  if (process.env.DSH_TASK_RADAR_HUD === '0') {
-    log('host.hud.disabled')
+    const pid = Number(String(readFileSync(HUD_PID_FILE, 'utf8')).trim())
+    return Number.isFinite(pid) && pid > 1 ? pid : undefined
+  } catch {
     return undefined
   }
+}
+
+function hudAlive(pid) {
+  if (pid === undefined) return false
+  try {
+    process.kill(pid, 0)
+  } catch {
+    return false
+  }
+  return isRadarProcess(pid)
+}
+
+/** 结束一个「确认是自己人」的旧 HUD；身份不符时只清 pid 文件，绝不动进程。 */
+function stopHud(pid, why) {
+  let killed = false
+  if (pid !== undefined && hudAlive(pid)) {
+    try {
+      process.kill(pid, 'SIGTERM')
+      killed = true
+      log(`host.hud.stale_killed pid=${pid} why=${why}`)
+    } catch (error) {
+      log(`host.hud.kill.failed pid=${pid} ${String(error && error.message)}`)
+    }
+  } else if (pid !== undefined) {
+    log(`host.hud.pid.dropped pid=${pid} why=${why} (不是 RadarHUD 或已退出)`)
+  }
+  try {
+    rmSync(HUD_PID_FILE, { force: true })
+  } catch {}
+  return killed
+}
+
+/**
+ * 写 radar-url.json 并**读回校验**（N-02）。
+ *
+ * HUD 每 2s 重读这个文件，写错一次它就整段离线；所以写完必须回读确认端口一致，
+ * 不一致立刻记日志（而不是静默留一个坏文件给下一轮轮询）。
+ */
+function writeUrlFile(port) {
   const url = `http://127.0.0.1:${port}/x-radar/radar`
   try {
     mkdirSync(BRIDGE_DIR, { recursive: true })
     writeFileSync(URL_FILE, JSON.stringify({ url, port, updatedAt: Date.now() }, null, 2))
-  } catch {}
+  } catch (error) {
+    log(`host.url.write.failed port=${port} ${String(error && error.message ? error.message : error)}`)
+    return undefined
+  }
+  let saved
+  try {
+    saved = JSON.parse(readFileSync(URL_FILE, 'utf8'))
+  } catch (error) {
+    log(`host.url.verify.failed port=${port} unreadable ${String(error && error.message ? error.message : error)}`)
+    return undefined
+  }
+  if (saved?.port !== port || typeof saved?.url !== 'string' || !saved.url.includes(`:${port}/`)) {
+    log(`host.url.verify.mismatch wanted=${port} got=${String(saved?.port)} url=${String(saved?.url)}`)
+    return undefined
+  }
+  return url
+}
+
+/** 端口就绪时把 URL 文件修回期望值；已一致则什么都不做（供 supervisor 每轮调用）。 */
+function repairUrlFile(port, control) {
+  let saved
+  try {
+    saved = JSON.parse(readFileSync(URL_FILE, 'utf8'))
+  } catch {
+    saved = undefined
+  }
+  if (saved?.port === port && typeof saved?.url === 'string' && saved.url.includes(`:${port}/`)) return false
+  const url = writeUrlFile(port)
+  if (url !== undefined) {
+    control.urlRepairs = (control.urlRepairs ?? 0) + 1
+    log(`host.url.repair port=${port} was=${String(saved?.port)} repairs=${control.urlRepairs}`)
+    return true
+  }
+  return false
+}
+
+/**
+ * 保证 HUD 在跑：
+ * - 端口没就绪时不放弃，交给 apply 里的 2s 重试（R-02：旧版直接 return undefined，
+ *   于是「第一次 apply 端口是 undefined」就永远没有胶囊）；
+ * - 已有进程但已死 / pid 身份不符时清理后重启；
+ * - 记每次启动/复活，失败不吞。
+ */
+function ensureHud(port, control) {
+  if (process.env.DSH_TASK_RADAR_HUD === '0') {
+    if (control.disabledLogged !== true) {
+      control.disabledLogged = true
+      log('host.hud.disabled')
+    }
+    return undefined
+  }
+  // 端口「0」不等于就绪：cordis 早期 webServer.port 可能是 0，写进 URL 文件会让运行中的
+  // HUD 在下一个 2s 轮询里连到 127.0.0.1:0 并转 offline（实测 08:49:24 发生）。
+  if (!Number.isFinite(port) || port <= 0) {
+    log('host.hud.wait-port port=' + String(port))
+    return undefined
+  }
+  writeUrlFile(port)
+  const existing = hudPid()
+  if (hudAlive(existing)) return existing
+  if (existing !== undefined) stopHud(existing, 'stale-or-foreign')
   if (!existsSync(HUD_BIN)) {
     log(`host.hud.missing ${HUD_BIN}`)
     return undefined
   }
+  if (control.starts >= 40) {
+    log('host.hud.giveup restarts>=40')
+    return undefined
+  }
+  control.starts += 1
   try {
-    const child = spawn(HUD_BIN, ['--url', 'auto', '--interval', '2'], {
+    if (existsSync(HUD_BIN)) chmodSync(HUD_BIN, 0o755)
+  } catch {}
+  let child
+  try {
+    child = spawn(HUD_BIN, ['--url', 'auto', '--interval', '2'], {
       detached: true,
       stdio: 'ignore',
     })
-    child.unref()
-    log(`host.hud.start port=${port} pid=${child.pid ?? 'unknown'}`)
-    return child
   } catch (error) {
-    log(`host.hud.spawn.failed ${String(error && error.message)}`)
+    log(`host.hud.spawn.failed ${String(error && error.message ? error.message : error)}`)
     return undefined
   }
+  // spawn 的失败是异步的（EACCES/ENOENT），必须监听，否则连日志都没有。
+  child.on('error', (error) => log(`host.hud.spawn.error ${String(error && error.message ? error.message : error)}`))
+  child.on('exit', (code, signal) => log(`host.hud.exit code=${code ?? 'null'} signal=${signal ?? 'null'}`))
+  child.unref()
+  log(`host.hud.start port=${port} pid=${child.pid ?? 'unknown'} attempt=${control.starts}`)
+  return child.pid
 }
 
 export function apply(ctx) {
@@ -867,19 +1138,77 @@ export function apply(ctx) {
       return () => {}
     }
     log(`host.route ${bound.path}`)
-    let port
-    try {
-      port = ctx.get('webServer')?.port
-    } catch {}
-    const hud = port === undefined ? undefined : startHud(port)
+
+    const control = { starts: 0, disabledLogged: false, stopped: false }
+    let portTimer
+    let supervisor
+    const portNow = () => {
+      try {
+        const port = ctx.get('webServer')?.port
+        return Number.isFinite(port) && port > 0 ? port : undefined
+      } catch {
+        return undefined
+      }
+    }
+    const ensure = (why) => {
+      if (control.stopped) return
+      const port = portNow()
+      if (port === undefined) {
+        log(`host.hud.wait_port why=${why}`)
+        return
+      }
+      ensureHud(port, control)
+    }
+    ensure('apply')
+    // 端口在 apply 时可能还没绑定：2s 一次重试，直到拿到端口再启动 HUD。
+    if (portNow() === undefined) {
+      portTimer = setInterval(() => {
+        if (control.stopped) return
+        if (portNow() !== undefined) {
+          clearInterval(portTimer)
+          portTimer = undefined
+          ensure('port-ready')
+        }
+      }, 2000)
+      portTimer.unref?.()
+    }
+    // 守护：HUD 崩了/被杀了要自己回来，而不是等下一次宿主重启。
+    supervisor = setInterval(() => {
+      if (control.stopped) return
+      const port = portNow()
+      if (port === undefined) return
+      // 先自愈 URL 文件：HUD 活着但文件被写成 port:0 时，把文件修回期望端口就能救回来
+      // （N-02：旧版只在 HUD 死亡时才动作，写错一次就得等宿主重启）。
+      repairUrlFile(port, control)
+      const pid = hudPid()
+      if (hudAlive(pid)) return
+      log(`host.hud.revive pid=${pid ?? 'none'}`)
+      ensureHud(port, control)
+    }, 20000)
+    supervisor.unref?.()
+    // 文件守护：比 supervisor 更勤（3s），把「radar-url.json 被写坏」的离线窗口压到一次轮询内。
+    const urlGuard = setInterval(() => {
+      if (control.stopped) return
+      const port = portNow()
+      if (port === undefined) return
+      repairUrlFile(port, control)
+    }, 3000)
+    urlGuard.unref?.()
     return () => {
+      control.stopped = true
       log('host.dispose')
+      if (portTimer !== undefined) clearInterval(portTimer)
+      if (urlGuard !== undefined) clearInterval(urlGuard)
+      if (supervisor !== undefined) clearInterval(supervisor)
       try {
         bound.dispose()
       } catch {}
-      if (hud !== undefined) {
+      // 只杀确认是自己人的 HUD：pid 被复用时不动别人的进程。
+      const pid = hudPid()
+      if (hudAlive(pid)) {
         try {
-          process.kill(hud.pid)
+          process.kill(pid, 'SIGTERM')
+          log(`host.hud.dispose_killed pid=${pid}`)
         } catch {}
       }
     }

@@ -11,10 +11,19 @@ One install, four plugins for DeepSeek Harness (desktop, macOS arm64):
 
 ## 安装
 
-DSH → 插件管理 → 安装 bundle → 粘贴：
+DSH → 插件管理 → 安装 bundle → 粘贴（或本地 `plugin_manager install_bundle <tgz 绝对路径>`）：
 
 ```
-https://github.com/pawsey0319/dsh-agent-suite/releases/download/v0.8.0/pawsey0319-dsh-agent-suite-0.8.0.tgz
+https://github.com/pawsey0319/dsh-agent-suite/releases/download/v0.8.1/pawsey0319-dsh-agent-suite-0.8.1.tgz
 ```
 
 装完重启 DSH App 生效（Node 侧插件不支持热替换）。
+
+装完自检：
+
+```bash
+curl -s localhost:<web 端口>/agent-suite/health   # 四个成员 state=mounted
+bash scripts/smoke.sh                              # 五项全 ✅
+```
+
+包内结构：`index.js`（成员挂载 + `/agent-suite/health`）、`client.js`（Web 前端半边）、`members.json`（成员清单）、`lib/{bridge,judge,office,radar}/**`、`lib/radar/native/RadarHUD`（已编译，含 `build.sh` 与 `RadarHUD.swift` 便于重编）。

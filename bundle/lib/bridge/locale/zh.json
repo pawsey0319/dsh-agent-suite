@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent Bridge",
+    "description": "把 Codex / Claude Code / WorkBuddy 作为外部 run 接入 DSH，事件原样回流（P1）",
+    "detail": "docs/DETAIL.md"
+  }
+}

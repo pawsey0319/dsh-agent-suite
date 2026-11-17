@@ -25,7 +25,11 @@ export function pendingInfo() {
     if (!existsSync(PENDING_FILE)) return null
     const lines = readFileSync(PENDING_FILE, 'utf8').split('\n').filter(Boolean)
     if (!lines.length) return null
-    return JSON.parse(lines[lines.length - 1])
+    const last = JSON.parse(lines[lines.length - 1])
+    // 最后一行是 cleared 记录时说明「已经清掉了」：旧实现仍把它当待确认返回，
+    // 于是清掉之后 HUD 还会凭空多出一条 WorkBuddy 待确认。
+    if (last && last.cleared === true) return null
+    return last
   } catch {
     return null
   }

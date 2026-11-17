@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "验收判别（L1）",
+    "description": "任务契约 + 确定性检查 + LLM 裁决 + 通知门",
+    "detail": "docs/DETAIL.md"
+  }
+}

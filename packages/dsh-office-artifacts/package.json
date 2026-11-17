@@ -1,8 +1,9 @@
 {
-  "name": "@pawsey/dsh-office-artifacts",
+  "name": "@local/dsh-office-artifacts",
   "version": "0.1.1",
+  "private": true,
   "type": "module",
-  "description": "Scan workspaces for office artifacts (docx/xlsx/pptx/pdf) and reveal them in Finder.",
+  "description": "把工作区里新生成的办公产物（docx/xlsx/pptx/pdf）汇总成清单，供 HUD 与对话使用",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -20,25 +21,5 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  },
-  "author": "pawsey0319",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/pawsey0319/dsh-agent-suite.git",
-    "directory": "packages/dsh-office-artifacts"
-  },
-  "homepage": "https://github.com/pawsey0319/dsh-agent-suite#readme",
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "dsh-plugin",
-    "agent",
-    "codex",
-    "claude-code"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "os": []
+  }
 }

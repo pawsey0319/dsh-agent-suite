@@ -101,6 +101,12 @@ private func log(_ message: String) {
 private final class BannerView: NSView {
     private let title: String
     private let body: String
+    /// 点横幅 = 确认这一条（标记已读并从队列里移除），2.21。
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
 
     init(frame: NSRect, title: String, body: String) {
         self.title = title
@@ -150,11 +156,16 @@ private struct RadarCounts: Decodable {
     var pending = 0
     var running = 0
     var approvals = 0
+    /// 待回答的 agent 提问（requestUserInput / WorkBuddy 确认卡），单独计数，
+    /// 否则它会被当成普通批准，用户看到「需批准」却不知道是在问问题。
+    var questions = 0
+    /// 失败的 run：以前完全不出现在胶囊里（R-13）。
+    var failed = 0
     var doneUnread = 0
     var autoConfirmed = 0
 
     private enum CodingKeys: String, CodingKey {
-        case pending, running, approvals, doneUnread, autoConfirmed
+        case pending, running, approvals, questions, failed, doneUnread, autoConfirmed
     }
 
     init() {}
@@ -164,6 +175,8 @@ private struct RadarCounts: Decodable {
         pending = RadarCounts.int(c, .pending)
         running = RadarCounts.int(c, .running)
         approvals = RadarCounts.int(c, .approvals)
+        questions = RadarCounts.int(c, .questions)
+        failed = RadarCounts.int(c, .failed)
         doneUnread = RadarCounts.int(c, .doneUnread)
         autoConfirmed = RadarCounts.int(c, .autoConfirmed)
     }
@@ -179,6 +192,39 @@ private struct RadarCounts: Decodable {
 }
 
 /// 雷达 feed 里的一条任务/会话。列表只展示 `kind=session && status=running`。
+/// 提问的结构化选项（2.20）：面板要把每个选项画成一行，点选即回执。
+private struct RadarOption: Decodable {
+    var id: String?
+    var label: String?
+    var description: String?
+
+    private enum CodingKeys: String, CodingKey { case id, label, description }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try? c.decodeIfPresent(String.self, forKey: .id)
+        label = try? c.decodeIfPresent(String.self, forKey: .label)
+        description = try? c.decodeIfPresent(String.self, forKey: .description)
+    }
+
+    var display: String { label ?? id ?? "选项" }
+}
+
+private struct RadarQuestion: Decodable {
+    var id: String?
+    var question: String?
+    var options: [RadarOption]?
+
+    private enum CodingKeys: String, CodingKey { case id, question, options }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try? c.decodeIfPresent(String.self, forKey: .id)
+        question = try? c.decodeIfPresent(String.self, forKey: .question)
+        options = try? c.decodeIfPresent([RadarOption].self, forKey: .options)
+    }
+}
+
 private struct RadarItem: Decodable {
     var id: String?
     var kind: String?
@@ -189,6 +235,11 @@ private struct RadarItem: Decodable {
     var seen: Bool?
     var updatedAt: Int64?
     var approvalId: String?
+    /// 桥发的一次性审批凭据：HUD 内联批准时要回传，否则 403。
+    var approvalToken: String?
+    /// 桥重启后遗留在队列里的审批：没有活 waiter，点「回答/批准」不会再送达任何进程。
+    var staleApproval: Bool?
+    var runId: String?
     var childCount: Int?
     var team: Bool?
     var children: [RadarChild]?
@@ -197,10 +248,16 @@ private struct RadarItem: Decodable {
     var missing: [String]?
     var path: String?
     var formatStatus: String?
+    /// 提问的结构化问题与选项（2.20）：行标题用问题原文，选项在面板里逐条可点。
+    var questions: [RadarQuestion]?
+    /// 详情页的阶段/起止时间（R-16：以前声明了却从不解码）。
+    var stages: [RadarStage]?
+    var startedAt: Double?
+    var finishedAt: Double?
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, agent, title, status, finalAnswer, seen, updatedAt, approvalId, childCount, team, children
-        case verdict, round, missing, path
+        case verdict, round, missing, path, approvalToken, runId, formatStatus, stages, startedAt, finishedAt, stale, questions
     }
 
     init(from decoder: Decoder) throws {
@@ -220,16 +277,39 @@ private struct RadarItem: Decodable {
         verdict = try? c.decodeIfPresent(String.self, forKey: .verdict)
         round = try? c.decodeIfPresent(Int.self, forKey: .round)
         missing = try? c.decodeIfPresent([String].self, forKey: .missing)
+        approvalToken = try? c.decodeIfPresent(String.self, forKey: .approvalToken)
+        staleApproval = try? c.decodeIfPresent(Bool.self, forKey: .stale)
+        runId = try? c.decodeIfPresent(String.self, forKey: .runId)
+        formatStatus = try? c.decodeIfPresent(String.self, forKey: .formatStatus)
+        questions = try? c.decodeIfPresent([RadarQuestion].self, forKey: .questions)
+        stages = try? c.decodeIfPresent([RadarStage].self, forKey: .stages)
+        // feed 里时间是毫秒；以前这些字段声明了却从不解码（R-16），详情页永远
+        // 只说「刚刚」。这里统一转成秒。
+        startedAt = RadarItem.seconds(c, .startedAt)
+        finishedAt = RadarItem.seconds(c, .finishedAt)
+    }
+
+    private static func seconds(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Double? {
+        if let ms = try? c.decodeIfPresent(Double.self, forKey: key), ms > 0 { return ms / 1000 }
+        if let s = try? c.decodeIfPresent(String.self, forKey: key) {
+            let f = ISO8601DateFormatter()
+            if let date = f.date(from: s) { return date.timeIntervalSince1970 }
+        }
+        return nil
     }
 
     /// 等宿主批准的任务（排在列表最前，桥侧 5 分钟内不处理会自动拒绝）。
     var isApproval: Bool { kind == "approval" }
 
+    /// agent 在向你提问（不是危险命令授权，而是需要你选/答）：提示文案和
+    /// 计数都要与批准区分开（R-05）。
+    var isQuestion: Bool { kind == "question" }
+
+    /// 失败的外部 run：必须出现在面板里，否则用户永远不知道跑挂了（R-13）。
+    var isFailedRun: Bool { kind == "run" && status == "failed" }
+
     /// 办公产物行（docx/xlsx/pptx/pdf），点一下在 Finder 里定位。
     var isArtifact: Bool { kind == "artifact" }
-    var stages: [RadarStage]? = nil
-    var startedAt: Double? = nil
-    var finishedAt: Double? = nil
 
     var isRunningSession: Bool {
         kind == "session" && status == "running"
@@ -309,6 +389,8 @@ private struct RenderState {
     var pending = 0
     var running = 0
     var approvals = 0
+    var questions = 0
+    var failed = 0
     var doneUnread = 0
     var autoConfirmed = 0
     var offline = false
@@ -319,7 +401,10 @@ private struct RenderState {
 
     /// 列表行数（会话 + 运行中/完成未看的外部任务）。
     private var rowCount: Int {
-        items.filter { $0.isApproval || $0.isRunningSession || $0.isRunningRun || $0.isReviewRun || $0.isDoneUnreadRun || $0.isArtifact }.count
+        items.filter {
+            $0.isApproval || $0.isQuestion || $0.isRunningSession || $0.isRunningRun ||
+                $0.isReviewRun || $0.isDoneUnreadRun || $0.isFailedRun || $0.isArtifact
+        }.count
     }
 
     /// 等 L1 判别的外部任务（待验收 / 返工中 / 需用户决定）。
@@ -331,6 +416,18 @@ private struct RenderState {
     /// 待批准的任务，新的在前。
     var approvalItems: [RadarItem] {
         items.filter(\.isApproval)
+            .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+    }
+
+    /// 待回答的提问，新的在前。
+    var questionItems: [RadarItem] {
+        items.filter(\.isQuestion)
+            .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+    }
+
+    /// 失败的 run：新的在前（点开看错误）。
+    var failedRuns: [RadarItem] {
+        items.filter(\.isFailedRun)
             .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
     }
 
@@ -359,16 +456,23 @@ private struct RenderState {
             .map { $0 }
     }
 
-    var panelRows: [RadarItem] { approvalItems + runningSessions + runningRuns + reviewRuns + doneRuns + artifactItems }
+    var panelRows: [RadarItem] {
+        // 提问排最前（用户在等人答），然后才是批准、运行、验收、完成、失败、产物。
+        questionItems + approvalItems + runningSessions + runningRuns + reviewRuns +
+            doneRuns + failedRuns + artifactItems
+    }
     var panelRowCount: Int { rowCount }
 
-    var idle: Bool { running == 0 && approvals == 0 }
+    /// 空闲 = 没有在跑的、没有等批准的、没有待回答的，也没有「完成未看」
+    /// （旧定义漏掉了 doneUnread，于是有未看结果时胶囊也是暗的，R-11）。
+    var idle: Bool { running == 0 && approvals == 0 && questions == 0 && doneUnread == 0 }
 
     /// 活跃任务（等批准 > 运行中 > 完成未看）。
     var activeItems: [RadarItem] {
+        let questions = items.filter { $0.isQuestion }
         let approvals = items.filter { $0.isApproval }
         let running = items.filter { $0.isRunningSession || $0.isRunningRun }
-        return approvals + running
+        return questions + approvals + running
     }
 
     /// 圆内小字：优先给「团队完成度 2/5」，否则给首个运行任务的短名。
@@ -410,7 +514,9 @@ private struct RenderState {
     /// 面板底部/顶部副行：需批准 > 完成未看，取前两个非零。
     var statLines: [(String, NSColor)] {
         var out: [(String, NSColor)] = []
+        if questions > 0 { out.append(("等你回答 \(questions)", NSColor.systemYellow)) }
         if approvals > 0 { out.append(("需批准 \(approvals)", NSColor.systemRed)) }
+        if failed > 0 { out.append(("失败 \(failed)", NSColor.systemRed)) }
         if doneUnread > 0 {
             out.append(("完成未看 \(doneUnread)", NSColor(calibratedWhite: 0.78, alpha: 0.75)))
         }
@@ -428,9 +534,12 @@ private struct RenderState {
         let done = doneRuns
             .map { "\($0.id ?? "-")|\($0.title ?? "-")" }
             .joined(separator: ",")
+        let questions = questionItems.map { "\($0.id ?? "-")" }.joined(separator: ",")
+        let failed = failedRuns.map { "\($0.id ?? "-")" }.joined(separator: ",")
         return "pending=\(pending) running=\(running) approvals=\(approvals) " +
-            "doneUnread=\(doneUnread) offline=\(offline) idle=\(idle) sessions=[\(sessions)] " +
-            "doneRows=[\(done)]"
+            "questions=\(self.questions) doneUnread=\(doneUnread) failed=\(self.failed) " +
+            "offline=\(offline) idle=\(idle) sessions=[\(sessions)] " +
+            "questionRows=[\(questions)] failedRows=[\(failed)] doneRows=[\(done)]"
     }
 }
 
@@ -520,6 +629,9 @@ private enum DetailAction {
     case backToEvents
     case approve
     case reject
+    case answer(Int)
+    /// 提问但没有选项：回执一个确认值（「回复」按钮）。
+    case confirmAnswer
     case jumpSession
 }
 
@@ -855,6 +967,12 @@ private final class PanelContentView: PassthroughView {
 
     /// 详情底部按钮的点击区域。
     private var detailActionHits: [(rect: NSRect, action: DetailAction)] = []
+    /// 当前提问的可点选项：label 与它所属 questionId，点选后回执 {qid: label}（2.20）。
+    var questionChoices: [(questionId: String, label: String)] = []
+    /// 当前详情是不是「提问」类（无选项时把底部按钮换成「回复 / 取消」）。
+    var isQuestionDetail = false
+    /// 无选项提问时用来回执的 question id（取第一个问题的 id）。
+    var questionIdFallback: String?
 
     func detailActionHit(at point: NSPoint) -> DetailAction? {
         for hit in detailActionHits where hit.rect.contains(point) {
@@ -1022,12 +1140,14 @@ private final class PanelContentView: PassthroughView {
                                   width: bounds.width - 2 * padding,
                                   height: HUD.rowHeight)
                 let doneUnread = item.isDoneUnreadRun
-                drawRow(item, index: index, in: rect, doneUnread: doneUnread, approval: item.isApproval)
-                if item.isApproval, let id = item.id, let approvalId = item.approvalId {
+                let asks = item.isApproval || item.isQuestion
+                drawRow(item, index: index, in: rect, doneUnread: doneUnread, approval: asks)
+                if asks, let id = item.id, let approvalId = item.approvalId {
                     approvalRowHits.append((rect: rect, id: id, approvalId: approvalId))
                 } else if doneUnread, let id = item.id {
                     doneRowHits.append((rect: rect, id: id))
-                } else if item.isRunningRun || item.isReviewRun, let id = item.id {
+                } else if item.isRunningRun || item.isReviewRun || item.isFailedRun, let id = item.id {
+                    // 失败的 run 也登记成「可点开看错误」的实时行，否则它只是一行死字。
                     liveRowHits.append((rect: rect, id: id))
                 } else if item.isRunningSession, let id = item.id {
                     sessionRowHits.append((rect: rect, id: id))
@@ -1105,6 +1225,12 @@ private final class PanelContentView: PassthroughView {
         var agentText: String
         if let review = reviewSubtitle(item) {
             agentText = "\((item.agent ?? "unknown").uppercased()) · \(review)"
+        } else if item.isQuestion {
+            agentText = "\((item.agent ?? "unknown").uppercased()) · 等你回答 · 点击处理"
+        } else if item.isFailedRun {
+            let reason = item.finalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
+            agentText = "\((item.agent ?? "unknown").uppercased()) · 失败 · " +
+                (reason?.isEmpty == false ? String((reason ?? "").prefix(28)) : "点击看日志")
         } else if approval {
             agentText = "\((item.agent ?? "unknown").uppercased()) · 待批准 · 点击处理"
         } else if doneUnread {
@@ -1293,7 +1419,43 @@ private final class PanelContentView: PassthroughView {
             .draw(with: bodyRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
                   attributes: bodyAttrs)
 
+        // 提问：把每个选项画成一行可点按钮（2.20）。点中即把
+        // {questionId: label} 回给 agent，而不是 allow/deny。
+        if !questionChoices.isEmpty {
+            var optionY = y - bodyHeight - 10
+            let optionAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.96),
+            ]
+            for (index, choice) in questionChoices.enumerated() {
+                let rect = NSRect(x: padding, y: optionY - 18, width: bounds.width - 2 * padding, height: 20)
+                if rect.minY < HUD.contentPadding + 26 { break }
+                let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+                NSColor.systemBlue.withAlphaComponent(0.30).setFill()
+                path.fill()
+                let label = "\(index + 1). \(choice.label)" as NSString
+                label.draw(in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
+                           withAttributes: optionAttrs)
+                detailActionHits.append((rect: rect, action: .answer(index)))
+                optionY -= 24
+            }
+            drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
+                             color: NSColor.white.withAlphaComponent(0.95),
+                             background: NSColor.systemRed.withAlphaComponent(0.72))
+            return
+        }
+
         // 底部：左「拒绝」（红），右「批准」（绿）
+        if isQuestionDetail {
+            // 无选项提问：不能给「批准/拒绝」这种语义，退化成「回复 / 取消」。
+            drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
+                             color: NSColor.white.withAlphaComponent(0.95),
+                             background: NSColor.systemRed.withAlphaComponent(0.72))
+            drawFooterButton(text: "✎ 回答…", align: .right, action: .confirmAnswer,
+                             color: NSColor.white.withAlphaComponent(0.98),
+                             background: NSColor.systemBlue.withAlphaComponent(0.72))
+            return
+        }
         drawFooterButton(text: "✕ 拒绝", align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
                          background: NSColor.systemRed.withAlphaComponent(0.72))
@@ -1839,6 +2001,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 详情对应 run 已拿到的最大 seq：实时跟随时用它做增量拉取。
     /// 当前审批视图对应的桥内审批 id（点击批准/拒绝时用）。
     private var pendingApprovalId: String?
+    /// N-10：当前审批对应的提问列表（无 options 时要逐条输入文本）。
+    private var pendingQuestions: [RadarQuestion] = []
+    /// 待审批项的一次性 token（桥用来确认「这次决定来自看到这条审批的人」）。
+    private var pendingApprovalToken: String?
+
     private var detailLastSeq = 0
     /// 详情打开期间的增量轮询（只在运行中启用）。
     private var liveDetailTimer: Timer?
@@ -2189,6 +2356,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               url.host != nil else { return nil }
+        // 端口 0（或缺失）说明宿主还没绑定端口：直接采用会让胶囊在下一个轮询里
+        // 连到 127.0.0.1:0 并转 offline（实测 08:49:24 / 08:50:46 两次）。
+        // 这时保留上一次可用 URL，等宿主把真实端口写进文件。
+        if let port = url.port, port <= 0 {
+            log("url ignored port=\(port) file=\(url.absoluteString)")
+            return nil
+        }
         return url
     }
 
@@ -2278,6 +2452,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             state.pending = counts.pending
             state.running = counts.running
             state.approvals = counts.approvals
+            state.questions = counts.questions
+            state.failed = counts.failed
             state.doneUnread = counts.doneUnread
             state.autoConfirmed = counts.autoConfirmed
             state.items = payload.items
@@ -2309,8 +2485,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
         circleView.state = state
         syncPulseTimer()
+        pruneNotifications()
+        notifyQuestions()
         notifyFinished()
         notifyApproval()
+        notifyReview()
         panelContent.state = state
         panelContent.detail = detail
 
@@ -2325,7 +2504,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if state.signature != lastLoggedSignature {
             lastLoggedSignature = state.signature
             log("render pending=\(state.pending) running=\(state.running) " +
-                "approvals=\(state.approvals) doneUnread=\(state.doneUnread) " +
+                "approvals=\(state.approvals) questions=\(state.questions) " +
+                "failed=\(state.failed) doneUnread=\(state.doneUnread) " +
                 "sessions=\(state.runningSessions.count) " +
                 "mode=\(state.offline ? "offline" : (idle ? "idle" : "active")) " +
                 "alpha=\(String(format: "%.2f", window.alphaValue)) " +
@@ -2450,6 +2630,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             "circle=\(NSStringFromRect(currentCircleRect())) " +
             "growLeft=\(growLeft) growUp=\(growUp) sessions=\(state.runningSessions.count) " +
             "screen=\(screen(containing: currentCircleRect())?.localizedName ?? "?")")
+        // N-06：面板一换尺寸，横幅列要重新让位（展开→横幅下移，收起→回到顶部）。
+        if !banners.isEmpty { layoutBanners(animate: true) }
     }
 
     private func setExpanded(_ expand: Bool, animated: Bool) {
@@ -2583,6 +2765,45 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 仅在「有需批准」时跑 20fps 的脉冲定时器，其余时间不额外耗电。
     private var notifiedDone: Set<String> = []
     private var notifiedApproval: Set<String> = []
+    private var notifiedQuestion: Set<String> = []
+    private var notifiedReview: Set<String> = []
+    private var notifiedFailed: Set<String> = []
+
+    /// 通知去重集合必须跟着「当前仍然存在的行」收缩，否则同一个 id 只会提醒
+    /// 一次就永远静默：WorkBuddy 的合成 id 恒为 workbuddy、同一条会话第二次
+    /// 跑完也不再横幅（R-07）。刷新时用当前 feed 重建集合。
+    private func pruneNotifications() {
+        let approvalIds = Set(state.approvalItems.compactMap { $0.id })
+        let questionIds = Set(state.questionItems.compactMap { $0.id })
+        let doneIds = Set(state.items.filter { $0.isDoneUnreadRun }.compactMap { doneKey($0) })
+        let reviewIds = Set(state.reviewRuns.compactMap { $0.id })
+        let failedIds = Set(state.failedRuns.compactMap { $0.id })
+        notifiedApproval.formIntersection(approvalIds)
+        notifiedQuestion.formIntersection(questionIds)
+        notifiedDone.formIntersection(doneIds)
+        notifiedReview.formIntersection(reviewIds)
+        notifiedFailed.formIntersection(failedIds)
+    }
+
+    /// agent 在向你提问：必须有一条可读的横幅，而不是当成普通批准（R-05）。
+    private func notifyQuestions() {
+        for item in state.questionItems {
+            guard let id = item.id, !notifiedQuestion.contains(id) else { continue }
+            notifiedQuestion.insert(id)
+            // 点横幅 = 直接打开这条提问的选项面板（否则用户只知道「有事」，不知道点哪）。
+            showBanner(title: "等你回答", body: item.title ?? "agent 有问题要问你") { [weak self] in
+                self?.openApproval((id: item.id ?? "", approvalId: item.approvalId ?? item.id ?? ""))
+            }
+            log("banner question \(shortId(id)) \(item.title ?? "")")
+        }
+    }
+
+    /// 日志里用短 id：feed 的 id 带 `approval:` / `run:` 前缀，直接 prefix(8)
+    /// 只会打出 `approval` 这种没信息量的串。
+    private func shortId(_ id: String) -> String {
+        let bare = id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? id
+        return String(bare.prefix(8))
+    }
 
     /// 新完成的任务发一条 macOS 通知（同一任务只提醒一次）。
     private func notifyApproval() {
@@ -2590,61 +2811,265 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             guard let id = item.id else { return false }
             return !notifiedApproval.contains(id)
         }
-        guard let first = fresh.first else { return }
-        for item in fresh { if let id = item.id { notifiedApproval.insert(id) } }
-        showBanner(title: "等你批准", body: first.title ?? "有一个任务等你批准")
-        log("banner approval \(first.id) \(first.title)")
-    }
-
-    private func notifyFinished() {
-        let done = state.items.filter { $0.isDoneUnreadRun && ($0.kind == "run" || $0.kind == "session") }
-        for item in done {
-            guard let id = item.id, !notifiedDone.contains(id) else { continue }
-            notifiedDone.insert(id)
-            let title = item.kind == "session" ? "会话完成" : (item.agent ?? "agent").uppercased() + " 任务完成"
-            let text = item.title ?? "任务已完成"
-            showBanner(title: title, body: text)
-            log("banner done \(id.prefix(8)) \(title)")
+        for item in fresh {
+            guard let id = item.id else { continue }
+            notifiedApproval.insert(id)
+            let count = state.approvalItems.count
+            let title = count > 1 ? "等你批准（\(count) 个）" : "等你批准"
+            showBanner(title: title, body: item.title ?? "有一个任务等你批准") { [weak self] in
+                self?.openApproval((id: item.id ?? "", approvalId: item.approvalId ?? item.id ?? ""))
+            }
+            log("banner approval \(shortId(id)) \(item.title ?? "")")
         }
     }
 
-    private var banners: [NSWindow] = []
+    /// 完成提醒：折叠成一条队列卡（2.21）。新完成不断并进同一张卡，标题是
+    /// 「N 个任务完成」+ 最新一条摘要；点卡顶 = 确认这批并让下方上移。
+    /// 去重键带 updatedAt —— 同一 session 第二次完成是一个新事件，必须重新提醒。
+    private var pendingDoneIds: [String] = []
+    private var pendingDoneCount = 0
+    private var doneBanner: NSWindow?
 
-    /// 应用内横幅：不依赖系统通知权限，直接画在屏幕右上角，6 秒后自动消失。
-    private func showBanner(title: String, body: String) {
-        guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
-        let width: CGFloat = 320
-        let height: CGFloat = 88
-        let frame = NSRect(x: screen.visibleFrame.maxX - width - 18,
-                           y: screen.visibleFrame.maxY - height - 12,
-                           width: width, height: height)
+    private func notifyFinished() {
+        let done = state.items.filter { $0.isDoneUnreadRun && ($0.kind == "run" || $0.kind == "session") }
+        let fresh = done.filter { item in
+            guard let key = doneKey(item) else { return false }
+            return !notifiedDone.contains(key)
+        }
+        guard !fresh.isEmpty else { return }
+        for item in fresh { if let key = doneKey(item) { notifiedDone.insert(key) } }
+        // N-07：标题里的 N 与 feed 的 counts.doneUnread **同源同值**（同一个时刻、同一个字段），
+        // 而不是「本次累计提醒了几条」——后者会比未读数大，用户看到「5 个任务完成」但面板只有 2 行。
+        // 点击确认时按同一份 id 集合清，保证「标题 N = 点一下清掉的未读 = 面板消失的行」。
+        let unreadIds = done.compactMap { $0.id }
+        pendingDoneIds = unreadIds
+        pendingDoneCount = state.doneUnread
+        let newest = fresh.max { ($0.updatedAt ?? 0) < ($1.updatedAt ?? 0) } ?? fresh[0]
+        let body = newest.title ?? "任务已完成"
+        // 旧卡先撤掉，避免「一张单条卡 + 一张折叠卡」同时挂着互相覆盖。
+        if let old = doneBanner { dismissBanner(old, reason: "merge"); doneBanner = nil }
+        let count = state.doneUnread
+        let title = count > 1 ? "\(count) 个任务完成" : (newest.kind == "session" ? "会话完成" : (newest.agent ?? "agent").uppercased() + " 任务完成")
+        let ids = pendingDoneIds
+        doneBanner = showBanner(title: title, body: body) { [weak self] in
+            guard let self else { return }
+            // 点折叠卡 = 确认这批未读 + 直接打开最新那条的结果页（N-06：点击必须有可见结果，
+            // 而不是只让卡片消失）。markSeen 与 openDetail 用的是同一批 id。
+            self.markSeen(ids: ids)
+            self.pendingDoneIds = []
+            self.pendingDoneCount = 0
+            self.doneBanner = nil
+            if let newestId = newest.id {
+                log("banner done open newest=\(self.shortId(newestId))")
+                self.openDetail(newestId)
+            }
+        }
+        // 口径证据：count 与 counts.doneUnread 必须相等；ids 是点击时要清的那批。
+        log("banner done queue count=\(count) doneUnread=\(state.doneUnread) ids=\(unreadIds.count) newest=\(shortId(newest.id ?? "-")) \(body)")
+    }
+
+    /// 事件唯一键：run 一次跑完是一个事件（run id 本身唯一）；会话要区分轮次，
+    /// 用 finishedAt 而不是 updatedAt —— updatedAt 会随后续事件前移，同一轮会被
+    /// 误判成新事件反复提醒（实测两个 run 折叠成「3 个任务完成」）。
+    private func doneKey(_ item: RadarItem) -> String? {
+        guard let id = item.id else { return nil }
+        if item.kind == "session" {
+            // finishedAt 是秒，updatedAt 是毫秒：统一成毫秒再取整，避免同一轮两种精度。
+            let round = item.finishedAt.map { Int($0 * 1000) } ?? Int(item.updatedAt ?? 0)
+            return "\(id)#\(round)"
+        }
+        return "\(id)#run"
+    }
+
+    /// 失败/被闸门拦下的任务：以前完全没有主动提示（R-09/R-13）。
+    private func notifyReview() {
+        for item in state.failedRuns {
+            guard let id = item.id, !notifiedFailed.contains(id) else { continue }
+            notifiedFailed.insert(id)
+            let body = (item.finalAnswer?.isEmpty == false ? item.finalAnswer! : item.title) ?? "任务失败了"
+            // N-08：插值必须整体加括号，否则 Swift 会把 `.uppercased()` 当字面量打进标题
+            // （实测横幅出现过 `codex.uppercased() 任务失败`）。
+            let who = (item.agent ?? "agent").uppercased()
+            // 失败卡也可点：点开就是这次 run 的日志/结果（否则用户只能自己去找）。
+            let failedId = id
+            showBanner(title: "\(who) 任务失败", body: body) { [weak self] in
+                self?.openDetail(failedId)
+            }
+            log("banner failed \(id.prefix(8))")
+        }
+        for item in state.reviewRuns where item.status == "blocked" || item.status == "rework" {
+            guard let id = item.id, !notifiedReview.contains(id) else { continue }
+            notifiedReview.insert(id)
+            let title = item.status == "blocked" ? "需要你决定" : "任务被退回"
+            let body = item.title ?? (item.status == "blocked" ? "有任务在等你决定" : "有任务需要返工")
+            showBanner(title: title, body: body)
+            log("banner review \(shortId(id)) status=\(item.status ?? "-")")
+        }
+    }
+
+    /// 通知队列：index 0 是屏幕最上面那一条（最新），点击确认后下方的整体上移一格。
+    private var banners: [NSWindow] = []
+    private var bannerTitles: [ObjectIdentifier: String] = [:]
+    private let bannerWidth: CGFloat = 320
+    private let bannerHeight: CGFloat = 88
+    private let bannerGap: CGFloat = 8
+
+    /// N-09：横幅要出现在「用户正在看的那块屏」。
+    /// 旧实现写死 `NSScreen.screens.first`，多显示器时可能落到另一块屏（甚至不在主屏坐标系里），
+    /// 用户会以为通知丢了。优先级：鼠标所在屏 → 胶囊所在屏 → NSScreen.main → 第一块。
+    /// N-09：横幅跟着「人正在看的屏」走，而不是永远第一块屏。
+    /// 优先级：鼠标所在屏 → 圆形胶囊所在屏 → 主屏 → 第一块屏。
+    private func bannerScreen() -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        let count = NSScreen.screens.count
+        let chosen: NSScreen?
+        let source: String
+        if let hovered = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) {
+            chosen = hovered
+            source = "mouse"
+        } else if let circleScreen = screen(containing: currentCircleRect()) {
+            chosen = circleScreen
+            source = "circle"
+        } else if let main = NSScreen.main {
+            chosen = main
+            source = "main"
+        } else {
+            chosen = NSScreen.screens.first
+            source = "first"
+        }
+        log("banner screen source=\(source) name=\(chosen?.localizedName ?? "?") screens=\(count) mouse=(\(Int(mouse.x)),\(Int(mouse.y)))")
+        return chosen
+    }
+
+    /// 横幅的顶部基线：面板展开且与横幅列水平重叠时，整列横幅让到面板下方，
+    /// 这样「点横幅」永远不会先命中面板空白（N-06 的第二半）。
+    private func bannerTopY(on screen: NSScreen) -> CGFloat {
+        var top = screen.visibleFrame.maxY - 4
+        if isExpanded, let window, window.isVisible {
+            let panel = window.frame
+            let column = NSRect(x: screen.visibleFrame.maxX - bannerWidth - 18,
+                                y: screen.visibleFrame.minY,
+                                width: bannerWidth, height: screen.visibleFrame.height)
+            if panel.intersects(column) {
+                top = min(top, panel.minY - bannerGap)
+                log("banner avoid panel panel=\(NSStringFromRect(panel)) top=\(Int(top))")
+            }
+        }
+        let lowest = screen.visibleFrame.minY + 8
+        if top < lowest {
+            log("banner clamp top=\(Int(top)) -> \(Int(lowest)) (面板占满了右侧)")
+            return lowest
+        }
+        return top
+    }
+
+    /// 队列按「最新在最上面」重排：所有卡片共用同一套槽位计算，绝不重叠。
+    private func layoutBanners(animate: Bool) {
+        guard let screen = bannerScreen() else { return }
+        let baseTop = bannerTopY(on: screen)
+        for (slot, window) in banners.enumerated() {
+            let frame = NSRect(x: screen.visibleFrame.maxX - bannerWidth - 18,
+                               y: baseTop - CGFloat(slot + 1) * (bannerHeight + bannerGap),
+                               width: bannerWidth, height: bannerHeight)
+            if animate {
+                window.setFrame(frame, display: true, animate: true)
+            } else {
+                window.setFrame(frame, display: true)
+            }
+        }
+        // 布局证据：相邻卡中心相距 bannerHeight+gap，任何两条都不会互相覆盖。
+        let slots = banners.enumerated()
+            .map { index, window in "\(index):y=\(Int(window.frame.origin.y))" }
+            .joined(separator: " ")
+        log("banner layout n=\(banners.count) screen=\(screen.localizedName) frame=\(NSStringFromRect(screen.visibleFrame)) " +
+            "baseTop=\(Int(baseTop)) panel=\(isExpanded ? NSStringFromRect(window?.frame ?? .zero) : "collapsed") \(slots)")
+    }
+
+    /// 应用内横幅：不依赖系统通知权限，直接画在屏幕右上角。
+    /// 可点确认的卡（onClick != nil）常驻到被点掉/60s；纯提示卡 6s 自动消失。
+    @discardableResult
+    private func showBanner(title: String, body: String, onClick: (() -> Void)? = nil) -> NSWindow? {
+        guard let screen = bannerScreen() else { return nil }
+        let width = bannerWidth
+        let height = bannerHeight
+        // 队列满 3 条：挤掉最旧的一条（队尾），并在日志里留下被挤掉的标题，不静默丢通知。
+        if banners.count >= 3, let oldest = banners.last {
+            log("banner evict oldest (3 already visible) \(bannerTitles[ObjectIdentifier(oldest)] ?? "-")")
+            banners.removeLast()
+            oldest.orderOut(nil)
+        }
+        let frame = NSRect(x: screen.visibleFrame.maxX - width - 18, y: 0, width: width, height: height)
         let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .statusBar
         window.hasShadow = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        window.ignoresMouseEvents = true
+        window.ignoresMouseEvents = false
         let view = BannerView(frame: NSRect(x: 0, y: 0, width: width, height: height), title: title, body: body)
+        view.onClick = { [weak self, weak window] in
+            guard let window else { return }
+            // 点一下 = 确认：从队列移除并让下面的整体上移（这里靠重排实现）。
+            self?.dismissBanner(window)
+            onClick?()
+        }
         window.contentView = view
         window.alphaValue = 0
         window.orderFrontRegardless()
-        banners.append(window)
+        // 新通知插到队首（最上面），旧的整体下移一格。
+        banners.insert(window, at: 0)
+        bannerTitles[ObjectIdentifier(window)] = title
+        layoutBanners(animate: false)
+        log("banner show queue=\(banners.count) title=\(title)")
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             window.animator().alphaValue = 1
         }
         NSSound(named: NSSound.Name("Glass"))?.play()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak window] in
+        let lifetime: TimeInterval = onClick == nil ? 6 : 60
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self, weak window] in
             guard let window else { return }
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.25
-                window.animator().alphaValue = 0
-            }, completionHandler: {
-                window.orderOut(nil)
-                self?.banners.removeAll { $0 === window }
-            })
+            self?.dismissBanner(window, reason: onClick == nil ? "timeout" : "expired")
         }
+        return window
+    }
+
+    /// 关掉一条横幅并把剩下的整体上移一格（2.21：点最上面一条，下方上顶）。
+    private func dismissBanner(_ window: NSWindow, reason: String = "clicked") {
+        guard let index = banners.firstIndex(where: { $0 === window }) else { return }
+        let title = bannerTitles[ObjectIdentifier(window)] ?? "-"
+        banners.remove(at: index)
+        bannerTitles.removeValue(forKey: ObjectIdentifier(window))
+        log("banner dismiss reason=\(reason) remaining=\(banners.count) title=\(title)")
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.16
+            window.animator().alphaValue = 0
+        }, completionHandler: {
+            window.orderOut(nil)
+        })
+        layoutBanners(animate: true)
+    }
+
+    /// 把一组 id 标为已读：横幅确认后与面板行共用同一份未读数据（2.21）。
+    private func markSeen(ids: [String]) {
+        guard !ids.isEmpty else { return }
+        let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
+        guard var components = URLComponents(string: raw), components.host != nil else { return }
+        var segments = components.path.split(separator: "/").map(String.init)
+        if let last = segments.last, last.hasPrefix("radar") {
+            segments[segments.count - 1] = "seen"
+        } else {
+            segments.append("seen")
+        }
+        components.path = "/" + segments.joined(separator: "/")
+        components.queryItems = [URLQueryItem(name: "id", value: ids.joined(separator: ","))]
+        guard let url = components.url else { return }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
+            DispatchQueue.main.async { self?.fetchNow(reason: "after-banner-confirm") }
+        }.resume()
+        log("banner confirm \(ids.count) item(s)")
     }
 
     private func appleScriptString(_ value: String) -> String {
@@ -2653,7 +3078,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     private func syncPulseTimer() {
-        let wanted = state.approvals > 0 || state.doneUnread > 0
+        let wanted = state.approvals > 0 || state.questions > 0 || state.doneUnread > 0
         if wanted, pulseTimer == nil {
             let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 guard let self, let circleView = self.circleView else { return }
@@ -2663,11 +3088,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
             RunLoop.main.add(timer, forMode: .common)
             pulseTimer = timer
+            // 绿呼吸/红呼吸的唯一驱动条件就是这三个计数，日志留证便于验收。
+            log("pulse on approvals=\(state.approvals) questions=\(state.questions) doneUnread=\(state.doneUnread)")
         } else if !wanted, let timer = pulseTimer {
             timer.invalidate()
             pulseTimer = nil
             pulsePhase = 0
             circleView?.pulse = 0
+            log("pulse off")
         }
     }
 
@@ -2683,6 +3111,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // 拖拽过程中鼠标必然会离开圆形范围，此时收起了就再也不会回到新位置。
         guard !isDragging else { return }
         guard isExpanded, !options.forceExpanded else { return }
+        // 从横幅点进来的详情/审批，鼠标本来就停在横幅上（面板外）。若按 hover 规则
+        // 自动收起，用户会看到面板闪一下就没了。详情或待审批期间一律不自动收起。
+        guard detailMode == .summary, pendingApprovalId == nil else { return }
         scheduleCollapse()
     }
 
@@ -2692,6 +3123,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             guard let self else { return }
             self.collapseTimer = nil
             guard self.isExpanded, !self.options.forceExpanded else { return }
+            guard self.detailMode == .summary, self.pendingApprovalId == nil else { return }
             self.setExpanded(false, animated: true)
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -2781,6 +3213,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         decideApproval(approve: true)
                     case .reject:
                         decideApproval(approve: false)
+                    case .confirmAnswer:
+                        // N-10：固定回「确认」等于替用户编造回答（模型会把它当成真实选择）。
+                        // 无 options 时必须让用户真的输入文本。
+                        promptAnswers()
+                    case .answer(let index):
+                        answerQuestion(optionIndex: index)
                     case .jumpSession:
                         let target = detail?.runId ?? ""
                         closeDetail()
@@ -2849,24 +3287,105 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func openApproval(_ hit: (id: String, approvalId: String)) {
         guard let item = state.items.first(where: { $0.id == hit.id }) else { return }
         pendingApprovalId = hit.approvalId
+        pendingApprovalToken = item.approvalToken
+        pendingQuestions = item.questions ?? []
         detailMode = .approval
         detailLastSeq = 0
+        let question = item.isQuestion
+        var choices: [(questionId: String, label: String)] = []
+        if question {
+            for (qi, ask) in (item.questions ?? []).enumerated() {
+                let qid = ask.id ?? "q\(qi)"
+                for option in ask.options ?? [] {
+                    choices.append((questionId: qid, label: option.display))
+                }
+            }
+        }
+        panelContent?.questionChoices = choices
+        panelContent?.isQuestionDetail = question
+        panelContent?.questionIdFallback = (item.questions ?? []).first?.id
         detail = RadarDetail(
-            title: "\((item.agent ?? "codex").uppercased()) 请求批准",
+            title: "\((item.agent ?? "codex").uppercased()) " + (question ? "有问题要问你" : "请求批准"),
             agent: item.agent ?? "codex",
-            meta: "等你决定 · 5 分钟内不处理会自动拒绝",
+            meta: item.staleApproval == true
+                ? "这条审批是宿主重启前留下的，已经没有进程在等它，可以直接忽略"
+                : question
+                    ? ((item.questions ?? []).allSatisfy { ($0.options ?? []).isEmpty }
+                        ? "等你回答 · 这条提问要自由文本，点「✎ 回答…」输入后发送；不答超时按拒绝处理"
+                        : "等你回答 · 选一个选项 = 回执该选项；不答超时按拒绝处理")
+                    : "等你决定 · 5 分钟内不处理会自动拒绝",
             body: item.title ?? "",
             runId: item.id ?? "",
             live: false
         )
         panelContent?.detailMode = .approval
         panelContent?.detail = detail
+        // N-06：点横幅（或列表行）后必须展开，否则「打开详情」是看不见的。
+        if !isExpanded { setExpanded(true, animated: true) }
         refreshExpandedGeometry(animated: true)
-        log("approval open id=\(hit.approvalId.prefix(8))")
+        log("approval open id=\(hit.approvalId.prefix(8)) expanded=\(isExpanded)")
+    }
+
+    /// N-10：自由文本提问的回答入口。
+    ///
+    /// 无 options 时不能给固定字符串：这里用带文本框的 NSAlert 让用户输入真实内容，
+    /// 再按 `{questionId: text}` 回执（bridge 会包成 `{answers:{qid:{answers:[text]}}}`）。
+    /// 多问题逐个输入；任何一次取消都整体放弃，绝不半提交。
+    /// 边界：这是 HUD 内的轻量输入，不支持多行富文本；需要长答案请在会话里回答。
+    private func promptAnswers() {
+        let asks = pendingQuestions
+        let fallbackQid = panelContent?.questionIdFallback ?? "reply"
+        var collected: [String: String] = [:]
+        if asks.isEmpty {
+            guard let text = promptText(title: "回答这个提问", message: detail?.body ?? "") else {
+                log("question free-text cancelled (no question metadata)")
+                return
+            }
+            collected[fallbackQid] = text
+        } else {
+            for (index, ask) in asks.enumerated() {
+                let qid = ask.id ?? "q\(index)"
+                let title = asks.count > 1 ? "回答 \(index + 1)/\(asks.count)" : "回答这个提问"
+                guard let text = promptText(title: title, message: ask.question ?? detail?.body ?? "") else {
+                    log("question free-text cancelled qid=\(qid)")
+                    return
+                }
+                collected[qid] = text
+            }
+        }
+        guard !collected.isEmpty else { return }
+        log("question free-text answered count=\(collected.count) keys=\(collected.keys.sorted().joined(separator: ","))")
+        decideApproval(approve: true, answers: collected)
+    }
+
+    /// 一次单行文本输入（NSAlert + accessory NSTextField）。取消返回 nil。
+    private func promptText(title: String, message: String) -> String? {
+        log("question free-text prompt title=\(title) message=\(message.prefix(40))")
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message.isEmpty ? "请输入你的回答" : message
+        alert.addButton(withTitle: "发送")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "输入你的回答（可以是一整句话）"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return nil }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     /// 批准/拒绝：代理到宿主 `/x-radar/approval-decide`，随后收起并刷新。
-    private func decideApproval(approve: Bool) {
+    /// 选中某个选项 = 回执 {qid: label}（2.20），与 allow/deny 完全分开。
+    private func answerQuestion(optionIndex: Int) {
+        guard let panelContent, panelContent.questionChoices.indices.contains(optionIndex) else { return }
+        let choice = panelContent.questionChoices[optionIndex]
+        decideApproval(approve: true, answers: [choice.questionId: choice.label])
+    }
+
+    private func decideApproval(approve: Bool, answers: [String: String]? = nil) {
         guard let approvalId = pendingApprovalId else { return }
         let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
         guard var components = URLComponents(string: raw), components.host != nil else { return }
@@ -2877,19 +3396,38 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             segments.append("approval-decide")
         }
         components.path = "/" + segments.joined(separator: "/")
-        components.queryItems = [
+        var items = [
             URLQueryItem(name: "id", value: approvalId),
             URLQueryItem(name: "decision", value: approve ? "accept" : "decline"),
+            URLQueryItem(name: "token", value: pendingApprovalToken ?? ""),
         ]
+        if let answers, !answers.isEmpty,
+           let data = try? JSONSerialization.data(withJSONObject: answers),
+           let json = String(data: data, encoding: .utf8) {
+            items.append(URLQueryItem(name: "answers", value: json))
+        }
+        components.queryItems = items
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         request.httpMethod = "GET"
-        let decision = approve ? "accept" : "decline"
+        let decision = answers?.isEmpty == false ? "answer" : (approve ? "accept" : "decline")
         URLSession.shared.dataTask(with: request) { data, _, error in
             let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            var applied = false
+            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                applied = (obj["ok"] as? Bool) == true
+            }
             DispatchQueue.main.async {
-                log("approval decide \(decision) -> \(text.isEmpty ? (error?.localizedDescription ?? "no body") : text)")
+                log("approval decide \(decision) ok=\(applied) -> \(text.isEmpty ? (error?.localizedDescription ?? "no body") : text)")
+                guard applied else {
+                    // 旧实现不管桥回 502 都关详情、清 pending，用户以为批了其实没有（R-06）。
+                    self.showBanner(title: "批准没有生效", body: text.isEmpty ? "桥未确认，详情已保留，可重试" : String(text.prefix(60)))
+                    self.fetchNow(reason: "after-approval-failed")
+                    return
+                }
                 self.pendingApprovalId = nil
+                self.pendingApprovalToken = nil
+                self.pendingQuestions = []
                 self.closeDetail()
                 self.fetchNow(reason: "after-approval")
             }
@@ -3079,6 +3617,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                              runId: id,
                              live: item.isRunningSession || item.isRunningRun)
         panelContent?.detail = detail
+        // N-06：打开详情必须真的把面板放出来。旧实现只设 detailMode/detail，
+        // 点横幅后窗口仍是 56x56 收起态，用户只看到横幅消失。
+        if !isExpanded { setExpanded(true, animated: true) }
         refreshExpandedGeometry(animated: true)
         if item.isDoneUnreadRun, !(item.seen ?? false) {
             markSeen([id])
