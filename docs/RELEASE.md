@@ -21,6 +21,11 @@
 **唯一发布源**是仓库里的 `release/agent-suite/bundle/`；`/tmp` 只放构建产物，不承担安装来源。
 构建：`bash scripts/build-tarball.sh`（产物在 `dist/`，`dist/` 不入库）。
 
+
+> 历史说明：`.github/workflows/publish-npm.yml` 是 0.7 时代「四个包分别发 npm」的遗留流程。
+> 现在四个成员以 `private` 打捆进整合包，发版只产出本 tarball 与 GitHub Release，
+> 因此该 workflow 在 tag 上会以 `EPRIVATE` 失败，属预期，不影响发布物。
+
 ## 二、安装
 
 ### 0. 硬前提：换包后必须重启 DSH 宿主
