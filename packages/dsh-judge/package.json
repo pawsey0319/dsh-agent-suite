@@ -1,7 +1,6 @@
 {
-  "name": "@pawsey0319/dsh-judge",
+  "name": "@pawsey/dsh-judge",
   "version": "0.1.3",
-  "private": true,
   "type": "module",
   "description": "L1 acceptance judge for DSH: task contracts, deterministic checks, LLM verdicts, notification gate and rework loop.",
   "exports": {

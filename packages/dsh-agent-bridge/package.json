@@ -1,7 +1,6 @@
 {
-  "name": "@pawsey0319/dsh-agent-bridge",
+  "name": "@pawsey/dsh-agent-bridge",
   "version": "0.6.1",
-  "private": true,
   "type": "module",
   "description": "Drive Codex / Claude Code / WorkBuddy from DSH chats — external runs, approval bridging, aggregate API passthrough, dsh-bridge CLI.",
   "icon": "icon.svg",

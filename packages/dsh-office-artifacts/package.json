@@ -1,7 +1,6 @@
 {
-  "name": "@pawsey0319/dsh-office-artifacts",
+  "name": "@pawsey/dsh-office-artifacts",
   "version": "0.1.1",
-  "private": true,
   "type": "module",
   "description": "Scan workspaces for office artifacts (docx/xlsx/pptx/pdf) and reveal them in Finder.",
   "exports": {
