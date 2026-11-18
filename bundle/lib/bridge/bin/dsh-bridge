@@ -9,19 +9,94 @@
  *
  * 端口从 ~/.dsh/agent-bridge/bridge-url.json 读取（宿主每次启动都会刷新）。
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { connect } from 'node:net'
 import { join } from 'node:path'
 
 const HOME = process.env.HOME ?? '/tmp'
-const URL_FILE = join(HOME, '.dsh', 'agent-bridge', 'bridge-url.json')
+const BRIDGE_DIR = join(HOME, '.dsh', 'agent-bridge')
+const URL_FILE = join(BRIDGE_DIR, 'bridge-url.json')
+const HOSTS_DIR = join(BRIDGE_DIR, 'hosts')
+
+/** 解析出来的基底 URL（main 启动时先探活再定；后续 call() 直接用）。 */
+let RESOLVED = null
+
+/** 端口是否还有进程在 listen —— 只连 TCP，不发 HTTP，20–200ms 出结果。 */
+function probePort(port, timeoutMs = 300) {
+  return new Promise((resolve) => {
+    if (!Number.isFinite(port) || port <= 0) return resolve(false)
+    const socket = connect({ host: '127.0.0.1', port, timeout: timeoutMs })
+    const done = (ok) => {
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(ok)
+    }
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
+
+function readUrlFile(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (!parsed?.url) return null
+    return {
+      url: String(parsed.url).replace(/\/$/, ''),
+      port: Number(parsed.port ?? new URL(String(parsed.url)).port),
+      updatedAt: Number(parsed.updatedAt ?? 0),
+      file,
+      legacy: file === URL_FILE,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 找到「当前活着的那个宿主」（N-14）。
+ *
+ * 优先级：DSH_BRIDGE_URL（调用方显式指定）→ hosts/<port>/bridge-url.json 里
+ * TCP 还通的那个（多个宿主并存时取 updatedAt 最新的活宿主）→ 根目录兼容镜像。
+ * 都找不到时给出可诊断错误（不再是一句 fetch failed）。
+ */
+async function discoverBase() {
+  const override = process.env.DSH_BRIDGE_URL
+  if (override) return override.replace(/\/$/, '')
+
+  const candidates = []
+  try {
+    for (const name of readdirSync(HOSTS_DIR)) {
+      const found = readUrlFile(join(HOSTS_DIR, name, 'bridge-url.json'))
+      if (found) candidates.push(found)
+    }
+  } catch {}
+  const legacy = readUrlFile(URL_FILE)
+  if (legacy) candidates.push(legacy)
+
+  const seen = new Set()
+  const unique = candidates.filter((entry) => {
+    if (seen.has(entry.url)) return false
+    seen.add(entry.url)
+    return true
+  })
+  unique.sort((a, b) => b.updatedAt - a.updatedAt)
+  for (const entry of unique) {
+    if (await probePort(entry.port)) return entry.url
+  }
+
+  const where = unique.length > 0
+    ? `找过这些端口但都没在监听：${unique.map((entry) => `${entry.port}(${entry.file})`).join(', ')}`
+    : `没有任何 bridge-url.json（找过 ${HOSTS_DIR}/*/bridge-url.json 和 ${URL_FILE}）`
+  throw new Error(`找不到活着的 DSH 宿主：${where}\n提示：确认 DSH 在运行且 @pawsey0319/dsh-agent-suite 已启用；或显式指定 DSH_BRIDGE_URL=http://127.0.0.1:<port>`)
+}
 
 function baseUrl() {
   const override = process.env.DSH_BRIDGE_URL
   if (override) return override.replace(/\/$/, '')
-  try {
-    const parsed = JSON.parse(readFileSync(URL_FILE, 'utf8'))
-    if (parsed?.url) return String(parsed.url).replace(/\/$/, '')
-  } catch {}
+  if (RESOLVED) return RESOLVED
+  const legacy = readUrlFile(URL_FILE)
+  if (legacy) return legacy.url
   throw new Error('找不到 bridge-url.json：宿主没在运行，或插件未启用')
 }
 
@@ -51,21 +126,29 @@ function parseArgs(argv) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// 事件窗口：绝不能是 limit=1。turn.end 之后 codex 还会发 mcpServer/startupStatus/updated（实测 234–448ms），
+// 单事件窗口会被它顶掉，CLI 就拿不到 turn.end 也拿不到 text 事件，打印「(没有文本输出)」（final-answer-race.md 主因）。
+const EVENT_WINDOW = 200
+
 async function waitRun(runId, timeoutSeconds) {
   const deadline = Date.now() + timeoutSeconds * 1000
   let lastStatus = ''
   while (Date.now() < deadline) {
-    const data = await call(`/agent-bridge/runs/${runId}?limit=1`)
+    const data = await call(`/agent-bridge/runs/${runId}?limit=${EVENT_WINDOW}`)
     const run = data?.run ?? {}
     const status = run.status ?? 'unknown'
     if (status !== lastStatus) {
       lastStatus = status
       process.stderr.write(`[dsh-bridge] ${runId.slice(0, 8)} ${status}${status === 'needs-approval' ? '（等待批准，去胶囊面板处理）' : ''}\n`)
     }
-    if (status === 'done' || status === 'failed' || status === 'cancelled') return data
+    if (status === 'done' || status === 'failed' || status === 'cancelled') {
+      // 终止后再拉一次：status 与最后一批事件之间可能有竞态，二次拉取拿到的是终态快照。
+      const settled = await call(`/agent-bridge/runs/${runId}?limit=${EVENT_WINDOW}`).catch(() => data)
+      return { ...settled, run: { ...(settled?.run ?? run) } }
+    }
     await sleep(1500)
   }
-  const final = await call(`/agent-bridge/runs/${runId}?limit=1`)
+  const final = await call(`/agent-bridge/runs/${runId}?limit=${EVENT_WINDOW}`)
   return { ...final, timeout: true }
 }
 
@@ -80,6 +163,13 @@ function answerFrom(events) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2)
   const options = parseArgs(rest)
+
+  if (command && command !== 'help' && command !== '--help') {
+    // 先把「当前活宿主」定下来：多宿主并存时按 hosts/<port>/ 探活，
+    // 拿到死端口时在启动阶段就报清楚，而不是后续 fetch failed（N-14）。
+    RESOLVED = await discoverBase()
+    if (process.env.DSH_BRIDGE_VERBOSE) process.stderr.write(`[dsh-bridge] base=${RESOLVED}\n`)
+  }
 
   if (command === 'doctor') {
     // 聚合 API 的唯一事实来源就是 DSH 自己在用的那个 provider（profile/cordis.patch.yml）。
@@ -149,8 +239,11 @@ async function main() {
     const runId = started?.runId ?? started?.id
     process.stderr.write(`[dsh-bridge] run ${runId} agent=${agent} cwd=${cwd}\n`)
     const finished = await waitRun(runId, Number(options.timeout ?? 180))
-    const answer = answerFrom(finished?.events)
     const run = finished?.run ?? {}
+    // 终止判定优先读 run.finalAnswer（bridge 已对 phase:null / 尾随通知做兜底），事件流只作后备。
+    const answer = (typeof run.finalAnswer === 'string' && run.finalAnswer.trim())
+      ? run.finalAnswer
+      : answerFrom(finished?.events)
     process.stdout.write(`${answer || '(没有文本输出)'}\n`)
     process.stderr.write(`[dsh-bridge] status=${run.status} duration=${run.durationMs ?? '?'}ms tokens=${run.usage?.total?.totalTokens ?? '?'}${finished?.timeout ? ' TIMEOUT' : ''}\n`)
     return run.status === 'done' ? 0 : 1
@@ -169,7 +262,10 @@ async function main() {
     const runId = options._[0]
     if (!runId) throw new Error('缺少 runId')
     const data = await call(`/agent-bridge/runs/${runId}?limit=200`)
-    process.stdout.write(`${answerFrom(data?.events)}\n\n--- 事件 ---\n`)
+    const shown = (typeof data?.run?.finalAnswer === 'string' && data.run.finalAnswer.trim())
+      ? data.run.finalAnswer
+      : answerFrom(data?.events)
+    process.stdout.write(`${shown}\n\n--- 事件 ---\n`)
     for (const event of data?.events ?? []) {
       process.stdout.write(`${String(event.seq).padStart(4)} ${String(event.kind).padEnd(12)} ${String(event.text ?? event.status ?? '').replace(/\s+/g, ' ').slice(0, 90)}\n`)
     }

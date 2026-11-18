@@ -93,10 +93,14 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(() => {
+        // N-21：只在 apply 时打点会让 /agent-suite/health 的 clientHalf 在 30s 后误判为 inactive。
+        // 这里按 6s 心跳一次，跳转轮询仍是 POLL_MS。
+        const heartbeat = setInterval(() => { if (!disposed) beacon('client.alive') }, 6000)
         const timer = setInterval(tick, POLL_MS)
         return () => {
           disposed = true
           clearInterval(timer)
+          clearInterval(heartbeat)
         }
       })
     }

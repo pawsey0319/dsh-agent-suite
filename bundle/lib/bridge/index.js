@@ -26,7 +26,7 @@
  *                                   失败退回 create({cwd}) + 原任务摘要
  * 队列持久化在 ~/.dsh/agent-bridge/pending-approvals.json，只存可序列化字段。
  */
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { autoConfirm as wbAutoConfirm, clearPending as wbClearPending, confirmAudit as wbAudit, pendingInfo as wbPending, launch as wbLaunch, readLast as wbReadLast, send as wbSend, state as wbState } from './workbuddy.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -57,6 +57,18 @@ function log(message) {
 }
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+// 还在跑的状态：这些之外都算终态（N-18 用来决定 SSE 是否立即结束）。
+const RUN_ACTIVE = new Set(['running', 'starting', 'queued', 'needs-approval', 'needs-answer'])
+// 无 waiter 的孤儿审批（宿主重载后遗留、且多半没有 token）留一个有限的观察窗口：
+// 超时后自动从队列消失，避免胶囊红环永远亮着。可用环境变量缩短（smoke 用）。
+const ORPHAN_TTL_MS = (() => {
+  const raw = Number(process.env.DSH_AGENT_BRIDGE_ORPHAN_TTL_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000
+})()
+const ORPHAN_SWEEP_MS = (() => {
+  const raw = Number(process.env.DSH_AGENT_BRIDGE_ORPHAN_SWEEP_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 1000
+})()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // P2：审批聚合 + 会话恢复。
@@ -191,10 +203,13 @@ function snapshotPending(entry) {
     runId: entry.runId ?? null,
     agent: entry.agent ?? null,
     method: entry.method ?? null,
+    kind: entry.kind ?? null,
     params: entry.params ?? null,
     at: entry.at ?? null,
     note: entry.note ?? null,
     stale: entry.stale === true,
+    // 无 waiter 的起始时刻：过期计时从「变孤儿」开始，而不是从创建开始（否则重启即秒过期）。
+    orphanedAt: entry.orphanedAt ?? null,
   }
 }
 
@@ -254,7 +269,7 @@ class PendingApprovalStore {
   upsert(entry) {
     const clean = sanitizePending(entry)
     if (clean === null) return null
-    this.items.set(clean.id, { ...clean, stale: false })
+    this.items.set(clean.id, { ...clean, stale: false, orphanedAt: null })
     while (this.items.size > PENDING_LIMIT) {
       const oldest = this.items.keys().next().value
       if (oldest === undefined) break
@@ -265,15 +280,17 @@ class PendingApprovalStore {
   }
 
   /** 宿主重载后，磁盘里剩下的条目都没有活 waiter 了。 */
-  markAllStale() {
+  markAllStale(now = Date.now()) {
     let changed = 0
     for (const entry of this.items.values()) {
       if (entry.stale !== true) {
         entry.stale = true
         changed += 1
       }
+      // 老版本落盘的条目没有 orphanedAt：以「本次重载」作为孤儿起点，给它完整的 TTL。
+      if (typeof entry.orphanedAt !== 'number') entry.orphanedAt = now
     }
-    if (changed > 0) this.save()
+    this.save()
     return changed
   }
 
@@ -291,6 +308,108 @@ class PendingApprovalStore {
     this.save()
     return count
   }
+}
+
+/**
+ * 扫掉「没有活 waiter 且已超过 ORPHAN_TTL_MS」的队列条目。
+ *
+ * 这些条目在 approvals Map 里已经没有 resolve/timer，任何决策都送不到子进程；
+ * 留着只会让 HUD 的红环一直呼吸。带 token 的活审批不在扫描范围内（它们的 waiter
+ * 还在 approvals 里），因此不会削弱鉴权。
+ */
+function reapOrphanApprovals({ store, approvals, now = Date.now(), ttlMs = ORPHAN_TTL_MS }) {
+  const liveIds = new Set([...approvals.keys()].map((id) => String(id)))
+  const expired = []
+  for (const entry of store.list()) {
+    if (liveIds.has(String(entry.id))) continue
+    if (entry.stale !== true) continue
+    const since = typeof entry.orphanedAt === 'number' ? entry.orphanedAt : entry.at ? Date.parse(entry.at) : NaN
+    if (!Number.isFinite(since)) continue
+    const ageMs = now - since
+    if (ageMs < ttlMs) continue
+    if (store.remove(entry.id)) expired.push({ id: entry.id, ageMs, tokenless: typeof entry.token !== 'string' || entry.token === '' })
+  }
+  const humanAge = (ms) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}min` : `${(ms / 1000).toFixed(1)}s`)
+  for (const row of expired) {
+    log(`approval expire id=${String(row.id).slice(0, 12)} age=${humanAge(row.ageMs)} tokenless=${row.tokenless ? 'yes' : 'no'} reason=no-waiter-ttl ttl=${humanAge(ttlMs)}`)
+  }
+  return expired
+}
+
+/**
+ * 宿主重载后的一次性对账：`status=needs-approval` 但队列里已经没有活 waiter 的 run
+ * 永远不会再被裁决（子进程早就不在了），留着只会让胶囊显示「待批准」却没有可点的
+ * 审批对象（approvals=0 与 needs-approval 行并存）。这里把它归一到终态 failed，
+ * 并留下可审计的日志与事件。
+ *
+ * 判定只看 approvals Map（唯一能把决策送回子进程的通道）：有活 waiter 的 run 不动。
+ */
+function reconcileRuns({ store, approvals, log = () => {} }) {
+  const liveRunIds = new Set(
+    [...approvals.values()]
+      .map((entry) => (entry && entry.runId !== undefined && entry.runId !== null ? String(entry.runId) : ''))
+      .filter((id) => id !== ''),
+  )
+  let dirs = []
+  try {
+    dirs = readdirSync(RUNS)
+  } catch {
+    return []
+  }
+  const now = new Date().toISOString()
+  const reconciled = []
+  for (const id of dirs) {
+    if (liveRunIds.has(id)) continue
+    const dir = join(RUNS, id)
+    let meta = null
+    try {
+      meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'))
+    } catch {
+      continue
+    }
+    if (meta === null || typeof meta !== 'object' || meta.status !== 'needs-approval') continue
+    // 内存里加载过的 run 走 RunStore（同时写 SSE + meta）；更早的历史 run 只修磁盘。
+    const run = store.runs.get(id)
+    if (run) {
+      try {
+        store.append(run, {
+          kind: 'run.reconcile',
+          from: 'needs-approval',
+          to: 'failed',
+          reason: 'no_live_waiter',
+          note: '宿主重启后审批队列里没有这个 run 的 waiter，已归一为终态',
+        })
+      } catch {}
+      store.setStatus(run, 'failed', {
+        error: 'approval waiter lost on host restart (no live waiter)',
+        reason: 'no_live_waiter',
+        reconciledAt: now,
+      })
+    } else {
+      const next = {
+        ...meta,
+        status: 'failed',
+        error: 'approval waiter lost on host restart (no live waiter)',
+        reason: 'no_live_waiter',
+        reconciledAt: now,
+        updatedAt: now,
+      }
+      try {
+        writeFileSync(join(dir, 'meta.json'), `${JSON.stringify(next, null, 2)}\n`)
+        const seq = Number.isFinite(meta.eventCount) ? meta.eventCount + 1 : 1
+        appendFileSync(
+          join(dir, 'events.jsonl'),
+          `${JSON.stringify({ seq, at: now, kind: 'run.reconcile', from: 'needs-approval', to: 'failed', reason: 'no_live_waiter', note: '宿主重启后审批队列里没有这个 run 的 waiter，已归一为终态' })}\n`,
+        )
+      } catch (error) {
+        log(`run reconcile id=${String(id).slice(0, 8)} write failed: ${String(error?.message ?? error)}`)
+        continue
+      }
+    }
+    reconciled.push(id)
+    log(`run reconcile id=${String(id).slice(0, 8)} from=needs-approval to=failed reason=no_live_waiter`)
+  }
+  return reconciled
 }
 
 // 插件目录本体（随包分发的资源用这个定位，不能用 cwd 推断）
@@ -667,6 +786,9 @@ class RunStore {
       finalAnswer: run.finalAnswer ?? null,
       durationMs: run.durationMs ?? null,
       error: run.error,
+      // 对账后的终态要能解释「为什么不是正常结束」：HUD/雷达直接读这两个字段。
+      reason: run.reason ?? null,
+      reconciledAt: run.reconciledAt ?? null,
     }
     try {
       writeFileSync(join(run.dir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`)
@@ -752,6 +874,31 @@ class RunStore {
   }
 }
 
+/**
+ * 取本次 turn 的最终答案。
+ * codex 正常给 phase==='final_answer'，但部分版本（线上 ffe2a911、06e1bf59）给 phase:null，
+ * 严格按 phase 过滤会让 turn.end / run.finalAnswer 永久为 null；这里回退最后一个带文本的 agentMessage。
+ */
+function finalAnswerFromItems(items) {
+  const list = Array.isArray(items) ? items : []
+  const hasText = (entry) => typeof entry?.text === 'string' && entry.text.trim() !== ''
+  const preferred = list.find((entry) => entry?.type === 'agentMessage' && entry?.phase === 'final_answer' && hasText(entry)) ?? null
+  if (preferred) return { text: preferred.text, source: 'final_answer', phase: preferred.phase ?? null }
+  const fallback = [...list].reverse().find((entry) => entry?.type === 'agentMessage' && hasText(entry)) ?? null
+  if (fallback) return { text: fallback.text, source: 'agentMessage', phase: fallback.phase ?? null }
+  return null
+}
+
+/** 最后一个带文本的 text 事件（item/agentMessage/delta 累积后的兜底）。 */
+function lastTextEvent(events) {
+  const list = Array.isArray(events) ? events : []
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const record = list[i]
+    if (record?.kind === 'text' && typeof record.text === 'string' && record.text.trim() !== '') return record.text
+  }
+  return null
+}
+
 /** Normalize a Codex notification into a compact timeline row (raw kept). */
 function normalize(notification) {
   const { method, params } = notification
@@ -772,7 +919,7 @@ function normalize(notification) {
   }
   if (method === 'turn/completed') {
     const items = Array.isArray(params?.turn?.items) ? params.turn.items : []
-    const final = items.find((entry) => entry?.type === 'agentMessage' && entry?.phase === 'final_answer') ?? null
+    const final = finalAnswerFromItems(items)
     return {
       kind: 'turn.end',
       status: params?.turn?.status ?? null,
@@ -946,17 +1093,71 @@ function applyUpstream(env, kind) {
   return env
 }
 
+/** 端口上是否还有进程在 listen（同步，~20ms）：判断根目录镜像该不该让位。 */
+function portListening(port) {
+  if (!Number.isFinite(port) || port <= 0) return false
+  try {
+    execFileSync('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], {
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function apply(ctx) {
   // 写一份自描述文件，供 CLI / MCP 桥接进程发现当前宿主端口（端口每次重启都变）。
-  try {
+  //
+  // N-14：同一台机器可能同时跑两个 DSH 宿主（desktop 与 web profile），旧版只写
+  // 根目录 bridge-url.json —— 后启动的宿主会把它覆盖成自己的端口，另一个宿主的
+  // `dsh-bridge run` 就连到别人身上（或连到已死端口 fetch failed）。
+  // 现在权威文件是 hosts/<port>/bridge-url.json，根目录只保留兼容镜像（仅在不存在/
+  // 指向自己/已过期时才刷新）。
+  const publishUrl = () => {
     const port = ctx.webServer?.port
-    if (port) {
+    if (!port) return false
+    try {
       // 新 profile 首次运行时 ROOT 还不存在：不 mkdir 会静默丢文件（F-12）。
       mkdirSync(ROOT, { recursive: true })
-      writeFileSync(join(ROOT, 'bridge-url.json'), `${JSON.stringify({ url: `http://127.0.0.1:${port}`, port, updatedAt: Date.now() }, null, 2)}\n`)
+      const dir = join(ROOT, 'hosts', String(port))
+      mkdirSync(dir, { recursive: true })
+      const body = `${JSON.stringify({ url: `http://127.0.0.1:${port}`, port, host: String(port), updatedAt: Date.now() }, null, 2)}\n`
+      writeFileSync(join(dir, 'bridge-url.json'), body)
+      const legacy = join(ROOT, 'bridge-url.json')
+      let current
+      try {
+        current = JSON.parse(readFileSync(legacy, 'utf8'))
+      } catch {
+        current = undefined
+      }
+      const currentPort = Number(current?.port)
+      const own = current && currentPort === port
+      // 根文件指向的端口还活着 = 另一个宿主在用，别覆盖（多宿主并存的关键）。
+      const takenByLiveHost = Number.isFinite(currentPort) && currentPort !== port && portListening(currentPort)
+      const stale = !current || !Number.isFinite(Number(current.updatedAt)) || Date.now() - Number(current.updatedAt) > 10 * 60 * 1000
+      if (takenByLiveHost) {
+        log(`bridge-url legacy kept port=${currentPort} self=${port} (另一宿主仍在线，未覆盖)`)
+      } else if (own || stale) {
+        writeFileSync(legacy, body)
+        if (own) log(`bridge-url mirror port=${port} (权威文件 hosts/${port}/bridge-url.json)`)
+      } else {
+        log(`bridge-url legacy kept port=${String(current?.port)} self=${port} (另一宿主在用根文件，未覆盖)`)
+      }
+      log(`bridge-url host=${dir} port=${port}`)
+      return true
+    } catch (error) {
+      log(`bridge-url write failed: ${error?.message ?? error}`)
+      return false
     }
-  } catch (error) {
-    log(`bridge-url write failed: ${error?.message ?? error}`)
+  }
+  if (!publishUrl()) {
+    // 端口在 apply 时可能还没绑定（cordis 先 apply 后 listen）：2s 重试，拿到再写。
+    const timer = setInterval(() => {
+      if (publishUrl()) clearInterval(timer)
+    }, 2000)
+    timer.unref?.()
   }
 
   const store = new RunStore()
@@ -976,6 +1177,31 @@ export function apply(ctx) {
     log(`pending approvals load failed: ${String(error?.message ?? error)}`)
   }
 
+  // 启动时一次性对账：上一个宿主进程留下的 needs-approval run 已经没有 waiter，
+  // 归一到终态，避免胶囊显示「待批准」但队列里没有任何可裁决对象。
+  try {
+    reconcileRuns({ store, approvals, log })
+  } catch (error) {
+    log(`run reconcile failed: ${String(error?.message ?? error)}`)
+  }
+
+  // 孤儿审批清扫：没有活 waiter 的遗留条目在 TTL 后自动消失（HUD 红环不会常亮）。
+  // 每次清扫后顺手对账一次，保证「审批过期 → 对应 run 也不再停在 needs-approval」。
+  const orphanSweep = setInterval(() => {
+    try {
+      reapOrphanApprovals({ store: pendingApprovals, approvals })
+    } catch (error) {
+      log(`orphan sweep failed: ${String(error?.message ?? error)}`)
+    }
+    try {
+      reconcileRuns({ store, approvals, log })
+    } catch (error) {
+      log(`run reconcile failed: ${String(error?.message ?? error)}`)
+    }
+  }, ORPHAN_SWEEP_MS)
+  if (typeof orphanSweep.unref === 'function') orphanSweep.unref()
+  log(`orphan sweep armed ttl=${ORPHAN_TTL_MS >= 60000 ? `${Math.round(ORPHAN_TTL_MS / 60000)}min` : `${(ORPHAN_TTL_MS / 1000).toFixed(1)}s`} every=${ORPHAN_SWEEP_MS >= 1000 ? `${Math.round(ORPHAN_SWEEP_MS / 1000)}s` : `${ORPHAN_SWEEP_MS}ms`}`)
+
   host.onNotification((event) => {
     if (event.type === 'host/exit') {
       for (const run of store.runs.values()) if (run.status === 'running') store.setStatus(run, 'failed', { error: 'codex app-server exited' })
@@ -987,7 +1213,27 @@ export function apply(ctx) {
     }
     const run = runsByThread.get(event.params?.threadId) ?? null
     if (!run) return
+    // 先算 turn 答案再落盘：turn.end 事件本身要带兜底答案，否则 events.jsonl 里永远是 null，
+    // 重放/CLI 二次拉取/判官读事件都会拿到空（final-answer-race.md 的次因）。
+    let turnAnswer = null
+    let turnAnswerSource = null
+    let turnAnswerPhase = null
+    if (event.method === 'turn/completed') {
+      const items = Array.isArray(event.params?.turn?.items) ? event.params.turn.items : []
+      const picked = finalAnswerFromItems(items)
+      turnAnswer = picked?.text ?? null
+      turnAnswerSource = picked?.source ?? null
+      turnAnswerPhase = picked?.phase ?? null
+      if (!turnAnswer) {
+        const fromEvents = lastTextEvent(run.events)
+        if (fromEvents) {
+          turnAnswer = fromEvents
+          turnAnswerSource = 'text-event'
+        }
+      }
+    }
     const row = normalize(event)
+    if (turnAnswer) row.finalAnswer = turnAnswer
     if (run.status === 'starting') store.setStatus(run, 'running')
     store.append(run, { notification: event.method, ...row, raw: event.params })
     if (row.kind === 'usage') {
@@ -996,14 +1242,17 @@ export function apply(ctx) {
     }
     if (event.method === 'turn/completed') {
       const turn = event.params?.turn ?? {}
-      const items = Array.isArray(turn.items) ? turn.items : []
-      const final = items.find((entry) => entry?.type === 'agentMessage' && entry?.phase === 'final_answer') ?? null
       const status = turn.status === 'completed' ? 'done' : 'failed'
       store.setStatus(run, status, {
-        finalAnswer: final?.text ?? null,
+        finalAnswer: turnAnswer ?? null,
         durationMs: turn.durationMs ?? null,
         error: turn.error ?? null,
       })
+      if (turnAnswer && turnAnswerSource !== 'final_answer') {
+        log(`finalAnswer fallback id=${run.id.slice(0, 8)} source=${turnAnswerSource}${turnAnswerSource === 'agentMessage' ? ` phase=${turnAnswerPhase ?? 'null'}` : ''} chars=${String(turnAnswer).length}`)
+      } else if (!turnAnswer && status === 'done') {
+        log(`finalAnswer missing id=${run.id.slice(0, 8)} agent=codex reason=no-agentMessage-text events=${Array.isArray(run.events) ? run.events.length : 0}`)
+      }
       // bridge.log 要能回答「这个 run 什么时候结束、成没成」（F-10）。
       log(`run ${status} id=${run.id.slice(0, 8)} agent=codex duration=${turn.durationMs ?? '-'} error=${turn.error ? String(turn.error).slice(0, 120) : '-'}`)
     }
@@ -1477,6 +1726,9 @@ export function apply(ctx) {
         pendingApprovals: pendingApprovals.list().length,
         approvals: approvals.size,
         root: ROOT,
+        // 多宿主隔离（N-14）：本宿主的状态目录与端口，便于确认两个宿主各写各的。
+        hostPort: Number(ctx.webServer?.port) || null,
+        hostDir: Number(ctx.webServer?.port) ? join(ROOT, 'hosts', String(ctx.webServer.port)) : null,
       })
     }
     if (method === 'GET' && parts[0] === 'beacon') {
@@ -1557,7 +1809,9 @@ export function apply(ctx) {
       }
     }
     if (method === 'GET' && parts[0] === 'runs' && parts[2] === 'stream') {
-      const run = store.runs.get(parts[1])
+      // 内存里只有最近 50 个 run：详情/事件流都要能回读到磁盘上的历史 run，
+      // 否则宿主重启后点开历史行只会拿到 404（t17 的 finding）。
+      const run = store.runs.get(parts[1]) ?? store.readFromDisk(parts[1])
       if (!run) return json(response, 404, { error: 'run not found' })
       store.hydrate(run)
       const since = Number(url.searchParams.get('since') ?? '0')
@@ -1565,6 +1819,11 @@ export function apply(ctx) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' })
       res.write(`event: status\ndata: ${JSON.stringify({ status: run.status })}\n\n`)
       for (const record of run.events) if (record.seq > since) res.write(`id: ${record.seq}\ndata: ${JSON.stringify(record)}\n\n`)
+      // N-18：终态 run 没有后续事件，写完就该结束；挂着只会让客户端等到超时。
+      if (!RUN_ACTIVE.has(run.status)) {
+        try { res.write('event: end\ndata: {}\n\n'); res.end() } catch {}
+        return
+      }
       run.clients.add(res)
       const ping = setInterval(() => {
         try {
@@ -1580,7 +1839,7 @@ export function apply(ctx) {
       return
     }
     if (method === 'GET' && parts[0] === 'runs' && parts.length === 2) {
-      const run = store.runs.get(parts[1])
+      const run = store.runs.get(parts[1]) ?? store.readFromDisk(parts[1])
       if (!run) return json(response, 404, { error: 'run not found' })
       store.hydrate(run)
       const since = Number(url.searchParams.get('since') ?? '0')
@@ -1600,9 +1859,14 @@ export function apply(ctx) {
           updatedAt: run.updatedAt,
           eventCount: run.eventCount,
           usage: run.usage,
-          finalAnswer: run.finalAnswer ?? null,
+          // N-19：历史 run 的 finalAnswer 可能是空的（落盘时没算），回退到事件里的最后一段文本，
+          // 免得 judge / office / 外部读者拿到 null 却以为任务没输出。
+          finalAnswer: run.finalAnswer ?? lastTextEvent(run.events) ?? null,
           durationMs: run.durationMs ?? null,
           error: run.error,
+          // 对账终态：客户端不用猜「为什么这条 run 不是正常结束」。
+          reason: run.reason ?? null,
+          reconciledAt: run.reconciledAt ?? null,
         },
         events,
       })
@@ -1727,8 +1991,32 @@ export function apply(ctx) {
       if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny (or pass answers)', code: 'bad_decision' })
       const result = decide(parts[1], decision, typeof body.note === 'string' ? body.note.slice(0, 500) : null, body.token, answers)
       if (result === 'forbidden') return json(response, 403, { ok: false, error: 'approval token mismatch', id: parts[1] })
-      // N-04：404 不能再回 decision:"allow" —— 只看 body 的调用方会把「未兑现」当「已批准」。
-      if (!result) return json(response, 404, { ok: false, decision: null, reason: 'not_found', id: parts[1] })
+      // 没有活 waiter：条目只可能是宿主重载后的遗留（多半没有 token）。
+      // 这类条目对任何决策都不会有副作用，但仍然要能「被丢掉」——否则 HUD 点它
+      // 只会一直 404，胶囊红环常亮（t15 的核心缺陷）。语义照旧：delivered=false。
+      if (!result) {
+        const leftover = pendingApprovals.get(parts[1])
+        if (leftover !== null) {
+          pendingApprovals.remove(parts[1])
+          log(`approval dismissed id=${String(parts[1]).slice(0, 12)} reason=no-live-waiter tokenless=${typeof leftover.token === 'string' && leftover.token !== '' ? 'no' : 'yes'}`)
+          try {
+            reconcileRuns({ store, approvals, log })
+          } catch (error) {
+            log(`run reconcile failed: ${String(error?.message ?? error)}`)
+          }
+          return json(response, 200, {
+            ok: true,
+            decision: null,
+            dismissed: true,
+            delivered: false,
+            stale: leftover.stale === true,
+            reason: 'no_live_waiter',
+            id: parts[1],
+          })
+        }
+        // N-04：404 不能再回 decision:"allow" —— 只看 body 的调用方会把「未兑现」当「已批准」。
+        return json(response, 404, { ok: false, decision: null, reason: 'not_found', id: parts[1] })
+      }
       return json(response, 200, { ok: true, decision, answers: answers ?? null, id: parts[1] })
     }
     // ── P2 审批聚合：HUD / 面板用 GET + query（prefix 资源只服务 GET/HEAD） ──
@@ -1785,23 +2073,36 @@ export function apply(ctx) {
           ? candidates.filter((entry) => onlyId === '' || entry.id === onlyId)
           : entriesOwnedByToken(candidates, token, onlyId === '' ? undefined : onlyId)
         if (owned.length === 0) {
+          // N-20：持正确运维 token 但队列为空（或指定 id 不在队列）不是鉴权失败，
+          // 403 只应该表示「token 不对」。否则运维会以为自己的 clear.token 坏了。
+          if (operator) {
+            log(`pending clear noop: nothing to clear (mode=${mode} id=${onlyId === '' ? '-' : onlyId})`)
+            return json(response, 200, { ok: true, cleared: 0, denied: 0, tokenless: 0, by: 'operator-token', note: 'queue empty' })
+          }
           log(`pending clear rejected: token missing or not owned (mode=${mode} id=${onlyId === '' ? '-' : onlyId})`)
           return json(response, 403, { ok: false, error: 'approval token required and must match a queued approval or the operator clear token', code: 'approval_token_mismatch' })
         }
         const ownedIds = new Set(owned.map((entry) => entry.id))
         let cleared = 0
         let denied = 0
+        let tokenless = 0
         for (const entry of candidates) {
           if (!ownedIds.has(entry.id)) continue
           if (mode !== 'all' && entry.stale !== true) continue
+          if (typeof entry.token !== 'string' || entry.token === '') tokenless += 1
           // 活 waiter 会先被 decide() 结掉（它自己会从队列移除），所以两种都要计数。
           // 内部维护路径：不经过 token 校验（它本来就是桥自己的清理动作）。
           const decided = mode === 'all' ? settleApproval(entry.id, 'decline', 'cleared') : false
           if (decided) denied += 1
           if (pendingApprovals.remove(entry.id) || decided) cleared += 1
         }
-        if (cleared > 0) log(`pending approvals cleared mode=${mode} cleared=${cleared} denied=${denied} by=${operator ? 'operator-token' : 'entry-token'}`)
-        return json(response, 200, { ok: true, mode, cleared, denied })
+        if (cleared > 0) log(`pending approvals cleared mode=${mode} cleared=${cleared} denied=${denied} tokenless=${tokenless} by=${operator ? 'operator-token' : 'entry-token'}`)
+        try {
+          reconcileRuns({ store, approvals, log })
+        } catch (error) {
+          log(`run reconcile failed: ${String(error?.message ?? error)}`)
+        }
+        return json(response, 200, { ok: true, mode, cleared, denied, tokenless, by: operator ? 'operator-token' : 'entry-token' })
       } catch (error) {
         return json(response, 500, { ok: false, error: String(error?.message ?? error) })
       }
@@ -1852,6 +2153,7 @@ export function apply(ctx) {
       break
     }
     return () => {
+      clearInterval(orphanSweep)
       if (bound) bound.dispose()
       for (const child of claudeChildren.values()) {
         try {

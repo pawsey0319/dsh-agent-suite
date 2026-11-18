@@ -66,8 +66,13 @@ private enum HUD {
 }
 
 private enum Paths {
+    /// `--state-dir <path>` 覆盖（多宿主隔离时指向 ~/.dsh/agent-bridge/hosts/<port>）。
+    /// 缺省仍是 ~/.dsh/agent-bridge，保持老用法与老安装可用。
+    static var stateDirOverride: URL?
+
     static var bridgeDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let stateDirOverride { return stateDirOverride }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".dsh", isDirectory: true)
             .appendingPathComponent("agent-bridge", isDirectory: true)
     }
@@ -101,6 +106,8 @@ private func log(_ message: String) {
 private final class BannerView: NSView {
     private let title: String
     private let body: String
+    /// 高度不够被折叠掉的条数：0 表示没有折叠，>0 时在正文尾部追加「另有 N 条」。
+    private var foldedCount = 0
     /// 点横幅 = 确认这一条（标记已读并从队列里移除），2.21。
     var onClick: (() -> Void)?
 
@@ -116,6 +123,14 @@ private final class BannerView: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    /// 折叠提示：布局层发现「可用高度不足」时，把被折叠的条数写到卡上，
+    /// 用户至少知道还有多少条；条数回到 0 时自动撤掉这行字。
+    func setFoldedCount(_ count: Int) {
+        guard foldedCount != count else { return }
+        foldedCount = count
+        needsDisplay = true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let rect = bounds.insetBy(dx: 1, dy: 1)
@@ -145,8 +160,9 @@ private final class BannerView: NSView {
         paragraph.lineBreakMode = .byTruncatingTail
         var attrs = bodyAttrs
         attrs[.paragraphStyle] = paragraph
-        (body as NSString).draw(in: NSRect(x: 14, y: 12, width: bounds.width - 28, height: 34),
-                                withAttributes: attrs)
+        let shownBody = foldedCount > 0 ? "\(body) · 另有 \(foldedCount) 条" : body
+        (shownBody as NSString).draw(in: NSRect(x: 14, y: 12, width: bounds.width - 28, height: 34),
+                                    withAttributes: attrs)
     }
 }
 
@@ -345,6 +361,8 @@ private struct RadarPayload: Decodable {
     var generatedAt: String?
     var counts: RadarCounts?
     var items: [RadarItem] = []
+    /// 未读完成的完整 id 清单（宿主按 id#run / id#finishedAt 去重后给出，不受 12 行截断影响）。
+    var doneUnreadIds: [String] = []
     var total: Int?
     var dsh: DshInfo?
 
@@ -353,8 +371,19 @@ private struct RadarPayload: Decodable {
         var url: String?
     }
 
+    /// 页面侧 client 半边（prd 2.22）：active=false 表示桌面端没在轮询，
+    /// 点会话行只能降级成「打开 App」。
+    struct ClientHalf: Decodable {
+        var active: Bool?
+        var lastBeacon: String?
+        var ageMs: Double?
+        var hint: String?
+    }
+
+    var clientHalf: ClientHalf?
+
     private enum CodingKeys: String, CodingKey {
-        case ok, generatedAt, counts, items, total, dsh
+        case ok, generatedAt, counts, items, total, dsh, clientHalf, doneUnreadIds
     }
 
     init(from decoder: Decoder) throws {
@@ -367,6 +396,8 @@ private struct RadarPayload: Decodable {
         }
         total = try? c.decodeIfPresent(Int.self, forKey: .total)
         dsh = try? c.decodeIfPresent(DshInfo.self, forKey: .dsh)
+        clientHalf = try? c.decodeIfPresent(ClientHalf.self, forKey: .clientHalf)
+        doneUnreadIds = (try? c.decodeIfPresent([String].self, forKey: .doneUnreadIds)) ?? []
     }
 }
 
@@ -395,6 +426,8 @@ private struct RenderState {
     var autoConfirmed = 0
     var offline = false
     var items: [RadarItem] = []
+    /// 宿主给的完整未读完成 id 清单（与 items 的 12 行截断无关），通知/清理共用它。
+    var doneUnreadIds: [String] = []
 
     /// 大数字口径 = 正在进行的顶层会话数（不含子智能体/子会话）。
     var taskCount: Int { running }
@@ -648,6 +681,8 @@ private struct Options {
     var interval: TimeInterval = HUD.defaultInterval
     /// `--expand`：启动即展开，且不因鼠标离开而收回（截图/验收用）。
     var forceExpanded = false
+    /// `--state-dir`：radar-url.json / hud.pid 所在目录（多宿主时每个宿主一份）。
+    var stateDir: String?
 
     static func parse(_ args: [String]) -> (Options, exitCode: Int32?) {
         var opts = Options()
@@ -699,6 +734,12 @@ private struct Options {
                 mockArg = v
             case "--expand":
                 opts.forceExpanded = true
+            case "--state-dir":
+                guard let v = value(for: flag, inline: inline) else {
+                    log("error: --state-dir 缺少值")
+                    return (opts, 2)
+                }
+                opts.stateDir = v
             default:
                 log("warn: 忽略未知参数 \(raw)")
             }
@@ -736,6 +777,8 @@ private struct Options {
           --interval <sec>   轮询间隔，默认 2 秒（范围 0.2–3600）。
           --mock <file>      只读本地 JSON 文件，不访问网络（便于自测）。
           --expand           启动即强制展开面板（截图/验收用，鼠标离开也不收回）。
+          --state-dir <dir>  状态目录（radar-url.json / hud.pid）；缺省 ~/.dsh/agent-bridge。
+                             多宿主并存时宿主会传 hosts/<port>，避免互相覆盖。
           -h, --help         显示本帮助。
 
         交互：鼠标移入圆形徽标展开面板，离开 250ms 后收回；
@@ -2048,6 +2091,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     init(options: Options) {
         self.options = options
+        if let dir = options.stateDir, !dir.isEmpty {
+            Paths.stateDirOverride = URL(fileURLWithPath: dir, isDirectory: true)
+        }
         super.init()
     }
 
@@ -2148,10 +2194,27 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         return true
     }
 
+    /// pid 文件内容：`{"pid":123,"ownerPort":49409,...}`（新）或裸数字（旧版本）。
     private func readPid() -> pid_t? {
         guard let data = try? Data(contentsOf: Paths.pid),
               let text = String(data: data, encoding: .utf8) else { return nil }
-        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{") {
+            if let json = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) as? [String: Any],
+               let pid = (json["pid"] as? NSNumber)?.int32Value {
+                return pid
+            }
+            return nil
+        }
+        return pid_t(trimmed)
+    }
+
+    /// 归属端口：state-dir 的最后一段是端口；没有就用 URL 上的端口。
+    private func ownerPort() -> Int? {
+        if let dir = Paths.stateDirOverride, let port = Int(dir.lastPathComponent) { return port }
+        if let port = lastGoodURL?.port { return port }
+        if case .explicit(let url) = options.source, let port = url.port { return port }
+        return nil
     }
 
     private func isRadarProcess(_ pid: pid_t) -> Bool {
@@ -2166,7 +2229,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     private func writePid() {
         do {
-            try "\(getpid())\n".write(to: Paths.pid, atomically: true, encoding: .utf8)
+            // ownerPort 让宿主侧 supervisor 能校验「这个 HUD 是不是我起的」（N-14）。
+            let owner = ownerPort().map(String.init) ?? "null"
+            let payload = "{\"pid\":\(getpid()),\"ownerPort\":\(owner),\"dir\":\"\(Paths.bridgeDir.path)\",\"updatedAt\":\(Int(Date().timeIntervalSince1970 * 1000))}\n"
+            try payload.write(to: Paths.pid, atomically: true, encoding: .utf8)
         } catch {
             log("warn: 无法写入 pid 文件: \(error.localizedDescription)")
         }
@@ -2455,8 +2521,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             state.questions = counts.questions
             state.failed = counts.failed
             state.doneUnread = counts.doneUnread
+            state.doneUnreadIds = payload.doneUnreadIds
             state.autoConfirmed = counts.autoConfirmed
             state.items = payload.items
+            clientHalf = payload.clientHalf
             state.offline = false
             updateUI(origin: origin)
         } catch {
@@ -2490,6 +2558,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         notifyFinished()
         notifyApproval()
         notifyReview()
+        notifyClientHalf()
         panelContent.state = state
         panelContent.detail = detail
 
@@ -2552,7 +2621,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     /// 以圆形原来的屏幕位置为锚点，向远离屏幕边缘的方向生长；越界时夹回屏幕。
     private func expansion(for circle: NSRect) -> Expansion {
-        let screen = screen(containing: circle) ?? NSScreen.main ?? NSScreen.screens[0]
+        let screen = panelScreen(for: circle)
         let visible = screen.visibleFrame
         let margin = HUD.edgeMargin
         let limit = visible.insetBy(dx: margin, dy: margin)
@@ -2841,14 +2910,21 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // N-07：标题里的 N 与 feed 的 counts.doneUnread **同源同值**（同一个时刻、同一个字段），
         // 而不是「本次累计提醒了几条」——后者会比未读数大，用户看到「5 个任务完成」但面板只有 2 行。
         // 点击确认时按同一份 id 集合清，保证「标题 N = 点一下清掉的未读 = 面板消失的行」。
-        let unreadIds = done.compactMap { $0.id }
+        // 同一集合派生：优先用宿主给的完整未读 id 清单（不受 12 行截断影响），
+        // 宿主没给时退回可见行；count 一律等于 ids 的数量，保证
+        // 「标题 N = ids.size = feed.doneUnread」，不再出现「25 个」但只清 12 条。
+        let visibleIds = done.compactMap { $0.id }
+        let unreadIds = state.doneUnreadIds.isEmpty ? visibleIds : state.doneUnreadIds
         pendingDoneIds = unreadIds
-        pendingDoneCount = state.doneUnread
+        pendingDoneCount = unreadIds.count
+        if state.doneUnread != unreadIds.count {
+            log("banner done mismatch feed=\(state.doneUnread) ids=\(unreadIds.count) visible=\(visibleIds.count)")
+        }
         let newest = fresh.max { ($0.updatedAt ?? 0) < ($1.updatedAt ?? 0) } ?? fresh[0]
         let body = newest.title ?? "任务已完成"
         // 旧卡先撤掉，避免「一张单条卡 + 一张折叠卡」同时挂着互相覆盖。
         if let old = doneBanner { dismissBanner(old, reason: "merge"); doneBanner = nil }
-        let count = state.doneUnread
+        let count = pendingDoneCount
         let title = count > 1 ? "\(count) 个任务完成" : (newest.kind == "session" ? "会话完成" : (newest.agent ?? "agent").uppercased() + " 任务完成")
         let ids = pendingDoneIds
         doneBanner = showBanner(title: title, body: body) { [weak self] in
@@ -2864,7 +2940,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 self.openDetail(newestId)
             }
         }
-        // 口径证据：count 与 counts.doneUnread 必须相等；ids 是点击时要清的那批。
+        // 口径证据：title 里的 count、点击清掉的 ids、feed 的 doneUnread 三者同值。
         log("banner done queue count=\(count) doneUnread=\(state.doneUnread) ids=\(unreadIds.count) newest=\(shortId(newest.id ?? "-")) \(body)")
     }
 
@@ -2917,45 +2993,83 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// N-09：横幅要出现在「用户正在看的那块屏」。
     /// 旧实现写死 `NSScreen.screens.first`，多显示器时可能落到另一块屏（甚至不在主屏坐标系里），
     /// 用户会以为通知丢了。优先级：鼠标所在屏 → 胶囊所在屏 → NSScreen.main → 第一块。
+    /// 选屏的单一入口（N-09 + t21 第 3 条）。
+    /// 横幅与面板共用同一条优先级链「鼠标所在屏 / 胶囊所在屏 → 主屏 → 第一块屏」，
+    /// 只是谁排第一不同：横幅优先人正在看的屏，面板优先胶囊贴着的屏（面板必须挨着胶囊）。
+    /// 两条链写在一处，避免两边各自演化出不一致的兜底顺序。
+    private func chooseScreen(preferMouse: Bool) -> (screen: NSScreen?, source: String) {
+        let mouse = NSEvent.mouseLocation
+        let hovered = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+        let circle = screen(containing: currentCircleRect())
+        let ordered: [(NSScreen?, String)] = preferMouse
+            ? [(hovered, "mouse"), (circle, "circle")]
+            : [(circle, "circle"), (hovered, "mouse")]
+        for (candidate, source) in ordered {
+            if let candidate = candidate { return (candidate, source) }
+        }
+        if let main = NSScreen.main { return (main, "main") }
+        return (NSScreen.screens.first, "first")
+    }
+
     /// N-09：横幅跟着「人正在看的屏」走，而不是永远第一块屏。
     /// 优先级：鼠标所在屏 → 圆形胶囊所在屏 → 主屏 → 第一块屏。
     private func bannerScreen() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
         let count = NSScreen.screens.count
-        let chosen: NSScreen?
-        let source: String
-        if let hovered = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) {
-            chosen = hovered
-            source = "mouse"
-        } else if let circleScreen = screen(containing: currentCircleRect()) {
-            chosen = circleScreen
-            source = "circle"
-        } else if let main = NSScreen.main {
-            chosen = main
-            source = "main"
+        let picked = chooseScreen(preferMouse: true)
+        log("banner screen source=\(picked.source) name=\(picked.screen?.localizedName ?? "?") screens=\(count) mouse=(\(Int(mouse.x)),\(Int(mouse.y)))")
+        return picked.screen
+    }
+
+    /// 面板展开用同一套选屏链，但优先「胶囊所在屏」（t21 第 3 条允许的口径：
+    /// 与横幅同一逻辑 / 或胶囊所在屏），这样鼠标临时滑到副屏也不会把面板拽离胶囊。
+    private func panelScreen(for circle: NSRect) -> NSScreen {
+        let count = NSScreen.screens.count
+        let anchor = screen(containing: circle)
+        let picked: (screen: NSScreen?, source: String)
+        if let anchor = anchor {
+            picked = (anchor, "circle")
         } else {
-            chosen = NSScreen.screens.first
-            source = "first"
+            picked = chooseScreen(preferMouse: true)
         }
-        log("banner screen source=\(source) name=\(chosen?.localizedName ?? "?") screens=\(count) mouse=(\(Int(mouse.x)),\(Int(mouse.y)))")
-        return chosen
+        log("panel screen source=\(picked.source) name=\(picked.screen?.localizedName ?? "?") screens=\(count) circle=(\(Int(circle.minX)),\(Int(circle.minY)))")
+        return picked.screen ?? NSScreen.main ?? NSScreen.screens[0]
     }
 
     /// 横幅的顶部基线：面板展开且与横幅列水平重叠时，整列横幅让到面板下方，
     /// 这样「点横幅」永远不会先命中面板空白（N-06 的第二半）。
+    /// 测试钩子：把可用高度压到 N 点（`DSH_TASK_RADAR_BANNER_ROOM=200`），
+    /// 用来在正常屏幕上复现「高度不够 → 折叠」的分支，避免只能靠肉眼在矮屏上验证。
+    private func bannerUsableFrame(_ screen: NSScreen) -> NSRect {
+        var frame = screen.visibleFrame
+        if let raw = ProcessInfo.processInfo.environment["DSH_TASK_RADAR_BANNER_ROOM"], let room = Double(raw), room > 40 {
+            frame.size.height = min(frame.height, CGFloat(room))
+            frame.origin.y = screen.visibleFrame.maxY - frame.size.height
+        }
+        return frame
+    }
+
     private func bannerTopY(on screen: NSScreen) -> CGFloat {
-        var top = screen.visibleFrame.maxY - 4
+        let usable = bannerUsableFrame(screen)
+        var top = usable.maxY - 4
         if isExpanded, let window, window.isVisible {
             let panel = window.frame
-            let column = NSRect(x: screen.visibleFrame.maxX - bannerWidth - 18,
-                                y: screen.visibleFrame.minY,
-                                width: bannerWidth, height: screen.visibleFrame.height)
+            let column = NSRect(x: usable.maxX - bannerWidth - 18,
+                                y: usable.minY,
+                                width: bannerWidth, height: usable.height)
             if panel.intersects(column) {
-                top = min(top, panel.minY - bannerGap)
-                log("banner avoid panel panel=\(NSStringFromRect(panel)) top=\(Int(top))")
+                let avoided = min(top, panel.minY - bannerGap)
+                // 面板贴到了屏幕下沿时，「让到面板上方」会连一张卡都放不下：这时宁可
+                // 与面板重叠一张也不要把通知藏掉（卡片仍在可见区内，y >= 8）。
+                if avoided - (bannerHeight + bannerGap) >= usable.minY + 8 {
+                    top = avoided
+                    log("banner avoid panel panel=\(NSStringFromRect(panel)) top=\(Int(top))")
+                } else {
+                    log("banner avoid panel skipped (no room above) panel=\(NSStringFromRect(panel)) top=\(Int(top))")
+                }
             }
         }
-        let lowest = screen.visibleFrame.minY + 8
+        let lowest = usable.minY + 8
         if top < lowest {
             log("banner clamp top=\(Int(top)) -> \(Int(lowest)) (面板占满了右侧)")
             return lowest
@@ -2967,20 +3081,45 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func layoutBanners(animate: Bool) {
         guard let screen = bannerScreen() else { return }
         let baseTop = bannerTopY(on: screen)
+        // 可用高度不足时不再把卡片排到屏幕外：只摆得下的条数可见，剩下的折叠成
+        // 「另有 N 条」写在最后一张卡上（t17 的 finding：clamp 只抬了 top，
+        // slot 1/2 依然算到可见区以下）。
+        let usable = bannerUsableFrame(screen)
+        let lowest = usable.minY + 8
+        // 第 i 张卡的 y = baseTop - (i+1)*(h+gap)，要 >= lowest 才算放得下。
+        let fit = max(1, Int(((baseTop - lowest) / (bannerHeight + bannerGap)).rounded(.down)))
+        var visible = 0
+        var hidden = 0
+        var placed: [String] = []
         for (slot, window) in banners.enumerated() {
+            let y = baseTop - CGFloat(slot + 1) * (bannerHeight + bannerGap)
+            guard slot < fit, y >= lowest else {
+                window.orderOut(nil)
+                hidden += 1
+                continue
+            }
             let frame = NSRect(x: screen.visibleFrame.maxX - bannerWidth - 18,
-                               y: baseTop - CGFloat(slot + 1) * (bannerHeight + bannerGap),
+                               y: y,
                                width: bannerWidth, height: bannerHeight)
             if animate {
                 window.setFrame(frame, display: true, animate: true)
             } else {
                 window.setFrame(frame, display: true)
             }
+            (window.contentView as? BannerView)?.setFoldedCount(0)
+            placed.append("\(slot):y=\(Int(y))")
+            visible += 1
         }
-        // 布局证据：相邻卡中心相距 bannerHeight+gap，任何两条都不会互相覆盖。
-        let slots = banners.enumerated()
-            .map { index, window in "\(index):y=\(Int(window.frame.origin.y))" }
-            .joined(separator: " ")
+        if hidden > 0 {
+            if let lastVisible = banners.prefix(visible).last,
+               let view = lastVisible.contentView as? BannerView {
+                view.setFoldedCount(hidden)
+            }
+            log("banner fold visible=\(visible) hidden=\(hidden) fit=\(fit) " +
+                "baseTop=\(Int(baseTop)) lowest=\(Int(lowest)) (可用高度不足)")
+        }
+        // 布局证据：只记录真正摆上去的卡；被折叠的不占坐标（绝不出现屏幕外的 y）。
+        let slots = placed.joined(separator: " ")
         log("banner layout n=\(banners.count) screen=\(screen.localizedName) frame=\(NSStringFromRect(screen.visibleFrame)) " +
             "baseTop=\(Int(baseTop)) panel=\(isExpanded ? NSStringFromRect(window?.frame ?? .zero) : "collapsed") \(slots)")
     }
@@ -3026,7 +3165,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             window.animator().alphaValue = 1
         }
         NSSound(named: NSSound.Name("Glass"))?.play()
-        let lifetime: TimeInterval = onClick == nil ? 6 : 60
+        // prd 2.24：可点的通知卡 30s 没被点就自动消失（旧值 60s 会把队列占住一整分钟）。
+        let lifetime: TimeInterval = onClick == nil ? 6 : 30
         DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self, weak window] in
             guard let window else { return }
             self?.dismissBanner(window, reason: onClick == nil ? "timeout" : "expired")
@@ -3252,7 +3392,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             } else if let item = state.items.first(where: { $0.id == id }) {
                 openSessionCard(item)
             } else {
-                jumpToSession(id)
+                jumpAndConfirm(sessionId: id, itemId: id)
             }
         } else if let path = artifactRowPath(event) {
             openArtifact(path)
@@ -3261,9 +3401,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         } else if let id = doneRowHitId(event) {
             // 已完成的会话：标已读并跳回去；已完成的 run：打开结果页。
             if let item = state.items.first(where: { $0.id == id }), item.kind == "session" {
-                // 完成的任务要能一键跳回去（先标已读再跳）。
-                markSeen([id])
-                jumpToSession(id)
+                // prd 2.23：先确认跳转真的落地（client ack 或降级打开 App），
+                // 只有 ack 才标已读；降级/失败都不清未读。
+                jumpAndConfirm(sessionId: id, itemId: id)
             } else {
                 openDetail(id)
             }
@@ -3442,6 +3582,110 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     /// 把「点会话行」翻译成宿主的一次跳转请求（页面侧 client 半轮询消费）。
+    private var clientHalf: RadarPayload.ClientHalf?
+    private var clientHalfHintShown = false
+
+    /// prd 2.22：宿主起来 30s 还没收到 client.apply beacon 时，一次性提示「跳转需重载页面」。
+    private func notifyClientHalf() {
+        guard let half = clientHalf else { return }
+        guard half.active == false, let hint = half.hint, !clientHalfHintShown else { return }
+        clientHalfHintShown = true
+        _ = showBanner(title: "跳转需重载页面", body: hint)
+        log("banner client-half inactive lastBeacon=\(half.lastBeacon ?? "never")")
+    }
+
+    /// 跳转 + 结果确认（prd 2.23）：jump 写盘后轮询 jump-status——
+    /// client ack 才标已读；degraded（只打开了 App）与失败都不清未读。
+    private func jumpAndConfirm(sessionId: String, itemId: String) {
+        guard let base = lastResolvedURLString.split(separator: "|").first.map(String.init),
+              var components = URLComponents(string: base), components.host != nil else {
+            log("jump: no resolved url")
+            return
+        }
+        var segments = components.path.split(separator: "/").map(String.init)
+        if let last = segments.last, last.hasPrefix("radar") {
+            segments[segments.count - 1] = "jump"
+        } else {
+            segments.append("jump")
+        }
+        components.path = "/" + segments.joined(separator: "/")
+        components.queryItems = [URLQueryItem(name: "session", value: sessionId)]
+        guard let url = components.url else { return }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error {
+                log("jump failed \(error.localizedDescription) seen=no")
+                self.bannerJumpFailed(sessionId: sessionId, reason: "request: \(error.localizedDescription)")
+                return
+            }
+            var jumpId: String?
+            if let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                jumpId = object["id"] as? String
+            }
+            log("jump sent session=\(sessionId.prefix(8)) id=\(jumpId ?? "-")")
+            self.pollJumpStatus(id: jumpId, sessionId: sessionId, itemId: itemId, attempt: 0)
+        }.resume()
+        activateDSH()
+    }
+
+    /// 轮询 /x-radar/jump-status：1s 一次，覆盖服务端 8s 的降级窗口。
+    private func pollJumpStatus(id: String?, sessionId: String, itemId: String, attempt: Int) {
+        guard attempt < 12 else {
+            log("jump status timeout id=\(id ?? "-") seen=no")
+            bannerJumpFailed(sessionId: sessionId, reason: "timeout")
+            return
+        }
+        guard let id,
+              let base = lastResolvedURLString.split(separator: "|").first.map(String.init),
+              var components = URLComponents(string: base), components.host != nil else {
+            log("jump status skipped (no id) seen=no")
+            return
+        }
+        var segments = components.path.split(separator: "/").map(String.init)
+        if let last = segments.last, last.hasPrefix("radar") {
+            segments[segments.count - 1] = "jump-status"
+        } else {
+            segments.append("jump-status")
+        }
+        components.path = "/" + segments.joined(separator: "/")
+        components.queryItems = [URLQueryItem(name: "id", value: id)]
+        guard let url = components.url else { return }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self else { return }
+            var stateText = "unknown"
+            if let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                stateText = (object["state"] as? String) ?? "unknown"
+            }
+            switch stateText {
+            case "acked":
+                log("jump status acked id=\(id) seen=yes")
+                self.markSeen(ids: [itemId])
+            case "degraded":
+                log("jump status degraded id=\(id) seen=no")
+                self.bannerJumpFailed(sessionId: sessionId, reason: "degraded")
+            case "pending":
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.pollJumpStatus(id: id, sessionId: sessionId, itemId: itemId, attempt: attempt + 1)
+                }
+            default:
+                log("jump status \(stateText) id=\(id) seen=no")
+                self.bannerJumpFailed(sessionId: sessionId, reason: stateText)
+            }
+        }.resume()
+    }
+
+    private func bannerJumpFailed(sessionId: String, reason: String) {
+        let title = reason == "degraded" ? "已打开 DSH，但没定位到会话" : "跳转没成功，未标记已读"
+        let body = reason == "degraded"
+            ? "页面侧 client 没在轮询，重载页面后再点会直接跳转"
+            : "会话 \(sessionId.prefix(8))：\(reason)"
+        _ = showBanner(title: title, body: body)
+    }
+
     private func jumpToSession(_ sessionId: String) {
         let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
         guard var components = URLComponents(string: raw), components.host != nil else {
@@ -3709,10 +3953,33 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self, let data else { return }
+            let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
             let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             let run = payload["run"] as? [String: Any] ?? [:]
+            // 404 / 空 run：宿主里这条记录已经被回收（内存只留最近 50 个 run，且磁盘
+            // meta 也不在）。这时不能再按 status 缺省成 "running" 一直 1.5s 重试，
+            // 否则用户点开历史行会永远看到「进行中」——改成终态并停表（t17 的 finding）。
+            if httpStatus == 404 || run.isEmpty {
+                let message = (payload["error"] as? String) ?? "run not found"
+                DispatchQueue.main.async {
+                    self.stopLiveDetail()
+                    guard var current = self.detail, current.runId == id || current.runId.isEmpty else {
+                        log("detail missing id=\(self.shortId(id)) status=\(httpStatus) ignored (detail moved)")
+                        return
+                    }
+                    current.live = false
+                    current.runStatus = "missing"
+                    current.meta = "详情不可用 · 宿主已回收这条记录（\(message)）；已停止刷新"
+                    if current.body.isEmpty { current.body = "（这条任务的结果已不在宿主内存里）" }
+                    self.detail = current
+                    self.panelContent?.detail = current
+                    self.refreshExpandedGeometry(animated: false)
+                    log("detail missing id=\(self.shortId(id)) status=\(httpStatus) live=0 retry=stopped")
+                }
+                return
+            }
             let events = payload["events"] as? [[String: Any]] ?? []
 
             var pieces: [String] = []
