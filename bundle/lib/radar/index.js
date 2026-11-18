@@ -24,7 +24,7 @@ function zhTask(status) {
   return TASK_STATUS_ZH[status] ?? String(status)
 }
 
-import { chmodSync, appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
@@ -34,6 +34,17 @@ export const inject = ['webServer']
 const LOG_DIR = '/tmp/dsh-task-radar'
 const BRIDGE_DIR = join(homedir(), '.dsh', 'agent-bridge')
 const ARTIFACT_KEEP_MS = 6 * 60 * 60 * 1000
+// 会话内提问（'user-questions/request'）的「只看不动」旁听记录。
+// 桌面提问卡由 api-remotes 的转发 listener 负责显示；雷达只旁听一份文本，
+// 记录后立刻把请求交还下游 —— 不接管、不阻塞、不改变任何他人的行为。
+// 接管（不 next() 直接自己回执）是另一个产品决策，见 docs/research/radar-optimize-prep.md。
+const QUESTION_TAP_TTL_MS = 10 * 60 * 1000
+const questionTap = new Map()
+// 接管窗口（用户裁定 2026-11-18）：20s 内没人答就 next() 让渡回桌面提问卡。
+const QUESTION_HOLD_MS = Number(process.env.DSH_TASK_RADAR_ANSWER_MS ?? 20000)
+/** 正在被雷达接管的请求：requestId -> { token, sessionId, questions, settle, at, timer }。 */
+const questionHold = new Map()
+let questionWatcher
 // 运行时状态按宿主隔离（N-14）：两个 DSH 宿主共用 ~/.dsh/agent-bridge 时，
 // 旧版把 seen.json / jump.json / radar-url.json / hud.pid / radar-sessions.json
 // 全放在根目录 —— 对方的端口会被写进 radar-url.json（HUD 转 offline），
@@ -84,10 +95,31 @@ function useHostState(port) {
 const HUD_BIN = join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'native', 'RadarHUD')
 const PREFERRED = ['/x-radar', '/x-radar-b', '/x-radar-c', '/x-radar-d']
 
+// 日志轮转（t5 F-05）：beacon.log 单文件超过 10MB 就滚成 .1/.2/.3，最多留三份。
+// 不轮转的话按住户机实测 51.7 B/s 约 2.3 天就能把单文件顶到 10MB，且没有任何上限。
+const LOG_MAX_BYTES = 10 * 1024 * 1024
+const LOG_KEEP = 3
+
+function rotateIfNeeded(path) {
+  try {
+    if (!existsSync(path)) return
+    if (statSync(path).size < LOG_MAX_BYTES) return
+    for (let index = LOG_KEEP; index >= 1; index -= 1) {
+      const from = index === 1 ? path : `${path}.${index - 1}`
+      const to = `${path}.${index}`
+      if (!existsSync(from)) continue
+      if (index === LOG_KEEP && existsSync(to)) rmSync(to, { force: true })
+      renameSync(from, to)
+    }
+  } catch {}
+}
+
 function log(line) {
   try {
     mkdirSync(LOG_DIR, { recursive: true })
-    appendFileSync(join(LOG_DIR, 'beacon.log'), `${new Date().toISOString()} ${line}\n`)
+    const logPath = join(LOG_DIR, 'beacon.log')
+    rotateIfNeeded(logPath)
+    appendFileSync(logPath, `${new Date().toISOString()} ${line}\n`)
   } catch {}
 }
 
@@ -143,6 +175,154 @@ function gateStatus(workerStatus, judged) {
   }
 }
 
+/** 失败原因的兜底文案：reason 码本身对用户没意义，翻译成一句人话。 */
+function reasonText(reason) {
+  switch (reason) {
+    case 'no_live_waiter':
+      return '审批对象已丢失（宿主重启过，没有活着的等待方）'
+    case 'timeout':
+      return '运行超时'
+    case 'spawn_failed':
+      return '进程启动失败'
+    case 'process-exited':
+      return '子进程已经退出（process-exited）'
+    case 'stale-running':
+      return '超过 10 分钟没有任何新事件（可能卡住了）'
+    default:
+      return null
+  }
+}
+
+/** 从 events.jsonl 尾部找最后一条错误文本：优先 kind=error 的 message，其次 stderr 文本。 */
+function lastRunErrorText(id) {
+  try {
+    const file = join(BRIDGE_DIR, 'runs', id, 'events.jsonl')
+    const raw = readFileSync(file, 'utf8')
+    const lines = raw.split('\n')
+    const from = Math.max(0, lines.length - 400)
+    for (let index = lines.length - 1; index >= from; index -= 1) {
+      const line = lines[index]
+      if (line.length === 0) continue
+      let event
+      try { event = JSON.parse(line) } catch { continue }
+      const text = event?.message ?? event?.text ?? event?.error ?? null
+      if (event?.kind === 'error' && typeof text === 'string' && text.trim() !== '') return text.trim()
+      if (event?.stream === 'stderr' && typeof text === 'string' && text.trim() !== '') return text.trim()
+    }
+  } catch {}
+  return null
+}
+
+/** feed 只给 200 字（面板一行放不下），详情页从 run meta 拿全量。 */
+/// 最后一条事件的 kind：判断僵尸 run 到底跑到哪一步（`turn.end` = 其实已经跑完）。
+function lastRunEventKind(id) {
+  let text = null
+  try {
+    text = readFileSync(join(BRIDGE_DIR, 'runs', id, 'events.jsonl'), 'utf8')
+  } catch {
+    return null
+  }
+  const lines = text.split('\n')
+  for (let index = lines.length - 1; index >= 0 && index >= lines.length - 400; index -= 1) {
+    const line = lines[index].trim()
+    if (line === '') continue
+    try {
+      const event = JSON.parse(line)
+      const kind = typeof event.kind === 'string' ? event.kind : typeof event.type === 'string' ? event.type : null
+      if (kind !== null) return kind
+    } catch {}
+  }
+  return null
+}
+
+function clipError(text) {
+  if (typeof text !== 'string') return null
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat === '') return null
+  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
+}
+
+// ---- 雷达自己的小账本（t14 续）------------------------------------------------
+// 桥不认识 retryOf，也不认识「从雷达里移除」：这两件事都是**视图层**的语义，
+// 所以记在雷达自己的 state 目录里，不往桥的 meta.json 里塞字段（避免两个写者打架）。
+const STALE_RUN_MS = 10 * 60 * 1000
+
+function retriesFile() {
+  return join(STATE_DIR, 'retries.json')
+}
+
+function hiddenFile() {
+  return join(STATE_DIR, 'hidden-sessions.json')
+}
+
+function readMap(path) {
+  const data = readJson(path, null)
+  return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : {}
+}
+
+/// 被重试顶替掉的旧 run：重试成功那一刻起就不再出现在列表里（用户口径「旧行消失」）。
+function supersededRuns() {
+  const map = readMap(retriesFile())
+  const out = {}
+  for (const entry of Object.values(map)) {
+    if (entry !== null && typeof entry === 'object' && typeof entry.retryOf === 'string') out[entry.retryOf] = true
+  }
+  return out
+}
+
+function readRetryOf(runId) {
+  const record = readMap(retriesFile())[runId]
+  return record && typeof record.retryOf === 'string' ? record.retryOf : null
+}
+
+function writeRetryOf(runId, retryOfId) {
+  const map = readMap(retriesFile())
+  map[runId] = { retryOf: retryOfId, at: Date.now() }
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(retriesFile(), JSON.stringify(map, null, 2))
+  } catch {}
+}
+
+function readHiddenSessions() {
+  return readMap(hiddenFile())
+}
+
+function hideSession(sessionId) {
+  const map = readMap(hiddenFile())
+  map[sessionId] = { at: Date.now() }
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(hiddenFile(), JSON.stringify(map, null, 2))
+  } catch {}
+}
+
+/// 僵尸 running：桥只在「宿主重启后审批没人接」时对账（needs-approval），
+/// 子进程被 OS 杀掉/崩溃留下的 running 没有任何人收尾，胶囊就会永远停在「进行中」。
+/// 这里在**读侧**兜底：running 且 updatedAt 超过 10 分钟没动 → 按最后一条 turn.end 判 done，
+/// 否则 failed(reason=stale-running)。只改 feed 里的视图，不写桥的 meta（写者仍是桥）。
+/// 进程级即时判定（t14 续 2）：桥的 run 记录里带 spawn 出来的子进程 pid。
+/// 子进程被 OS 杀掉/崩溃退出后，桥不会落状态，`kill(pid, 0)` 立刻能看出「进程没了」——
+/// 这种情况不该等 10 分钟，必须马上落终态，否则胶囊会一直绿着「进行中」。
+/// 返回 true / false；拿不到 pid 时返回 null（未知，不影响其它判定）。
+function processAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 1) return null
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM = 进程在，但不是我们的（仍然算活着）；ESRCH = 进程已经没了。
+    return error?.code === 'EPERM'
+  }
+}
+
+function staleRunStatus(run, now) {
+  if (run.status !== 'running' && run.status !== 'starting' && run.status !== 'queued') return null
+  const ageMs = now - (Number(run.updatedAt) || 0)
+  if (!(ageMs > STALE_RUN_MS)) return null
+  return { ageMs }
+}
+
 function bridgeRuns() {
   let ids = []
   try {
@@ -172,6 +352,15 @@ function bridgeRuns() {
       finalAnswer: meta.finalAnswer ?? null,
       // 桥对账过的终态会带 reason=no_live_waiter：面板据此解释「为什么失败」。
       reason: meta.reason ?? null,
+      // 人类可读的失败原因（t14 bug 3）：桥把 spawn/退出码等原始错误写在这里。
+      error: typeof meta.error === 'string' && meta.error.trim() !== '' ? meta.error.trim() : null,
+      // 详情页要判断「有没有内容可展示」：没有事件的历史 run 不能再给一个空面板。
+      eventCount: Number.isFinite(meta.eventCount) ? meta.eventCount : null,
+      pid: Number.isFinite(meta.pid) ? meta.pid : null,
+      // 一眼能否分辨「真在跑」和「进程没了还在写 running」（t14 续 2）。
+      pidAlive: processAlive(Number.isFinite(meta.pid) ? meta.pid : null),
+      // 重试产生的 run 记在雷达自己的账本里（桥不认 retryOf，见 README 已知限制）。
+      retryOf: readRetryOf(id),
     })
   }
   return runs
@@ -250,6 +439,9 @@ async function diagOnce(ctx) {
 async function sessionItems(ctx) {
   const out = []
   const controller = ctx.get('sessionController')
+  // 双击会话行选「仅从雷达移除」的人不想再看到这行：feed 层永久过滤。
+  const hidden = readHiddenSessions()
+  const hiddenSessionIds = Object.fromEntries(Object.keys(hidden).map((key) => [key, true]))
   if (controller !== undefined && typeof controller.list === 'function') {
     const summaries = await underTimeout(
       Promise.resolve()
@@ -384,7 +576,12 @@ async function sessionItems(ctx) {
         // 一个父会话调了四个智能体，界面上只看到一个父会话在处理）。
         const runningFromChildren = kids.some((kid) => kid.running)
         if (isTop) {
+          // 双击会话行选「仅从雷达移除」后，永久不再出现在列表（feed 层过滤，不动 DSH 数据）。
+          if (hiddenSessionIds[row.id] === true) continue
           const members = row.team ? teamMembers(row, kids) : []
+          // 规则 B：主列表只放主会话，子会话一律挂到主会话详情里；
+          // 普通会话的子 agent 也要能看到（不只是 agent team）。
+          const visibleKids = kids.filter(fresh).map(toChild)
           out.push({
             id: row.id,
             kind: 'session',
@@ -394,8 +591,8 @@ async function sessionItems(ctx) {
             status: row.running || runningFromChildren ? 'running' : 'idle',
             // 只有 agent team 才展开成员进度；普通 session 的子 agent 不进列表（用户口径）。
             team: row.team,
-            childCount: row.team ? members.length : 0,
-            children: row.team ? members : undefined,
+            childCount: row.team ? members.length : visibleKids.length,
+            children: row.team ? members : visibleKids.length > 0 ? visibleKids : undefined,
             // 阶段视图：任务看板就是这条会话的分阶段计划
             stages: row.team
               ? (row.tasks ?? [])
@@ -621,6 +818,237 @@ function artifactItems() {
   }
 }
 
+/** 提问的可见文本：header 优先（短），否则问题原文。 */
+function questionHeadline(question) {
+  if (question === undefined || question === null) return ''
+  const raw = typeof question.header === 'string' && question.header.trim() !== ''
+    ? question.header
+    : (typeof question.question === 'string' ? question.question : '')
+  return raw.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 旁听一条会话内提问（prepend listener 里调用）：只记文本与选项，然后调用方必须 next()。
+ * 气泡/桌面卡是否显示不归这里管，所以这里绝不 return 答案。
+ */
+function tapQuestion(request) {
+  try {
+    const sessionId = request?.agent?.session?.id ?? request?.agent?.id
+    if (sessionId === undefined || sessionId === null) return
+    const questions = Array.isArray(request.questions)
+      ? request.questions.slice(0, 9).map((question, index) => ({
+          id: String(question?.id ?? index),
+          question: typeof question?.question === 'string' ? question.question : '',
+          header: typeof question?.header === 'string' ? question.header : null,
+          options: Array.isArray(question?.options)
+            ? question.options.slice(0, 9).map((option) => ({
+                label: typeof option?.label === 'string' ? option.label : String(option ?? ''),
+                description: typeof option?.description === 'string' ? option.description : null,
+              }))
+            : null,
+          multiSelect: question?.multiSelect === true,
+        }))
+      : []
+    const record = { questions, at: Date.now() }
+    questionTap.set(String(sessionId), record)
+    log(`question tap session=${String(sessionId).slice(0, 12)} n=${questions.length} head=${questionHeadline(questions[0]).slice(0, 24)}`)
+    return record
+  } catch (error) {
+    // 旁听失败绝不能让提问本身失败：调用方无条件 next()。
+    log(`question tap error ${String(error && error.message ? error.message : error).slice(0, 200)}`)
+    return undefined
+  }
+}
+
+/**
+ * 权威「谁在等回答」：typertGateway 里未决的 forwarded Remote 事件。
+ * 一次调用取全部，比逐会话 state() 便宜；不可用时返回 null（feed 退化为只靠旁听记录）。
+ */
+function pendingQuestionSessions(ctx) {
+  try {
+    const gateway = ctx.get('typertGateway')
+    if (gateway === undefined || gateway === null || typeof gateway.getPendingRemoteEvents !== 'function') return null
+    const out = new Set()
+    for (const info of gateway.getPendingRemoteEvents()) {
+      if (info?.event !== 'user-questions/request') continue
+      out.add(String(info.agentId))
+    }
+    return out
+  } catch (error) {
+    log(`questions pending error ${String(error && error.message ? error.message : error).slice(0, 200)}`)
+    return null
+  }
+}
+
+/** 短随机串（请求 id / 一次性 token）。 */
+function randomToken(length) {
+  let out = ''
+  while (out.length < length) out += Math.random().toString(36).slice(2)
+  return out.slice(0, length)
+}
+
+/**
+ * 有没有活着的 Web 客户端（Typert 连接的浏览器/桌面页）。
+ * 有客户端时桌面提问卡会正常弹出，雷达**不许**接管（用户裁定第 2 条）；探测不到也按「有」处理。
+ */
+function hasLiveWebClient(ctx) {
+  try {
+    const gateway = ctx.get('typertGateway')
+    if (gateway !== undefined && gateway !== null && typeof gateway.hasLiveClient === 'function') {
+      return gateway.hasLiveClient() !== false
+    }
+  } catch (error) {
+    log(`question client probe error ${String(error && error.message ? error.message : error).slice(0, 160)}`)
+  }
+  return true
+}
+
+/** 接管前提：HUD 活着 + 没有活客户端。任一不成立都必须 next()，把请求还给桌面卡。 */
+function takeoverVerdict(ctx) {
+  if (!hudAlive(hudPid())) return 'hud-dead'
+  if (hasLiveWebClient(ctx)) return 'client-live'
+  return 'ok'
+}
+
+function stopQuestionWatcher() {
+  if (questionWatcher === undefined) return
+  try { clearInterval(questionWatcher) } catch { /* ignore */ }
+  questionWatcher = undefined
+}
+
+/** HUD 死了就没人在面板上作答：立刻把还在手上的请求全部让渡，别让模型侧干等（R-05）。 */
+function ensureQuestionWatcher() {
+  if (questionWatcher !== undefined) return
+  questionWatcher = setInterval(() => {
+    if (questionHold.size === 0) { stopQuestionWatcher(); return }
+    if (hudAlive(hudPid())) return
+    for (const [requestId, held] of [...questionHold]) {
+      log(`question yield hud-dead request=${requestId}`)
+      held.settle('yield', undefined)
+    }
+  }, 1000)
+}
+
+/**
+ * 接管一条会话内提问：登记成可被 `/x-radar/question-answer` 作答的条目，
+ * 并在 QUESTION_HOLD_MS 后无条件 next() 让渡（返回下游的答案）。
+ */
+function holdQuestion(ctx, request, next, tap) {
+  const requestId = randomToken(12)
+  const token = randomToken(16)
+  const sessionId = String(request?.agent?.session?.id ?? request?.agent?.id ?? '')
+  const questions = Array.isArray(tap?.questions) ? tap.questions : []
+  return new Promise((resolve) => {
+    let done = false
+    const settle = (why, answers) => {
+      if (done) return
+      done = true
+      try { clearTimeout(timer) } catch { /* ignore */ }
+      questionHold.delete(requestId)
+      if (questionHold.size === 0) stopQuestionWatcher()
+      if (why === 'answered') {
+        log(`question answered request=${requestId} session=${sessionId.slice(0, 12)} n=${answers.length}`)
+        resolve({ answers })
+        return
+      }
+      log(`question yield ${why} request=${requestId} session=${sessionId.slice(0, 12)}`)
+      // 让渡 = 交回下游（桌面提问卡 / 别的 answerer）。下游失败要照原样抛出去。
+      resolve(next())
+    }
+    const timer = setTimeout(() => settle('yield', undefined), QUESTION_HOLD_MS)
+    questionHold.set(requestId, { token, sessionId, questions, settle, at: Date.now() })
+    if (tap !== undefined) {
+      tap.requestId = requestId
+      tap.token = token
+      tap.takenOverAt = Date.now()
+    }
+    ensureQuestionWatcher()
+    log(`question hold request=${requestId} session=${sessionId.slice(0, 12)} n=${questions.length} ms=${QUESTION_HOLD_MS}`)
+  })
+}
+
+/**
+ * HUD 回执校验：官方形状是数组 `{answers:[{id, selected:[label], custom?}]}`（用户裁定第 5 条）。
+ * 只接受本请求里出现过的 question id / option label；返回 null 表示形状不合法。
+ */
+function normalizeDshAnswers(raw, questions) {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const byId = new Map()
+  for (const question of questions ?? []) byId.set(String(question.id), question)
+  const out = []
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') return null
+    const id = String(entry.id ?? '')
+    const question = byId.get(id)
+    if (question === undefined) return null
+    const selected = (Array.isArray(entry.selected) ? entry.selected : [])
+      .map((value) => String(value))
+      .filter((value) => (question.options ?? []).some((option) => option.label === value))
+    const custom = typeof entry.custom === 'string' && entry.custom.trim() !== '' ? entry.custom.trim().slice(0, 200) : undefined
+    if (selected.length === 0 && custom === undefined) return null
+    if (question.multiSelect !== true && selected.length > 1) return null
+    out.push({ id, selected, ...(custom === undefined ? {} : { custom }) })
+  }
+  return out
+}
+
+/** 某会话正在被接管的请求（feed 用：HUD 要知道这条能就地提交、还有多久让渡）。 */
+function holdForSession(sessionId) {
+  for (const [requestId, held] of questionHold) {
+    if (held.sessionId === String(sessionId)) return { requestId, ...held }
+  }
+  return undefined
+}
+
+const SOURCE_DSH = 'dsh'
+
+/**
+ * 会话内提问 → feed 条目（kind=question，source=dsh）。
+ * 与桥里的提问（pendingApprovals 那条路）共用 kind，但 source 区分来源（t4 §0 D2）。
+ */
+function dshQuestionItems(ctx, sessions) {
+  const pending = pendingQuestionSessions(ctx)
+  const source = pending === null ? 'unavailable' : 'typertGateway'
+  if (pending === null || pending.size === 0) return { items: [], pending: pending ?? new Set(), source }
+  const byId = new Map()
+  for (const session of sessions?.items ?? []) {
+    if (typeof session?.id === 'string' && session.id !== '') byId.set(session.id, session)
+  }
+  const nowMs = Date.now()
+  const items = []
+  for (const id of pending) {
+    const tap = questionTap.get(id)
+    if (tap !== undefined && nowMs - Number(tap.at ?? 0) > QUESTION_TAP_TTL_MS) questionTap.delete(id)
+    const questions = Array.isArray(tap?.questions) && tap.questions.length > 0 ? tap.questions : undefined
+    const session = byId.get(id)
+    const headline = questionHeadline(questions?.[0])
+    const fallback = typeof session?.title === 'string' && session.title !== '' ? session.title : '会话在等你回答'
+    const held = holdForSession(id)
+    items.push({
+      kind: 'question',
+      id: `question:${id}`,
+      source: SOURCE_DSH,
+      sessionId: id,
+      agent: 'dsh',
+      title: headline === '' ? fallback : headline,
+      // 结构化问题与选项原样透传，HUD 面板逐条渲染（与桥内提问同形状）。
+      questions,
+      status: 'needs-answer',
+      updatedAt: Number(tap?.at ?? nowMs),
+      // 被接管才有回执通道：HUD 拿这组字段直接提交，字段缺失=只能提醒（回 DSH 里答）。
+      ...(held === undefined ? {} : {
+        answerRequest: held.requestId,
+        answerToken: held.token,
+        answerExpiresInMs: Math.max(0, QUESTION_HOLD_MS - (nowMs - Number(held.at ?? nowMs))),
+      }),
+    })
+  }
+  return { items, pending, source }
+}
+
+/** feed 截断上限：面板一屏 6 行 + 滚动，40 条足够覆盖一屏之外的真实任务。 */
+const MAX_ITEMS = 40
+
 async function buildRadar(ctx) {
   void diagOnce(ctx)
   // 端口要先知道：待批准队列是向桥（同一宿主进程）取的 HTTP 接口。
@@ -631,6 +1059,9 @@ async function buildRadar(ctx) {
   const runs = bridgeRuns()
   const sessions = await sessionItems(ctx)
   const approvals = await pendingApprovals(port)
+  // 会话内提问（DSH 自己的 ask_user_question）是独立于桥的第二套机制：单独取，单独标 source。
+  const dshQuestions = dshQuestionItems(ctx, sessions)
+  const pendingAnswerIds = dshQuestions.pending
   const items = []
 
   for (const approval of approvals) {
@@ -655,6 +1086,9 @@ async function buildRadar(ctx) {
     })
   }
 
+  // 会话内提问排在所有批准之前渲染（用户在等人答，这是当下唯一可动作的事）。
+  for (const item of dshQuestions.items) items.push(item)
+
   // 队列里没有对应审批的 run 一律不算「待批准」：桥在启动时会把这类 run 对账成 failed，
   // 但雷达也要能独立识别（旧数据/桥没来得及对账时不再显示自相矛盾的行）。
   const approvalRunIds = new Set(
@@ -662,9 +1096,14 @@ async function buildRadar(ctx) {
   )
   const orphanNoted = new Set()
   const ACTIVE_RUN = new Set(['running', 'starting', 'queued', 'needs-approval'])
+  const superseded = supersededRuns()
   for (const run of runs) {
     // 只有两类 run 进面板：①正在跑/等批准的；②有任务契约、真的过闸判别的。
     // 无契约的历史 run（含接入判别层之前的测试 run）一律不进胶囊，避免面板被噪声灌满。
+    if (superseded[run.id] === true) {
+      log(`run superseded by retry id=${run.id.slice(0, 8)}`)
+      continue
+    }
     const active = ACTIVE_RUN.has(run.status)
     // 刚跑完的（60 分钟内）也要留，否则完成提醒永远不会触发；更早的历史 run 才排除。
     const recent = Date.now() - Number(run.updatedAt ?? 0) <= 60 * 60 * 1000
@@ -680,6 +1119,29 @@ async function buildRadar(ctx) {
         log(`radar run orphaned id=${run.id.slice(0, 8)} from=needs-approval to=failed reason=no_live_waiter`)
       }
     }
+    // 失败行必须能说「为什么失败」（t14 bug 3）：meta.error → 最后一条错误事件 → reason 码兜底。
+    let error = null
+    // 僵尸 running（t14 续 bug 1 / 2）：桥只对账 needs-approval；子进程崩掉留下的 running 没人收尾。
+    // 分两级：进程没了（kill(pid,0)=ESRCH）立刻落终态；进程还在但 10 分钟没动静才算 stale。
+    const stale = staleRunStatus({ status, updatedAt: run.updatedAt }, Date.now())
+    const runningish = status === 'running' || status === 'starting' || status === 'queued'
+    if (runningish && run.pidAlive === false) {
+      const tail = lastRunEventKind(run.id)
+      status = tail === 'turn.end' ? 'done' : 'failed'
+      if (tail === 'turn.end') {
+        log(`process-exited run=${run.id.slice(0, 8)} agent=${run.agent} pid=${run.pid} last=turn.end -> done`)
+      } else {
+        reason = 'process-exited'
+        error = '进程已退出（process-exited）'
+        log(`process-exited run=${run.id.slice(0, 8)} agent=${run.agent} pid=${run.pid} last=${tail ?? 'none'} -> failed`)
+      }
+    } else if (stale !== null) {
+      const tail = lastRunEventKind(run.id)
+      status = tail === 'turn.end' ? 'done' : 'failed'
+      reason = tail === 'turn.end' ? reason : 'stale-running'
+      if (tail !== 'turn.end') error = '超过 10 分钟没有任何新事件（可能卡住了，stale-running）'
+      log(`stale-running run=${run.id.slice(0, 8)} agent=${run.agent} ageMin=${Math.round(stale.ageMs / 60000)} last=${tail ?? 'none'} -> ${status}`)
+    }
     if ((status === 'done' || status === 'failed') && run.seen) status = 'idle'
     if (status === 'idle' || status === 'unknown') {
       status = run.verdict === 'needs_revision'
@@ -692,7 +1154,10 @@ async function buildRadar(ctx) {
     }
     if (status === 'idle') continue
     if (run.seen === true && (status === 'done' || status === 'failed' || status === 'unverified')) continue
-    items.push({ ...run, kind: 'run', status, reason })
+    if (status === 'failed') {
+      error = clipError(run.error) ?? clipError(lastRunErrorText(run.id)) ?? clipError(reasonText(reason)) ?? null
+    }
+    items.push({ ...run, kind: 'run', status, reason, error })
   }
   // 会话完成后的保留：running→idle 的瞬间记一笔，60 分钟内且没看过就留在胶囊里可点。
   const TRACK_FILE = trackFile()
@@ -728,6 +1193,9 @@ async function buildRadar(ctx) {
     const id = session.id
     if (!id) continue
     if (session.status === 'running') {
+      // 等回答的会话不再计入「进行中」：胶囊必须能说「在等你回答」，而不是「在忙」（t4 §0 D1）。
+      // 它的可见行由 dshQuestions 的 kind=question 条目负责，这里不重复出一行。
+      if (pendingAnswerIds.has(id)) continue
       items.push({ ...session, startedAt: track.started[id] ?? nowMs })
       continue
     }
@@ -787,6 +1255,8 @@ async function buildRadar(ctx) {
     failed: items.filter((item) => item.kind === 'run' && item.status === 'failed').length,
     doneUnread: doneUnreadIds.length,
   }
+  // 会话内提问（DSH 自己的 ask_user_question）单独计数：排障时能区分「桥在等」与「会话在等」。
+  counts.questionsDsh = items.filter((item) => item.kind === 'question' && item.source === SOURCE_DSH).length
   counts.pending = counts.running
 
   // 办公产物：最近 6 小时内生成的 docx / xlsx / pptx / pdf，最多 3 条（点一下在 Finder 定位）。
@@ -805,12 +1275,41 @@ async function buildRadar(ctx) {
     counts.artifacts = artifacts.length
   }
 
-  // 审批有时限（桥侧 5 分钟无响应即自动拒绝），所以排最前。
-  // 旧版直接用 rank[status] 相减：failed/starting 这类没登记的 status 会让
-  // 比较函数返回 NaN，整张面板的顺序就变得不可预测（R-13）。
-  const rank = { 'needs-answer': 0, 'needs-approval': 0, done: 1, failed: 1, running: 2, rework: 2, verifying: 2, idle: 3 }
-  const rankOf = (status) => (Object.hasOwn(rank, status) ? rank[status] : 4)
-  items.sort((left, right) => (rankOf(left.status) - rankOf(right.status)) || ((right.updatedAt ?? 0) - (left.updatedAt ?? 0)))
+  // t14 bug 2：排序口径 = 先问「能不能动手」，再看「出没出问题」，最后才是完成。
+  // question(0) > approval(1) > failed(2) > running(3) > rework/blocked(4) > verifying(5) > done(6) > artifact/其它(7)
+  // 旧版把 done 和 failed 排前面、running 靠后，于是 16 条 done 一铺，running 与 failed 被截断掉。
+  const priorityOf = (item) => {
+    if (item.kind === 'question') return 0
+    if (item.kind === 'approval') return 1
+    if (item.kind === 'run' && item.status === 'failed') return 2
+    if (item.kind === 'session' && item.status === 'running') return 3
+    if (item.kind === 'run' && ['running', 'starting', 'queued', 'needs-approval'].includes(item.status)) return 3
+    if (item.status === 'rework' || item.status === 'blocked') return 4
+    if (item.status === 'verifying' || item.status === 'unverified') return 5
+    if (item.status === 'done') return 6
+    return 7
+  }
+  for (const item of items) item.priority = priorityOf(item)
+  items.sort((left, right) => (left.priority - right.priority) || ((right.updatedAt ?? 0) - (left.updatedAt ?? 0)))
+
+  // t14 bug 3 附带项：同一 agent 的连续同标题 done 折叠成一条（带 count），
+  // 否则真实任务永远被自己的 smoke/测试 run 挤出列表。细节：只折叠相邻的，跨状态不折叠。
+  const folded = []
+  const doneGroups = new Map()
+  for (const item of items) {
+    if (item.kind === 'run' && item.status === 'done') {
+      const key = `${item.agent ?? ''}|${item.title ?? ''}`
+      const kept = doneGroups.get(key)
+      if (kept !== undefined) {
+        kept.count = (kept.count ?? 1) + 1
+        continue
+      }
+      doneGroups.set(key, item)
+    }
+    folded.push(item)
+  }
+  items.length = 0
+  items.push(...folded)
 
   return {
     ok: true,
@@ -819,12 +1318,51 @@ async function buildRadar(ctx) {
     // 未读完成的完整 id 清单（不受 items.slice(12) 截断影响），HUD 用它做标题数、
     // 点击清单一与去重键，避免「25 个任务完成」但只清掉可见的 12 条。
     doneUnreadIds,
-    items: items.slice(0, 12),
+    items: items.slice(0, MAX_ITEMS),
     total: items.length,
-    sources: { sessions: sessions.source, runs: runs.length },
+    sources: { sessions: sessions.source, runs: runs.length, questions: dshQuestions.source },
     clientHalf: clientHalfState(),
     dsh: { port: port ?? null, url: port === undefined ? null : `http://127.0.0.1:${port}` },
   }
+}
+
+// feed 快照缓存（t5 M4：p50 59.2ms > 门 50ms，54ms 全在每次请求都 await sessionController.list()）。
+// HUD 每 2s 拉一次、突发重连会连拉多次，1s 快照足够新，且把 p50 从「每次都等 list()」变成「大多命中」。
+// 单飞：并发请求共用一次 buildRadar，避免缓存过期时同时打多份 list()。
+const SNAPSHOT_TTL_MS = 1000
+let snapshotAt = 0
+let snapshotBody = null
+let snapshotInflight = null
+
+function refreshSnapshot(ctx) {
+  if (snapshotInflight) return snapshotInflight
+  snapshotInflight = buildRadar(ctx)
+    .then((body) => {
+      snapshotAt = Date.now()
+      snapshotBody = body
+      return body
+    })
+    .finally(() => { snapshotInflight = null })
+  // 后台刷新的失败不能变成未捕获拒绝：留着旧快照，下次请求再试。
+  snapshotInflight.catch(() => {})
+  return snapshotInflight
+}
+
+// 让下一次 /radar 立刻重建：置已读、批/拒之后必须马上看到新状态，不能等 TTL。
+function invalidateSnapshot() {
+  snapshotAt = 0
+  snapshotBody = null
+}
+
+// stale-while-revalidate：有快照就立刻返回（p50 从「每次等 list()」降到 1ms 级），
+// 过期了在后台补一份；只有冷启动那一次要等 list()。
+async function buildRadarCached(ctx) {
+  if (snapshotBody) {
+    const ageMs = Date.now() - snapshotAt
+    if (ageMs >= SNAPSHOT_TTL_MS) refreshSnapshot(ctx)
+    return { body: snapshotBody, cached: true, ageMs }
+  }
+  return { body: await refreshSnapshot(ctx), cached: false, ageMs: 0 }
 }
 
 function radarRoute(ctx) {
@@ -834,8 +1372,11 @@ function radarRoute(ctx) {
     if (tail === 'beacon') return beaconResponse(url)
     if (tail === 'radar') {
       let body
+      let cached = false
       try {
-        body = await buildRadar(ctx)
+        const snapshot = await buildRadarCached(ctx)
+        body = snapshot.body
+        cached = snapshot.cached
       } catch (error) {
         log(`radar error ${String(error && error.stack ? error.stack : error).slice(0, 600)}`)
         return new Response(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }), {
@@ -843,7 +1384,7 @@ function radarRoute(ctx) {
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         })
       }
-      log(`radar counts pending=${body.counts.pending} running=${body.counts.running} approvals=${body.counts.approvals} rows=${body.items.length} src=${body.sources.sessions}`)
+      log(`radar counts pending=${body.counts.pending} running=${body.counts.running} approvals=${body.counts.approvals} questions=${body.counts.questions} qdsh=${body.counts.questionsDsh} rows=${body.items.length} src=${body.sources.sessions} cached=${cached ? 1 : 0}`)
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -908,6 +1449,81 @@ function radarRoute(ctx) {
         } catch {}
       }, JUMP_ACK_TIMEOUT_MS).unref?.()
       return new Response(JSON.stringify({ ok: true, id: record.id, client: half.active ? 'active' : 'inactive', timeoutMs: JUMP_ACK_TIMEOUT_MS }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
+    if (tail === 'question-answer') {
+      // HUD 面板就地作答：只认被接管（holdQuestion 登记）的请求 + 一次性 token。
+      // 用户裁定第 5 条：回执形状是数组 `{answers:[{id, selected:[label], custom?}]}`。
+      const requestId = url.searchParams.get('request') ?? ''
+      const token = url.searchParams.get('token') ?? ''
+      const held = questionHold.get(requestId)
+      const fail = (status, error) => new Response(JSON.stringify({ ok: false, error }), {
+        status,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+      if (held === undefined) {
+        log(`question answer rejected request=${requestId.slice(0, 12)} reason=not-pending`)
+        return fail(410, 'request not pending')
+      }
+      if (token === '' || token !== held.token) {
+        log(`question answer rejected request=${requestId.slice(0, 12)} reason=bad-token`)
+        return fail(403, 'bad token')
+      }
+      let parsed
+      try {
+        parsed = JSON.parse(url.searchParams.get('answers') ?? '')
+      } catch {
+        return fail(400, 'answers must be JSON array')
+      }
+      const answers = normalizeDshAnswers(parsed, held.questions)
+      if (answers === null) {
+        log(`question answer rejected request=${requestId.slice(0, 12)} reason=bad-shape`)
+        return fail(400, 'answers must be [{id, selected:[label], custom?}]')
+      }
+      held.settle('answered', answers)
+      invalidateSnapshot()
+      return new Response(JSON.stringify({ ok: true, request: requestId, answered: answers.length }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+    if (tail === 'questions') {
+      // 排障用：会话内提问的两路证据（权威未决集合 + 旁听到的文本）。
+      const pending = pendingQuestionSessions(ctx)
+      const taps = []
+      for (const [sessionId, tap] of questionTap) {
+        taps.push({
+          sessionId,
+          ageMs: Date.now() - Number(tap.at ?? 0),
+          questions: (tap.questions ?? []).map((question) => ({
+            id: question.id,
+            header: question.header,
+            question: String(question.question ?? '').slice(0, 120),
+            options: (question.options ?? []).map((option) => option.label),
+          })),
+        })
+      }
+      const gateway = (() => {
+        try {
+          return typeof ctx.get('typertGateway')?.getPendingRemoteEvents === 'function' ? 'typertGateway' : 'unavailable'
+        } catch { return 'unavailable' }
+      })()
+      return new Response(JSON.stringify({
+        ok: true,
+        source: gateway,
+        pending: pending === null ? null : [...pending],
+        holds: [...questionHold].map(([requestId, held]) => ({
+          request: requestId,
+          sessionId: held.sessionId,
+          ageMs: Date.now() - Number(held.at ?? 0),
+          remainingMs: Math.max(0, QUESTION_HOLD_MS - (Date.now() - Number(held.at ?? 0))),
+          questions: (held.questions ?? []).map((question) => ({ id: question.id, multiSelect: question.multiSelect === true })),
+        })),
+        taps,
+      }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
@@ -1057,6 +1673,8 @@ function radarRoute(ctx) {
       // 不能一律 502 —— HUD 靠状态码区分「过时」和「桥挂了」。
       const passthrough = [400, 403, 404, 409]
       const status = result.ok ? 200 : passthrough.includes(result.status) ? result.status : 502
+      // 批/拒成功或失败都动过审批队列，快照一律作废，避免 HUD 立刻刷新时看到旧的 pending。
+      invalidateSnapshot()
       return new Response(JSON.stringify(result), {
         status,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -1076,8 +1694,136 @@ function radarRoute(ctx) {
           mkdirSync(STATE_DIR, { recursive: true })
           writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
         } catch {}
+        invalidateSnapshot()
       }
       return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } })
+    }
+    if (tail === 'retry') {
+      // 失败行的「重试」：用同一个 prompt/agent/cwd 重新起一个 run。
+      // 桥的 POST /agent-bridge/runs 不认 retryOf，所以在雷达自己的账本里记一份
+      // （feed 的 item.retryOf 就从这个账本读）。
+      const runId = (url.searchParams.get('run') ?? '').trim()
+      if (runId === '') {
+        return new Response(JSON.stringify({ ok: false, error: 'run is required' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      const meta = readJson(join(BRIDGE_DIR, 'runs', runId, 'meta.json'), null)
+      if (meta === null || typeof meta !== 'object' || typeof meta.prompt !== 'string' || meta.prompt.trim() === '') {
+        return new Response(JSON.stringify({ ok: false, error: 'run not found or has no prompt' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      const bridgePort = ctx.get('webServer')?.port
+      if (!Number.isFinite(bridgePort) || bridgePort <= 0) {
+        return new Response(JSON.stringify({ ok: false, error: 'webServer port unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      const bridge = `http://127.0.0.1:${bridgePort}/agent-bridge/runs`
+      try {
+        const created = await fetch(bridge, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            prompt: meta.prompt,
+            agent: meta.agent === 'claude' ? 'claude' : 'codex',
+            cwd: typeof meta.cwd === 'string' ? meta.cwd : undefined,
+            ...(typeof meta.model === 'string' && meta.model ? { model: meta.model } : {}),
+          }),
+          signal: AbortSignal.timeout(6000),
+        })
+        const body = await created.json().catch(() => null)
+        if (!created.ok || body === null || typeof body.runId !== 'string') {
+          log(`retry failed run=${runId.slice(0, 8)} status=${created.status} body=${JSON.stringify(body).slice(0, 160)}`)
+          return new Response(JSON.stringify({ ok: false, error: 'bridge rejected retry', status: created.status, body }), {
+            status: 502,
+            headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+          })
+        }
+        writeRetryOf(body.runId, runId)
+        const seen = readSeen()
+        seen[runId] = Date.now()
+        try {
+          mkdirSync(STATE_DIR, { recursive: true })
+          writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+        } catch {}
+        invalidateSnapshot()
+        log(`retry run=${runId.slice(0, 8)} -> new=${body.runId.slice(0, 8)} agent=${body.agent ?? '?'}`)
+        return new Response(JSON.stringify({ ok: true, runId: body.runId, retryOf: runId, agent: body.agent ?? null }), {
+          status: 200,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      } catch (error) {
+        log(`retry error run=${runId.slice(0, 8)} ${String(error && error.message ? error.message : error)}`)
+        return new Response(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }), {
+          status: 502,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+    }
+    if (tail === 'hide-session') {
+      // 双击会话行选「仅从雷达移除」：写 hidden-sessions.json（永久过滤）+ seen。
+      // 只动雷达自己的视图，不碰 DSH 的会话数据（删会话只能在 DSH 里做）。
+      const sessionId = (url.searchParams.get('session') ?? '').trim()
+      if (sessionId === '') {
+        return new Response(JSON.stringify({ ok: false, error: 'session is required' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      hideSession(sessionId)
+      const seen = readSeen()
+      seen[sessionId] = Date.now()
+      try {
+        mkdirSync(STATE_DIR, { recursive: true })
+        writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+      } catch {}
+      invalidateSnapshot()
+      log(`session hidden id=${sessionId.slice(0, 8)}`)
+      return new Response(JSON.stringify({ ok: true, hidden: sessionId }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+    if (tail === 'clear-done') {
+      // t14 bug 4：「清除已完成」= 全部标已读 + 清掉会话 finished 记账，
+      // 否则下次重启 radar-sessions.json 里的 finished 会再把 done 行放回来。
+      const fresh = await buildRadar(ctx)
+      const ids = Array.isArray(fresh.doneUnreadIds) ? fresh.doneUnreadIds : []
+      let trackCleared = 0
+      if (ids.length > 0) {
+        const seen = readSeen()
+        const now = Date.now()
+        for (const id of ids) seen[id] = now
+        try {
+          mkdirSync(STATE_DIR, { recursive: true })
+          writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+        } catch {}
+        try {
+          const track = readJson(trackFile(), null)
+          if (track !== null && typeof track === 'object') {
+            for (const id of ids) {
+              if (track.finished?.[id] !== undefined) {
+                delete track.finished[id]
+                delete track.started[id]
+                delete track.finishedAt[id]
+                trackCleared += 1
+              }
+            }
+            writeFileSync(trackFile(), JSON.stringify(track))
+          }
+        } catch {}
+        invalidateSnapshot()
+      }
+      log(`panel clear-done n=${ids.length} track=${trackCleared}`)
+      return new Response(JSON.stringify({ ok: true, cleared: ids.length, track: trackCleared }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
     }
     return new Response(JSON.stringify({ ok: false, error: 'not found', path: tail }), {
       status: 404,
@@ -1423,6 +2169,28 @@ function attachClientHalfToSuiteHealth() {
 export function apply(ctx) {
   log('host.apply')
   attachClientHalfToSuiteHealth()
+  // 旁听会话内提问：prepend 让自己排在 api-remotes 的转发 listener 之前（它接手后
+  // 不再 next()，晚注册的 listener 永远轮不到）。这里只记文本，随即 next() 交还下游：
+  // 桌面提问卡照常由 Web 端弹出，雷达不接管、不改任何人的行为。
+  // 旁听是增强项：宿主或测试桩没有 ctx.on 时不能让整个插件起不来（smoke 的假 ctx 就是这种）。
+  if (typeof ctx?.on === 'function') {
+    try {
+      ctx.on('user-questions/request', (request, next) => {
+        const tap = tapQuestion(request)
+        const verdict = takeoverVerdict(ctx)
+        if (verdict !== 'ok') {
+          // 不接管：HUD 不在 / 有活客户端（桌面卡会正常弹出）。旁听记录留着给 feed 用。
+          return next()
+        }
+        return holdQuestion(ctx, request, next, tap)
+      }, true)
+      log('question tap listening')
+    } catch (error) {
+      log(`question tap listen failed ${error?.message ?? error}`)
+    }
+  } else {
+    log('question tap unavailable ctx.on')
+  }
   ctx.effect(() => {
     let bound
     for (const path of PREFERRED) {
@@ -1502,6 +2270,9 @@ export function apply(ctx) {
       if (portTimer !== undefined) clearInterval(portTimer)
       if (urlGuard !== undefined) clearInterval(urlGuard)
       if (supervisor !== undefined) clearInterval(supervisor)
+      // 换代/卸载：还挂在手上的会话内提问必须让渡，不能留一个没人回答的 waterfall（R-05）。
+      for (const held of [...questionHold.values()]) held.settle('yield', undefined)
+      stopQuestionWatcher()
       try {
         bound.dispose()
       } catch {}

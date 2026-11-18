@@ -12,6 +12,60 @@ const run = promisify(execFile)
 export const WORKBUDDY_APP = '/Applications/WorkBuddy.app'
 const AUDIT_FILE = join(homedir(), '.dsh', 'agent-bridge', 'workbuddy-confirms.json')
 const PENDING_FILE = join(homedir(), '.dsh', 'agent-bridge', 'workbuddy-pending.json')
+const CONFIG_FILE = join(homedir(), '.dsh', 'agent-bridge', 'workbuddy.json')
+
+// 确认策略（t24）：
+//   ask  —— 默认。检测到确认卡不代点，只落 pending 让胶囊「WorkBuddy 等你确认」；
+//           用户 accept 才 open -a WorkBuddy 交给人自己点。
+//   auto —— 显式选择，恢复原先「点卡片 + 点弹窗」的自动代点，审计写 mode:'auto'。
+// 为什么默认 ask：代点等于替用户在第三方 App 里同意一个我们看不懂的条款/动作
+// （可能是付款、授权、删除），属于不可逆操作，必须由人确认。详见 docs/DEV.md。
+export const CONFIRM_POLICIES = ['ask', 'auto']
+export const DEFAULT_CONFIRM_POLICY = 'ask'
+
+export function readConfig() {
+  try {
+    if (!existsSync(CONFIG_FILE)) return {}
+    const parsed = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    // 配置损坏时按默认（ask）处理：宁可多问一句，也不要静默代点。
+    return {}
+  }
+}
+
+export function confirmPolicy() {
+  const value = readConfig().confirmPolicy
+  return value === 'auto' ? 'auto' : DEFAULT_CONFIRM_POLICY
+}
+
+export function policyInfo() {
+  const config = readConfig()
+  return {
+    confirmPolicy: confirmPolicy(),
+    configured: typeof config.confirmPolicy === 'string' ? config.confirmPolicy : null,
+    default: DEFAULT_CONFIRM_POLICY,
+    file: CONFIG_FILE,
+  }
+}
+
+/** 确认卡的处理动作：只有显式 auto 才代点。 */
+export function pendingCardAction(policy = confirmPolicy()) {
+  return policy === 'auto' ? 'click' : 'ask'
+}
+
+export function auditDecision(mode, info = {}) {
+  const entry = {
+    ts: Date.now(),
+    mode,
+    card: String(info.card ?? '').slice(0, 160),
+    dialog: null,
+    policy: info.policy ?? confirmPolicy(),
+    source: info.source ?? 'host',
+  }
+  audit(entry)
+  return entry
+}
 
 export function markPending(info) {
   try {
@@ -64,13 +118,27 @@ export function confirmAudit(limit = 200) {
       })
       .filter(Boolean)
     const todayKey = new Date().toISOString().slice(0, 10)
+    // 决策记录（ask/user/declined）故意只写 ts、不写 at：「已代你确认 N 次」按行内
+    // 日期字符串统计（radar 读同一个文件），不能让人工确认混进代点计数。
+    const dayOf = (item) => {
+      if (typeof item.at === 'string' && item.at) return item.at.slice(0, 10)
+      if (typeof item.ts === 'number') return new Date(item.ts).toISOString().slice(0, 10)
+      return ''
+    }
+    const modeCount = (mode) => items.filter((item) => item.mode === mode).length
+    const todayModeCount = (mode) => items.filter((item) => item.mode === mode && dayOf(item) === todayKey).length
     return {
       count: items.length,
-      today: items.filter((item) => String(item.at || '').startsWith(todayKey)).length,
+      today: items.filter((item) => dayOf(item) === todayKey).length,
+      auto: modeCount('auto'),
+      autoToday: todayModeCount('auto'),
+      user: modeCount('user'),
+      declined: modeCount('declined'),
+      ask: modeCount('ask'),
       items: items.slice(-limit),
     }
   } catch {
-    return { count: 0, today: 0, items: [] }
+    return { count: 0, today: 0, auto: 0, autoToday: 0, user: 0, declined: 0, ask: 0, items: [] }
   }
 }
 export const PROBE = 'http://127.0.0.1:18488/workbuddy/probe'
@@ -251,6 +319,9 @@ const CONFIRM_DIALOG = `(() => {
   return { ok: true, clicked: 'dialog', label };
 })()`
 
+// 显式代点（POST /workbuddy/confirm）。默认 ask 策略下这条路径不会再被自动触发，
+// 只有调用方（人或脚本）明确要求「代我点一下」时才会执行，因此仍然写 mode:'auto'，
+// 让胶囊的「已代你确认 N 次」如实反映发生了代点。
 export async function autoConfirm(port = DEFAULT_CDP) {
   return withSocket(port, async ({ send: cdp }) => {
     const first = await evaluate(cdp, CONFIRM_SCRIPT)
@@ -262,6 +333,8 @@ export async function autoConfirm(port = DEFAULT_CDP) {
       card: String(first.label || '').slice(0, 120),
       dialog: second && second.ok ? String(second.label || '') : null,
       mode: 'auto',
+      policy: confirmPolicy(),
+      source: 'explicit-confirm',
     }
     audit(entry)
     return { ok: true, ...entry }
@@ -311,7 +384,17 @@ export async function send(text, port = DEFAULT_CDP, options = {}) {
     for (let i = 0; i < 30 && state && state.busy; i += 1) state = await settle(cdp, 700)
     let autoConfirmed = null
     if (state && state.pendingCard) {
-      // 用户 2026-11-16 决定：这类「回复确认消息」卡片自动点确认，并写审计（可在胶囊里看次数）。
+      // t24：默认 ask —— 只登记待确认、交给胶囊问人，绝不代点。
+      // 代点等于替用户在第三方 App 里同意一个我们看不懂的动作，不可逆。
+      const policy = confirmPolicy()
+      const action = pendingCardAction(policy)
+      const card = state.pendingCard.slice(0, 160)
+      if (action !== 'click') {
+        markPending({ card, reason: 'pending_confirmation', policy })
+        auditDecision('ask', { card, policy, source: 'send' })
+        return { ok: false, needsUser: true, reason: 'pending_confirmation', policy, card }
+      }
+      // 用户在 workbuddy.json 里显式选了 auto：恢复原自动代点。
       const confirmed = await evaluate(cdp, CONFIRM_SCRIPT)
       if (confirmed && confirmed.ok) {
         await sleep(700)
@@ -321,12 +404,13 @@ export async function send(text, port = DEFAULT_CDP, options = {}) {
           card: String(confirmed.label || '').slice(0, 120),
           dialog: dialog && dialog.ok ? String(dialog.label || '') : null,
           mode: 'auto',
+          policy,
         }
         audit(autoConfirmed)
         await sleep(900)
       } else {
-        markPending({ card: state.pendingCard.slice(0, 160), reason: 'pending_confirmation' })
-        return { ok: false, needsUser: true, reason: 'pending_confirmation', card: state.pendingCard.slice(0, 160) }
+        markPending({ card, reason: 'pending_confirmation', policy })
+        return { ok: false, needsUser: true, reason: 'pending_confirmation', policy, card }
       }
     }
 

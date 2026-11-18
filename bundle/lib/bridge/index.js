@@ -27,11 +27,11 @@
  * 队列持久化在 ~/.dsh/agent-bridge/pending-approvals.json，只存可序列化字段。
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { autoConfirm as wbAutoConfirm, clearPending as wbClearPending, confirmAudit as wbAudit, pendingInfo as wbPending, launch as wbLaunch, readLast as wbReadLast, send as wbSend, state as wbState } from './workbuddy.js'
+import { auditDecision as wbAuditDecision, autoConfirm as wbAutoConfirm, clearPending as wbClearPending, confirmAudit as wbAudit, confirmPolicy as wbPolicy, pendingInfo as wbPending, policyInfo as wbPolicyInfo, launch as wbLaunch, readConfig as wbReadConfig, readLast as wbReadLast, send as wbSend, state as wbState, CONFIRM_POLICIES } from './workbuddy.js'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-agent-bridge'
@@ -344,6 +344,21 @@ function reapOrphanApprovals({ store, approvals, now = Date.now(), ttlMs = ORPHA
  *
  * 判定只看 approvals Map（唯一能把决策送回子进程的通道）：有活 waiter 的 run 不动。
  */
+function isRunningStatus(status) {
+  return status === 'running' || status === 'starting' || status === 'queued' || status === 'needs-approval'
+}
+
+/** 进程是否还在（t16 F1）：ESRCH=没了；EPERM=在跑但属于别人。 */
+function pidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 1) return null
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
 function reconcileRuns({ store, approvals, log = () => {} }) {
   const liveRunIds = new Set(
     [...approvals.values()]
@@ -367,7 +382,38 @@ function reconcileRuns({ store, approvals, log = () => {} }) {
     } catch {
       continue
     }
-    if (meta === null || typeof meta !== 'object' || meta.status !== 'needs-approval') continue
+    if (meta === null || typeof meta !== 'object') continue
+    if (meta.status !== 'needs-approval') {
+      // t16 F1：桥自己也要能收尾「status=running 但子进程早没了」的 run
+      // （宿主硬崩/子进程被 kill 都没机会走 exit 回调时，磁盘上就会留这种记录）。
+      // 只对带 pid 的记录判定；历史 run 没有 pid → 交给雷达的 10 分钟兜底。
+      if (!isRunningStatus(meta.status)) continue
+      if (!Number.isFinite(meta.pid)) continue
+      if (pidAlive(meta.pid) !== false) continue
+      const run = store.runs.get(id)
+      const note = '子进程已经退出（process-exited），桥在读侧补写终态'
+      if (run) {
+        try {
+          store.append(run, { kind: 'run.reconcile', from: meta.status, to: 'failed', reason: 'process-exited', note })
+        } catch {}
+        store.setStatus(run, 'failed', { error: note, reason: 'process-exited', reconciledAt: now })
+      } else {
+        const next = { ...meta, status: 'failed', error: note, reason: 'process-exited', reconciledAt: now, updatedAt: now }
+        try {
+          writeFileSync(join(dir, 'meta.json'), `${JSON.stringify(next, null, 2)}\n`)
+          const seq = Number.isFinite(meta.eventCount) ? meta.eventCount + 1 : 1
+          appendFileSync(
+            join(dir, 'events.jsonl'),
+            `${JSON.stringify({ seq, at: now, kind: 'run.reconcile', from: meta.status, to: 'failed', reason: 'process-exited', note })}\n`,
+          )
+        } catch (error) {
+          log(`reconcile persist failed id=${id.slice(0, 8)} ${String(error?.message ?? error)}`)
+        }
+      }
+      log(`process-exited run=${id.slice(0, 8)} agent=${meta.agent ?? '?'} pid=${meta.pid} source=reconcile`)
+      reconciled.push(id)
+      continue
+    }
     // 内存里加载过的 run 走 RunStore（同时写 SSE + meta）；更早的历史 run 只修磁盘。
     const run = store.runs.get(id)
     if (run) {
@@ -734,6 +780,9 @@ class RunStore {
       status: 'starting',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      // 子进程 pid（t16 F1）：claude 是本次 spawn 的子进程，codex 是共享 app-server。
+      // 雷达用它做「进程级即时判定」；历史 run 没有该字段时为 null（只能靠 10 分钟兜底）。
+      pid: null,
       threadId: null,
       turnId: null,
       eventCount: 0,
@@ -779,6 +828,8 @@ class RunStore {
       status: run.status,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
+      // 落盘 pid：雷达读 meta.json 的 pid 做 kill(pid,0) 存活判定（t16 F1）。
+      pid: Number.isFinite(run.pid) ? run.pid : null,
       threadId: run.threadId,
       turnId: run.turnId,
       eventCount: run.eventCount,
@@ -1204,7 +1255,13 @@ export function apply(ctx) {
 
   host.onNotification((event) => {
     if (event.type === 'host/exit') {
-      for (const run of store.runs.values()) if (run.status === 'running') store.setStatus(run, 'failed', { error: 'codex app-server exited' })
+      // app-server 进程没了 = 所有 codex run 的承载进程都没了（t16 F1）：
+      // 落 reason=process-exited，让 /runs/:id 与雷达的读侧判定同一口径。
+      for (const run of store.runs.values()) {
+        if (run.status !== 'running' && run.status !== 'starting' && run.status !== 'needs-approval') continue
+        store.setStatus(run, 'failed', { error: 'codex app-server exited', reason: 'process-exited' })
+        log(`process-exited run=${run.id.slice(0, 8)} agent=codex pid=${run.pid ?? 'unknown'} host=exit`)
+      }
       return
     }
     if (event.type !== 'notification') {
@@ -1409,8 +1466,12 @@ export function apply(ctx) {
     }
     await host.start()
     const run = store.create({ agent: 'codex', prompt, cwd, model: body.model ?? null, dshSessionId })
+    // t16 F1：codex 的每个 run 由同一个 `codex app-server` 子进程承载，
+    // 所以 pid 记的是 app-server 的 pid（它死了，所有 run 都该判 process-exited）。
+    run.pid = Number.isFinite(host.child?.pid) ? host.child.pid : null
     store.append(run, { kind: 'run.created', prompt })
-    log(`run start id=${run.id.slice(0, 8)} agent=codex cwd=${cwd}`)
+    store.persist(run)
+    log(`run start id=${run.id.slice(0, 8)} agent=codex pid=${run.pid ?? 'unknown'} cwd=${cwd}`)
     const thread = await host.request('thread/start', { cwd, ...(body.model ? { model: body.model } : {}) })
     run.threadId = thread.thread.id
     run.model = thread.model ?? run.model
@@ -1473,7 +1534,10 @@ export function apply(ctx) {
     claudeChildren.set(run.id, child)
     run.binary = binary
     run.settingsPath = settingsPath
+    // t16 F1：spawn 成功立刻把 pid 落盘（雷达据此判定进程是否还在）。
+    run.pid = Number.isFinite(child.pid) ? child.pid : null
     store.persist(run)
+    log(`run pid id=${run.id.slice(0, 8)} agent=claude pid=${run.pid ?? 'unknown'}`)
 
     const state = { sessionId: null, model: run.model, sawText: false }
     let buffer = ''
@@ -1522,7 +1586,13 @@ export function apply(ctx) {
     child.on('exit', (code, signal) => {
       claudeChildren.delete(run.id)
       if (run.status === 'running' || run.status === 'starting' || run.status === 'needs-approval') {
-        store.setStatus(run, code === 0 ? 'done' : 'failed', { error: code === 0 ? null : `${signal ?? code}: ${stderr.slice(-400)}` })
+        // 非零退出/被信号杀死 = 子进程没了：落 reason=process-exited，和雷达的读侧判定同一口径（t16 F1）。
+        const abnormal = code !== 0
+        store.setStatus(run, abnormal ? 'failed' : 'done', {
+          error: abnormal ? `${signal ?? code}: ${stderr.slice(-400)}` : null,
+          ...(abnormal ? { reason: 'process-exited' } : {}),
+        })
+        if (abnormal) log(`process-exited run=${run.id.slice(0, 8)} agent=claude pid=${run.pid ?? 'unknown'} signal=${signal ?? code}`)
       }
     })
     return child
@@ -1721,6 +1791,20 @@ export function apply(ctx) {
           lastError: host.lastError ?? null,
         },
         claude: { binary: claudeBinaryPath, running: claudeChildren.size },
+        workbuddy: (() => {
+          const audit = wbAudit(200)
+          const pending = wbPending()
+          return {
+            confirmPolicy: wbPolicy(),
+            pending: Boolean(pending && !pending.cleared),
+            pendingCard: pending?.card ?? null,
+            autoConfirmed: audit.auto ?? 0,
+            autoConfirmedToday: audit.autoToday ?? 0,
+            userConfirmed: audit.user ?? 0,
+            declined: audit.declined ?? 0,
+            ask: audit.ask ?? 0,
+          }
+        })(),
         runs: store.runs.size,
         failedRuns,
         pendingApprovals: pendingApprovals.list().length,
@@ -1751,9 +1835,26 @@ export function apply(ctx) {
     if (parts[0] === 'workbuddy' && method === 'GET' && parts[1] === 'pending') {
       return json(response, 200, { pending: wbPending() })
     }
+    if (parts[0] === 'workbuddy' && method === 'GET' && parts[1] === 'policy') {
+      return json(response, 200, { ok: true, ...wbPolicyInfo(), policies: CONFIRM_POLICIES })
+    }
+    if (parts[0] === 'workbuddy' && method === 'POST' && parts[1] === 'policy') {
+      // 显式切换：只写 workbuddy.json 的 confirmPolicy，其余字段原样保留。
+      const body = (await readJsonBody(request)) ?? {}
+      const next = String(body.confirmPolicy ?? body.policy ?? '')
+      if (!CONFIRM_POLICIES.includes(next)) {
+        return json(response, 400, { ok: false, error: 'confirmPolicy must be ask|auto', policies: CONFIRM_POLICIES })
+      }
+      const config = wbReadConfig()
+      const target = join(ROOT, 'workbuddy.json')
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, `${JSON.stringify({ ...config, confirmPolicy: next }, null, 2)}\n`)
+      log(`workbuddy policy -> ${next} (file=${target})`)
+      return json(response, 200, { ok: true, ...wbPolicyInfo() })
+    }
     if (parts[0] === 'workbuddy' && method === 'POST' && parts[1] === 'confirm') {
       const result = await wbAutoConfirm(wbPort(url)).catch((error) => ({ ok: false, error: String(error.message || error) }))
-      log(`workbuddy confirm ok=${result.ok}`)
+      log(`workbuddy confirm policy=${wbPolicy()} ok=${result.ok} mode=${result.mode ?? '-'}`)
       return json(response, result.ok ? 200 : 500, result)
     }
     if (parts[0] === 'workbuddy' && method === 'GET' && parts[1] === 'confirms') {
@@ -1772,7 +1873,8 @@ export function apply(ctx) {
     if (parts[0] === 'workbuddy' && method === 'POST' && parts[1] === 'send') {
       const body = await readBody(request)
       const result = await wbSend(String(body.text ?? ''), wbPort(url), { newTask: body.newTask === true }).catch((error) => ({ ok: false, error: String(error.message || error) }))
-      log(`workbuddy send ok=${result.ok}`)
+      // ask 分支的关键证据：needsUser + policy=ask + 没有 mode:'auto' 的审计记录。
+      log(`workbuddy send ok=${result.ok} policy=${result.policy ?? wbPolicy()} needsUser=${result.needsUser === true} reason=${result.reason ?? '-'}`)
       return json(response, result.ok ? 200 : 500, result)
     }
     if (parts[0] === 'workbuddy' && method === 'GET' && parts[1] === 'last') {
@@ -1954,6 +2056,7 @@ export function apply(ctx) {
       const list = [...live, ...stale]
       const pending = wbPending()
       if (pending && !pending.cleared) {
+        const policy = wbPolicy()
         list.unshift({
           id: 'workbuddy',
           agent: 'workbuddy',
@@ -1961,27 +2064,43 @@ export function apply(ctx) {
           title: pending.card || 'WorkBuddy 等你确认',
           at: pending.at,
           createdAt: pending.at,
+          confirmPolicy: policy,
+          // ask：等人点「打开 WorkBuddy 自己确认」；auto：只是显式开关，不改变这条卡片的语义。
+          action: 'open-for-user',
         })
       }
       return json(response, 200, { approvals: list })
     }
     if (method === 'POST' && parts[0] === 'approvals' && parts.length === 2 && parts[1] === 'workbuddy') {
-      // WorkBuddy 的确认卡不是「命令批准」：accept = 激活应用让人去点确认；
-      // decline = 只清掉这条待确认，绝不擅自打开 WorkBuddy（R-04）。
+      // WorkBuddy 的确认卡不是「命令批准」，而且默认（confirmPolicy=ask）不代点：
+      //   accept  = 只把人送到 WorkBuddy 现场，卡片由人自己点（审计 mode:'user'）
+      //   decline = 不动卡片，只清掉这条待确认（审计 mode:'declined'）
+      // 两条路径都不点卡片、都不点弹窗。
       const body = (await readJsonBody(request)) ?? {}
       const decision = normalizeDecision(body.decision)
       if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny' })
+      const policy = wbPolicy()
+      const pending = wbPending()
+      const card = pending?.card ?? ''
       if (decision === 'deny') {
         wbClearPending()
-        log('approval workbuddy -> declined (app not opened)')
-        return json(response, 200, { ok: true, decision: 'deny', agent: 'workbuddy' })
+        wbAuditDecision('declined', { card, policy, source: 'approval' })
+        log(`approval workbuddy -> declined (card untouched, app not opened) policy=${policy}`)
+        return json(response, 200, { ok: true, decision: 'deny', agent: 'workbuddy', mode: 'declined', confirmPolicy: policy })
       }
       await new Promise((resolve) => {
+        // 测试/CI 环境不该真的弹起第三方 App：DSH_AGENT_BRIDGE_NO_OPEN=1 时只记日志。
+        if (process.env.DSH_AGENT_BRIDGE_NO_OPEN === '1') {
+          log('approval workbuddy open skipped (DSH_AGENT_BRIDGE_NO_OPEN=1)')
+          resolve()
+          return
+        }
         execFile('/usr/bin/open', ['-a', 'WorkBuddy'], () => resolve())
       })
       wbClearPending()
-      log('approval workbuddy -> activate')
-      return json(response, 200, { ok: true, decision: 'allow', action: 'activate', agent: 'workbuddy' })
+      wbAuditDecision('user', { card, policy, source: 'approval' })
+      log(`approval workbuddy -> open for user (no auto click) policy=${policy} card=${card.slice(0, 40)}`)
+      return json(response, 200, { ok: true, decision: 'allow', action: 'open-for-user', autoClicked: false, agent: 'workbuddy', mode: 'user', confirmPolicy: policy })
     }
     if (method === 'POST' && parts[0] === 'approvals' && parts.length === 2) {
       const body = (await readJsonBody(request)) ?? {}
