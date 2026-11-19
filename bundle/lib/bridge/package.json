@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-agent-bridge",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "type": "module",
   "description": "把 Codex（app-server）作为外部 run 接入 DSH：结构化事件原样落盘 + HTTP/SSE 事件出口 + 审批队列（DSH one-console P1）",

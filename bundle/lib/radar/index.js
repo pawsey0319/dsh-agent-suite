@@ -29,6 +29,17 @@ import { chmodSync, appendFileSync, copyFileSync, existsSync, mkdirSync, readdir
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
+/** 按「码点」截断，绝不在代理对中间砍断（emoji 安全）。
+ *  数组原样按元素切；其它值转字符串后按 Array.from 切。
+ *  审计项 E-02/F-03：`str.slice(0,N)` 可能产生孤立代理 → JSON/UTF-8 往返出现 U+FFFD。 */
+function uslice(value, count) {
+  if (Array.isArray(value)) return value.slice(0, count)
+  const text = value === null || value === undefined ? '' : String(value)
+  const chars = Array.from(text)
+  return chars.length > count ? chars.slice(0, count).join('') : text
+}
+
+
 export const name = 'dsh-task-radar'
 export const inject = ['webServer']
 
@@ -41,8 +52,13 @@ const ARTIFACT_KEEP_MS = 6 * 60 * 60 * 1000
 // 接管（不 next() 直接自己回执）是另一个产品决策，见 docs/research/radar-optimize-prep.md。
 const QUESTION_TAP_TTL_MS = 10 * 60 * 1000
 const questionTap = new Map()
-// 接管窗口（用户裁定 2026-11-18）：20s 内没人答就 next() 让渡回桌面提问卡。
-const QUESTION_HOLD_MS = Number(process.env.DSH_TASK_RADAR_ANSWER_MS ?? 20000)
+/**
+ * 接管的最长持有时间（t22 / S-01）：接管只在「没有活跃 Web 客户端」时发生，
+ * 所以这里**不再**是「20s 后自动让渡」——那样会在没人能答的时候把请求从面板上抽走。
+ * 现在的让渡条件是事件驱动的：HUD 死掉、或页面重新连上（桌面卡接管）。
+ * 这个常量只作为最后兜底，避免极端情况下模型侧无限等待。
+ */
+const QUESTION_HOLD_MS = Number(process.env.DSH_TASK_RADAR_ANSWER_MS ?? 600000)
 /** 正在被雷达接管的请求：requestId -> { token, sessionId, questions, settle, at, timer }。 */
 const questionHold = new Map()
 let questionWatcher
@@ -87,6 +103,43 @@ const INHERIT_FILES = [
   'radar-sessions.json',
 ]
 
+/**
+ * 兄弟宿主目录「是否已退役」（t22 / S-06）。
+ *
+ * 端口每次重启都变，所以换端口必须能继承 seen/hidden 这些用户态；但**并发运行的另一个宿主**
+ * 的 seen 绝不能拷进来（会把 A 宿主的「已读」带成 B 宿主的，用户看到条目凭空消失）。
+ * 判据：它自己的 hud.pid 已经死了，且目录 10 分钟没有写入 —— 退役端口，同族。
+ */
+function retiredSibling(item, nowMs) {
+  if (nowMs - item.mtime <= 10 * 60 * 1000) return false
+  const handle = readPidFile(join(item.base, 'hud.pid'))
+  if (Number.isFinite(handle?.pid) && processAlive(handle.pid) === true) return false
+  return true
+}
+
+/** seen.json 的版本号（t22 / S-06）：新不被旧覆盖，判据是 sidecar 里的 updatedAt。 */
+function seenMetaFile(dir) {
+  return join(dir, 'seen-meta.json')
+}
+
+function writeSeenMeta(dir, updatedAt) {
+  try {
+    writeJsonAtomic(seenMetaFile(dir), { schema: 1, port: basename(dir), updatedAt })
+  } catch {}
+}
+
+function seenUpdatedAt(dir) {
+  try {
+    const meta = JSON.parse(readFileSync(seenMetaFile(dir), 'utf8'))
+    if (Number.isFinite(meta?.updatedAt)) return Number(meta.updatedAt)
+  } catch {}
+  try {
+    return statSync(join(dir, 'seen.json')).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
 /** 新宿主目录首次出现时，从最近活跃的兄弟宿主目录继承上面这些用户态文件。 */
 function migrateSiblingState(dir) {
   let siblings = []
@@ -105,13 +158,26 @@ function migrateSiblingState(dir) {
   // 逐文件选源：最新兄弟目录可能只写过一个文件，所以每个文件各自找「最近写过它的那个目录」。
   const copied = []
   const sources = new Set()
+  const nowMs = Date.now()
   for (const name of INHERIT_FILES) {
     const target = join(dir, name)
     if (existsSync(target)) continue
-    const source = siblings.find((item) => existsSync(join(item.base, name)))
-    if (!source) continue
+    // t22 / S-06：只从**已退役**的同族目录继承；并发宿主的目录一律跳过并留痕。
+    const candidates = siblings.filter((item) => existsSync(join(item.base, name)))
+    const source = candidates.find((item) => retiredSibling(item, nowMs))
+    if (!source) {
+      if (candidates.length > 0) {
+        log(`state.inherit.skipped ${name} reason=live-sibling candidates=${candidates.map((item) => item.port).join('+')}`)
+      }
+      continue
+    }
+    if (name === 'seen.json' && seenUpdatedAt(source.base) <= seenUpdatedAt(dir)) {
+      log(`state.inherit.skipped ${name} reason=not-newer from=${source.port}`)
+      continue
+    }
     try {
       copyFileSync(join(source.base, name), target)
+      if (name === 'seen.json') writeSeenMeta(dir, Date.now())
       copied.push(name)
       sources.add(source.port)
     } catch (error) {
@@ -132,6 +198,42 @@ function fileMtime(base) {
     } catch {}
   }
   return score
+}
+
+/**
+ * 统一的 seen 落盘（t22 / S-06 + S-08）：原子写 + sidecar 版本号。
+ * 任何绕过它的 writeFileSync 都会让「新不被旧覆盖」失效，所以调用点一律走这里。
+ */
+function saveSeen(seen) {
+  mkdirSync(STATE_DIR, { recursive: true })
+  writeJsonAtomic(seenFile(), seen)
+  writeSeenMeta(STATE_DIR, Date.now())
+}
+
+/**
+ * 原子写 JSON（t22 / S-08）：先写同目录临时文件再 rename。
+ * 直接用 writeFileSync 覆盖时，进程在写到一半被杀会把账本截断成 `{}`（未读/隐藏全部重置）。
+ */
+function writeJsonAtomic(file, value) {
+  mkdirSync(dirname(file), { recursive: true })
+  const tmp = `${file}.tmp-${process.pid}`
+  writeFileSync(tmp, JSON.stringify(value))
+  try {
+    renameSync(tmp, file)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch {}
+    throw error
+  }
+}
+
+/** 内容没变就不写盘（t22 / S-08）：2s 轮询每轮重写 8–16KB 账本没有意义。 */
+const lastJsonWrite = new Map()
+function writeJsonIfChanged(file, value) {
+  const text = JSON.stringify(value)
+  if (lastJsonWrite.get(file) === text) return false
+  writeJsonAtomic(file, value)
+  lastJsonWrite.set(file, text)
+  return true
 }
 
 /** 端口就绪后把状态目录切到 hosts/<port>/；重复调用是幂等的。 */
@@ -207,7 +309,7 @@ function readVerdict(runId) {
   return {
     verdict: verdict?.verdict ?? null,
     reason: verdict?.reason ?? null,
-    missing: Array.isArray(verdict?.missing) ? verdict.missing.slice(0, 3) : [],
+    missing: Array.isArray(verdict?.missing) ? uslice(verdict.missing, 3) : [],
     round: rounds?.round ?? 0,
     hasContract: contract !== null && typeof contract === 'object',
   }
@@ -299,7 +401,7 @@ function clipError(text) {
   if (typeof text !== 'string') return null
   const flat = text.replace(/\s+/g, ' ').trim()
   if (flat === '') return null
-  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
+  return flat.length > 200 ? `${uslice(flat, 200)}…` : flat
 }
 
 // ---- 雷达自己的小账本（t14 续）------------------------------------------------
@@ -359,7 +461,7 @@ function watchJobs(ctx) {
       if (event.type === 'registered' || event.type === 'progress' || event.type === 'stopping') {
         if (event.type === 'registered') {
           liveJobs.set(owner, (liveJobs.get(owner) ?? 0) + 1)
-          log(`job registered owner=${owner.slice(0, 12)} id=${event.job?.id} kind=${event.job?.kind}`)
+          log(`job registered owner=${uslice(owner, 12)} id=${event.job?.id} kind=${event.job?.kind}`)
         }
         return
       }
@@ -368,7 +470,7 @@ function watchJobs(ctx) {
         if (next === 0) liveJobs.delete(owner)
         else liveJobs.set(owner, next)
         if (event.type === 'settled') {
-          log(`job settled owner=${owner.slice(0, 12)} id=${event.job?.id} status=${status}`)
+          log(`job settled owner=${uslice(owner, 12)} id=${event.job?.id} status=${status}`)
         }
       }
     })
@@ -392,7 +494,7 @@ function jobCountFallback(ctx, sessionIds) {
   if (now - jobsFallbackAt > 5000) {
     jobsFallbackAt = now
     jobsFallbackCache.clear()
-    for (const id of sessionIds.slice(0, 60)) {
+    for (const id of uslice(sessionIds, 60)) {
       try {
         const list = jobs.list(id) ?? []
         const live = list.filter(
@@ -541,6 +643,51 @@ function bridgeRuns() {
   return runs
 }
 
+/**
+ * 状态变更路由的同源判定（t22 / X-01、X-02）：照 dsh-project-journal 的 crossOriginReason 口径。
+ * 返回 null 表示同源；否则返回拒绝原因（写进 403 的 detail）。
+ * 只用「浏览器会自动加」的请求头，命令行 curl 不带这些头也放行（本机进程本来就是可信的）。
+ */
+function sameOriginReason(request) {
+  const header = (name) => {
+    try {
+      return request?.headers?.get?.(name) ?? null
+    } catch {
+      return null
+    }
+  }
+  const site = String(header('sec-fetch-site') ?? '').toLowerCase()
+  if (site === 'cross-site' || site === 'same-site') return `Sec-Fetch-Site: ${site}`
+  const hostHeader = String(header('host') ?? '').toLowerCase()
+  const hostName = hostHeader.split(':')[0]
+  const hostPort = hostHeader.split(':')[1] ?? ''
+  const sameHost = (name, port) => {
+    const near = name === hostName
+      || (hostName === 'localhost' && name === '127.0.0.1')
+      || (hostName === '127.0.0.1' && name === 'localhost')
+    return near && (port === '' || hostPort === '' || port === hostPort)
+  }
+  for (const name of ['origin', 'referer']) {
+    const value = header(name)
+    if (value === null || value === '') continue
+    let parsed
+    try {
+      parsed = new URL(value)
+    } catch {
+      return `${name} 不是合法 URL：${uslice(value, 80)}`
+    }
+    const port = parsed.port === '' ? (parsed.protocol === 'https:' ? '443' : '80') : parsed.port
+    if (!sameHost(parsed.hostname.toLowerCase(), port)) return `${name} 与宿主不同源：${parsed.origin}`
+  }
+  return null
+}
+
+/** 会改宿主状态的雷达路由：只允许 GET + 同源（t22 / X-01）。 */
+const MUTATING_TAILS = new Set([
+  'seen', 'clear-done', 'hide-session', 'hide-run', 'retry', 'question-answer',
+  'approval-decide', 'jump', 'jump-pending', 'jump-ack', 'purge-tests',
+])
+
 function json(response, status, body) {
   const text = JSON.stringify(body)
   if (typeof response.writeHead === 'function') {
@@ -587,11 +734,11 @@ async function diagOnce(ctx) {
     if (out.hasList) {
       const r = await underTimeout(Promise.resolve().then(() => controller.list()), 1500)
       out.listType = Array.isArray(r) ? 'array' : typeof r
-      out.listKeys = r && !Array.isArray(r) ? Object.keys(r).slice(0, 8) : undefined
+      out.listKeys = r && !Array.isArray(r) ? uslice(Object.keys(r), 8) : undefined
       const rows = Array.isArray(r) ? r : Array.isArray(r?.items) ? r.items : []
       out.rowCount = rows.length
-      out.firstRowKeys = rows[0] ? Object.keys(rows[0]).slice(0, 20) : undefined
-      out.firstRowJson = rows[0] ? JSON.stringify(rows[0]).slice(0, 700) : undefined
+      out.firstRowKeys = rows[0] ? uslice(Object.keys(rows[0]), 20) : undefined
+      out.firstRowJson = rows[0] ? uslice(JSON.stringify(rows[0]), 700) : undefined
     }
   } catch (err) {
     out.controllerError = String(err?.message ?? err)
@@ -601,9 +748,9 @@ async function diagOnce(ctx) {
     const list = typeof sessions?.list === 'function' ? sessions.list() : []
     out.sessionCount = list.length
     const first = list[0]
-    out.sessionKeys = first ? Object.keys(first).slice(0, 20) : undefined
-    out.headerKeys = first?.header ? Object.keys(first.header).slice(0, 20) : undefined
-    out.sessionJson = first ? JSON.stringify(first).slice(0, 600) : undefined
+    out.sessionKeys = first ? uslice(Object.keys(first), 20) : undefined
+    out.headerKeys = first?.header ? uslice(Object.keys(first.header), 20) : undefined
+    out.sessionJson = first ? uslice(JSON.stringify(first), 600) : undefined
   } catch (err) {
     out.sessionsError = String(err?.message ?? err)
   }
@@ -793,7 +940,7 @@ async function sessionItems(ctx) {
                   .filter((task) => task && typeof task.subject === 'string' && task.subject)
                   .slice(0, 12)
                   .map((task) => ({
-                    subject: String(task.subject).slice(0, 90),
+                    subject: uslice(String(task.subject), 90),
                     status: typeof task.status === 'string' ? zhTask(task.status) : '',
                   }))
               : undefined,
@@ -913,11 +1060,11 @@ function questionText(approval) {
       // 标题只放问题原文：选项由面板逐条渲染（2.20），塞进标题会挤掉题干。
       const first = (list[0]?.question ?? list[0]?.text ?? list[0]?.prompt ?? list[0] ?? '').toString().trim().replace(/\s+/g, ' ')
       // 标题就是问题原文（t5 验收④）：不再加「等你回答：」前缀，行内副标题已经说明是提问。
-      return texts.length > 1 ? `${first.slice(0, 52)}（等 ${texts.length} 问）` : first.slice(0, 60)
+      return texts.length > 1 ? `${uslice(first, 52)}（等 ${texts.length} 问）` : uslice(first, 60)
     }
   }
   const single = params?.prompt ?? params?.question ?? params?.input?.question
-  if (typeof single === 'string' && single.trim()) return single.trim().replace(/\s+/g, ' ').slice(0, 60)
+  if (typeof single === 'string' && single.trim()) return uslice(single.trim().replace(/\s+/g, ' '), 60)
   return undefined
 }
 
@@ -1009,7 +1156,7 @@ function describeApproval(approval) {
     const text = direct.trim().replace(/\s+/g, ' ')
     // 用户 2026-11-16 要求：行文案要自己说清楚是谁在等什么，不要只有一句「回复确认消息」。
     const agent = String(approval?.agent ?? '').toLowerCase()
-    if (agent === 'workbuddy') return `WorkBuddy 等你确认：${text.slice(0, 60)}`
+    if (agent === 'workbuddy') return `WorkBuddy 等你确认：${uslice(text, 60)}`
     return text
   }
   const method = String(approval?.method ?? 'approval')
@@ -1021,11 +1168,13 @@ function artifactItems() {
     const payload = JSON.parse(readFileSync(join(BRIDGE_DIR, 'artifacts.json'), 'utf8'))
     const items = Array.isArray(payload?.items) ? payload.items : []
     const fresh = items.filter((item) => Date.now() - Number(item.updatedAt ?? 0) <= ARTIFACT_KEEP_MS)
-    return fresh.slice(0, 3).map((item) => ({
+    return uslice(fresh, 3).map((item) => ({
       id: `artifact:${item.path}`,
       kind: 'artifact',
       agent: item.kind ?? 'file',
-      title: item.name ?? item.relative ?? '未命名产物',
+      title: item.title ?? item.name ?? item.relative ?? '未命名产物',
+      category: item.category ?? item.kind ?? 'file',
+      sizeBytes: Number.isFinite(item.sizeBytes) ? item.sizeBytes : (Number.isFinite(item.size) ? item.size : 0),
       status: 'done',
       path: item.path,
       updatedAt: Number(item.updatedAt ?? Date.now()),
@@ -1053,13 +1202,13 @@ function tapQuestion(request) {
     const sessionId = request?.agent?.session?.id ?? request?.agent?.id
     if (sessionId === undefined || sessionId === null) return
     const questions = Array.isArray(request.questions)
-      ? request.questions.slice(0, 9).map((question, index) => ({
+      ? uslice(request.questions, 9).map((question, index) => ({
           // 没有 id 的题用 q0/q1 兜底：HUD 的自由文本入口用同一套，否则回执 id 对不上。
           id: String(question?.id ?? `q${index}`),
           question: typeof question?.question === 'string' ? question.question : '',
           header: typeof question?.header === 'string' ? question.header : null,
           options: Array.isArray(question?.options)
-            ? question.options.slice(0, 9).map((option) => ({
+            ? uslice(question.options, 9).map((option) => ({
                 label: typeof option?.label === 'string' ? option.label : String(option ?? ''),
                 description: typeof option?.description === 'string' ? option.description : null,
               }))
@@ -1069,11 +1218,11 @@ function tapQuestion(request) {
       : []
     const record = { questions, at: Date.now() }
     questionTap.set(String(sessionId), record)
-    log(`question tap session=${String(sessionId).slice(0, 12)} n=${questions.length} head=${questionHeadline(questions[0]).slice(0, 24)}`)
+    log(`question tap session=${uslice(String(sessionId), 12)} n=${questions.length} head=${uslice(questionHeadline(questions[0]), 24)}`)
     return record
   } catch (error) {
     // 旁听失败绝不能让提问本身失败：调用方无条件 next()。
-    log(`question tap error ${String(error && error.message ? error.message : error).slice(0, 200)}`)
+    log(`question tap error ${uslice(String(error && error.message ? error.message : error), 200)}`)
     return undefined
   }
 }
@@ -1093,7 +1242,7 @@ function pendingQuestionSessions(ctx) {
     }
     return out
   } catch (error) {
-    log(`questions pending error ${String(error && error.message ? error.message : error).slice(0, 200)}`)
+    log(`questions pending error ${uslice(String(error && error.message ? error.message : error), 200)}`)
     return null
   }
 }
@@ -1116,7 +1265,7 @@ function hasLiveWebClient(ctx) {
       return gateway.hasLiveClient() !== false
     }
   } catch (error) {
-    log(`question client probe error ${String(error && error.message ? error.message : error).slice(0, 160)}`)
+    log(`question client probe error ${uslice(String(error && error.message ? error.message : error), 160)}`)
   }
   return true
 }
@@ -1134,22 +1283,39 @@ function stopQuestionWatcher() {
   questionWatcher = undefined
 }
 
-/** HUD 死了就没人在面板上作答：立刻把还在手上的请求全部让渡，别让模型侧干等（R-05）。 */
-function ensureQuestionWatcher() {
+let questionWatcherCtx = null
+
+/**
+ * 持有期间的让渡巡检（1s）：
+ *   - HUD 死了 → 没人在面板上作答，立刻让渡（R-05，避免模型侧干等）；
+ *   - 页面重新连上（出现活跃 Web 客户端）→ 桌面提问卡才是权威入口，让渡给它（t22 / S-02）。
+ * 除这两种事件外**不主动让渡**：接管的前提就是「当时没有客户端」。
+ */
+function ensureQuestionWatcher(ctx) {
+  if (ctx !== undefined) questionWatcherCtx = ctx
   if (questionWatcher !== undefined) return
   questionWatcher = setInterval(() => {
     if (questionHold.size === 0) { stopQuestionWatcher(); return }
-    if (hudAlive(hudPid())) return
-    for (const [requestId, held] of [...questionHold]) {
-      log(`question yield hud-dead request=${requestId}`)
-      held.settle('yield', undefined)
+    const live = questionWatcherCtx === null ? true : hudAlive(hudPid())
+    if (!live) {
+      for (const [requestId, held] of [...questionHold]) {
+        log(`question yield reason=hud-dead request=${requestId}`)
+        held.settle('yield', undefined)
+      }
+      return
+    }
+    if (questionWatcherCtx !== null && hasLiveWebClient(questionWatcherCtx)) {
+      for (const [requestId, held] of [...questionHold]) {
+        log(`question yield reason=client-live request=${requestId}`)
+        held.settle('yield', undefined)
+      }
     }
   }, 1000)
 }
 
 /**
- * 接管一条会话内提问：登记成可被 `/x-radar/question-answer` 作答的条目，
- * 并在 QUESTION_HOLD_MS 后无条件 next() 让渡（返回下游的答案）。
+ * 接管一条会话内提问：登记成可被 `/x-radar/question-answer` 作答的条目。
+ * 让渡是事件驱动的（HUD 死 / 客户端回来），只在 QUESTION_HOLD_MS 兜底超时（t22 / S-01、S-02）。
  */
 function holdQuestion(ctx, request, next, tap) {
   const requestId = randomToken(12)
@@ -1168,24 +1334,25 @@ function holdQuestion(ctx, request, next, tap) {
         // shape=array 是 t13 定稿的回执形状 {answers:[{id,selected,custom?}]}；日志留证便于门禁 grep。
         const customCount = answers.filter((entry) => typeof entry?.custom === 'string').length
         const ids = answers.map((entry) => String(entry?.id ?? '')).join(',')
-        log(`question answered request=${requestId} session=${sessionId.slice(0, 12)} ` +
+        log(`question answered request=${requestId} session=${uslice(sessionId, 12)} ` +
           `n=${answers.length} shape=array ids=${ids} custom=${customCount}`)
         resolve({ answers })
         return
       }
-      log(`question yield ${why} request=${requestId} session=${sessionId.slice(0, 12)}`)
+      log(`question yield ${why} request=${requestId} session=${uslice(sessionId, 12)}`)
       // 让渡 = 交回下游（桌面提问卡 / 别的 answerer）。下游失败要照原样抛出去。
       resolve(next())
     }
-    const timer = setTimeout(() => settle('yield', undefined), QUESTION_HOLD_MS)
+    // 兜底上限（默认 10 分钟）：只在 HUD 活着、客户端也没回来、但就是没人作答时生效。
+    const timer = setTimeout(() => settle('yield-timeout', undefined), QUESTION_HOLD_MS)
     questionHold.set(requestId, { token, sessionId, questions, settle, at: Date.now() })
     if (tap !== undefined) {
       tap.requestId = requestId
       tap.token = token
       tap.takenOverAt = Date.now()
     }
-    ensureQuestionWatcher()
-    log(`question hold request=${requestId} session=${sessionId.slice(0, 12)} n=${questions.length} ms=${QUESTION_HOLD_MS}`)
+    ensureQuestionWatcher(ctx)
+    log(`question hold request=${requestId} session=${uslice(sessionId, 12)} n=${questions.length} maxMs=${QUESTION_HOLD_MS}`)
   })
 }
 
@@ -1206,7 +1373,7 @@ function normalizeDshAnswers(raw, questions) {
     const selected = (Array.isArray(entry.selected) ? entry.selected : [])
       .map((value) => String(value))
       .filter((value) => (question.options ?? []).some((option) => option.label === value))
-    const custom = typeof entry.custom === 'string' && entry.custom.trim() !== '' ? entry.custom.trim().slice(0, 200) : undefined
+    const custom = typeof entry.custom === 'string' && entry.custom.trim() !== '' ? uslice(entry.custom.trim(), 200) : undefined
     if (selected.length === 0 && custom === undefined) return null
     if (question.multiSelect !== true && selected.length > 1) return null
     out.push({ id, selected, ...(custom === undefined ? {} : { custom }) })
@@ -1240,14 +1407,14 @@ function dshQuestionItems(ctx, sessions) {
   // 已经没有等待方的接管条目立即作废（会话里答完了/超时让渡了）：不能留着可点入口。
   for (const [id, held] of [...questionHold.entries()]) {
     if (pending.has(held.sessionId)) continue
-    log(`stale question dropped id=${id} session=${String(held.sessionId).slice(0, 12)} reason=no-waiter`)
+    log(`stale question dropped id=${id} session=${uslice(String(held.sessionId), 12)} reason=no-waiter`)
     held.settle('yield', undefined)
   }
   for (const [id, tap] of [...questionTap.entries()]) {
     if (pending.has(id)) continue
     if (nowMs - Number(tap?.at ?? 0) < 5_000) continue
     questionTap.delete(id)
-    log(`stale question dropped id=question:${String(id).slice(0, 12)} reason=no-waiter`)
+    log(`stale question dropped id=question:${uslice(String(id), 12)} reason=no-waiter`)
   }
   const items = []
   for (const id of pending) {
@@ -1304,8 +1471,8 @@ async function buildRadar(ctx) {
     // 没有活 waiter、run 已终态、或子进程已死 → 一律判失效，不进 feed，也不给可点入口。
     const staleReason = staleApprovalReason(approval, runsById)
     if (staleReason !== null) {
-      log(`stale approval dropped id=${String(approval.id).slice(0, 12)} ` +
-        `run=${String(approval.runId ?? '-').slice(0, 12)} agent=${approval.agent ?? '-'} reason=${staleReason}`)
+      log(`stale approval dropped id=${uslice(String(approval.id), 12)} ` +
+        `run=${uslice(String(approval.runId ?? '-'), 12)} agent=${approval.agent ?? '-'} reason=${staleReason}`)
       continue
     }
     const kind = approvalKind(approval)
@@ -1352,7 +1519,7 @@ async function buildRadar(ctx) {
     // 只有两类 run 进面板：①正在跑/等批准的；②有任务契约、真的过闸判别的。
     // 无契约的历史 run（含接入判别层之前的测试 run）一律不进胶囊，避免面板被噪声灌满。
     if (superseded[run.id] === true) {
-      log(`run superseded by retry id=${run.id.slice(0, 8)}`)
+      log(`run superseded by retry id=${uslice(run.id, 8)}`)
       continue
     }
     const active = ACTIVE_RUN.has(run.status)
@@ -1367,7 +1534,7 @@ async function buildRadar(ctx) {
       reason = 'no_live_waiter'
       if (!orphanNoted.has(run.id)) {
         orphanNoted.add(run.id)
-        log(`radar run orphaned id=${run.id.slice(0, 8)} from=needs-approval to=failed reason=no_live_waiter`)
+        log(`radar run orphaned id=${uslice(run.id, 8)} from=needs-approval to=failed reason=no_live_waiter`)
       }
     }
     // 失败行必须能说「为什么失败」（t14 bug 3）：meta.error → 最后一条错误事件 → reason 码兜底。
@@ -1380,18 +1547,18 @@ async function buildRadar(ctx) {
       const tail = lastRunEventKind(run.id)
       status = tail === 'turn.end' ? 'done' : 'failed'
       if (tail === 'turn.end') {
-        log(`process-exited run=${run.id.slice(0, 8)} agent=${run.agent} pid=${run.pid} last=turn.end -> done`)
+        log(`process-exited run=${uslice(run.id, 8)} agent=${run.agent} pid=${run.pid} last=turn.end -> done`)
       } else {
         reason = 'process-exited'
         error = '进程已退出（process-exited）'
-        log(`process-exited run=${run.id.slice(0, 8)} agent=${run.agent} pid=${run.pid} last=${tail ?? 'none'} -> failed`)
+        log(`process-exited run=${uslice(run.id, 8)} agent=${run.agent} pid=${run.pid} last=${tail ?? 'none'} -> failed`)
       }
     } else if (stale !== null) {
       const tail = lastRunEventKind(run.id)
       status = tail === 'turn.end' ? 'done' : 'failed'
       reason = tail === 'turn.end' ? reason : 'stale-running'
       if (tail !== 'turn.end') error = '超过 10 分钟没有任何新事件（可能卡住了，stale-running）'
-      log(`stale-running run=${run.id.slice(0, 8)} agent=${run.agent} ageMin=${Math.round(stale.ageMs / 60000)} last=${tail ?? 'none'} -> ${status}`)
+      log(`stale-running run=${uslice(run.id, 8)} agent=${run.agent} ageMin=${Math.round(stale.ageMs / 60000)} last=${tail ?? 'none'} -> ${status}`)
     }
     if ((status === 'done' || status === 'failed') && run.seen) status = 'idle'
     if (status === 'idle' || status === 'unknown') {
@@ -1409,17 +1576,17 @@ async function buildRadar(ctx) {
     const revisionAge = Date.now() - Number(run.updatedAt ?? 0)
     if (status === 'rework') {
       if (revisionAge > REVISION_TTL_MS) {
-        log(`rework stale run=${run.id.slice(0, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
+        log(`rework stale run=${uslice(run.id, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
         continue
       } else {
         // 降级成「已完成」，但诚实说明：验收没过，也没有自动返工。
         status = 'done'
         note = '验收未通过，未自动返工'
-        log(`rework unbound run=${run.id.slice(0, 8)} -> done (no live continuation)`)
+        log(`rework unbound run=${uslice(run.id, 8)} -> done (no live continuation)`)
       }
     } else if (status === 'verifying' || status === 'unverified') {
       if (revisionAge > REVISION_TTL_MS) {
-        log(`${status} stale run=${run.id.slice(0, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
+        log(`${status} stale run=${uslice(run.id, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
         continue
       }
       note = status === 'verifying' ? '等裁决（判别层没有回话）' : '没签验收契约，按完成处理'
@@ -1432,9 +1599,9 @@ async function buildRadar(ctx) {
         status = 'failed'
         reason = 'blocked-no-action'
         error = '判别层判「受阻」，但没有可处置的审批或提问（blocked-no-action）'
-        log(`blocked-no-action run=${run.id.slice(0, 8)} -> failed`)
+        log(`blocked-no-action run=${uslice(run.id, 8)} -> failed`)
       } else {
-        log(`blocked actionable run=${run.id.slice(0, 8)} approvals=1`)
+        log(`blocked actionable run=${uslice(run.id, 8)} approvals=1`)
       }
     }
     if (run.seen === true && (status === 'done' || status === 'failed' || status === 'unverified')) continue
@@ -1466,7 +1633,7 @@ async function buildRadar(ctx) {
       if (seenSet.has(id)) {
         const seen = readSeen()
         delete seen[id]
-        try { writeFileSync(seenFile(), JSON.stringify(seen, null, 2)) } catch {}
+        try { saveSeen(seen) } catch {}
         seenSet.delete(id)
       }
       track.running[id] = nowMs
@@ -1539,35 +1706,27 @@ async function buildRadar(ctx) {
     })
   }
   try {
-    writeFileSync(TRACK_FILE, JSON.stringify(track))
-  } catch {}
+    // t22 / S-08：原子写 + 内容未变不写（2s 轮询 × 多客户端会把同一份账本反复覆盖）。
+    writeJsonIfChanged(TRACK_FILE, track)
+  } catch (error) {
+    log(`track write failed ${String(error && error.message ? error.message : error)}`)
+  }
 
   // 用户口径（2026-11-13）：胶囊数字 = 正在进行的顶层会话数；
   // 子智能体/子会话不计入，审批与完成未看只作为次要提示。
   // 完成未看的唯一键：run 用 id#run，session 用 id#<finishedAt 毫秒>（updatedAt 会随后续
   // 事件前移，同一轮会被误判成新事件）。HUD 的通知计数与点击清单一律用这批 id 派生，
   // 保证「标题 N = ids.size = counts.doneUnread」（t17 的 finding：三者曾各算各的）。
-  const doneKeys = new Set()
-  const doneUnreadIds = []
-  for (const item of items) {
-    if (item.status !== 'done' || typeof item.id !== 'string') continue
-    const round = item.finishedAt === undefined || item.finishedAt === null
-      ? Math.trunc(Number(item.updatedAt ?? 0))
-      : Math.trunc(Number(item.finishedAt) * 1000)
-    const key = item.kind === 'session' ? `${item.id}#${round}` : `${item.id}#run`
-    if (doneKeys.has(key)) continue
-    doneKeys.add(key)
-    doneUnreadIds.push(item.id)
-    if (doneUnreadIds.length >= 200) break
-  }
-
+  // t22 / B-4：doneUnreadIds 必须与 feed 里真实存在的 done 行**集合相等**（原来从全量 items 里取，
+  // 折叠与 slice(MAX_ITEMS) 之后会出现「ids 里有 40 个、列表里只有 2 个」的口径分裂）。
+  // 所以这里先算 counts 的其它项，doneUnread 留到 fold + slice 之后再从最终列表里取。
   const counts = {
     running: items.filter((item) => item.kind === 'session' && item.status === 'running').length,
     // 审批与提问都算「等你处理」：胶囊红呼吸 + 告警横幅都看这个数。
     approvals: items.filter((item) => item.kind === 'approval' || item.kind === 'question').length,
     questions: items.filter((item) => item.kind === 'question').length,
     failed: items.filter((item) => item.kind === 'run' && item.status === 'failed').length,
-    doneUnread: doneUnreadIds.length,
+    doneUnread: 0,
   }
   // 会话内提问（DSH 自己的 ask_user_question）单独计数：排障时能区分「桥在等」与「会话在等」。
   counts.questionsDsh = items.filter((item) => item.kind === 'question' && item.source === SOURCE_DSH).length
@@ -1579,7 +1738,7 @@ async function buildRadar(ctx) {
     const confirmFile = join(BRIDGE_DIR, 'workbuddy-confirms.json')
     if (existsSync(confirmFile)) {
       const lines = readFileSync(confirmFile, 'utf8').split('\n').filter(Boolean)
-      const today = new Date().toISOString().slice(0, 10)
+      const today = new uslice(Date().toISOString(), 10)
       counts.autoConfirmed = lines.filter((line) => line.includes(today)).length
     }
   } catch {}
@@ -1625,14 +1784,25 @@ async function buildRadar(ctx) {
   items.length = 0
   items.push(...folded)
 
+  // t22 / B-4：未读完成 id 只从**最终渲染的列表**里取，保证 len(doneUnreadIds) == done 行数。
+  const visible = items.slice(0, MAX_ITEMS)
+  const doneUnreadIds = []
+  const seenDone = new Set()
+  for (const item of visible) {
+    if (item.status !== 'done' || typeof item.id !== 'string') continue
+    if (seenDone.has(item.id)) continue
+    seenDone.add(item.id)
+    doneUnreadIds.push(item.id)
+  }
+  counts.doneUnread = doneUnreadIds.length
+
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
     counts,
-    // 未读完成的完整 id 清单（不受 items.slice(12) 截断影响），HUD 用它做标题数、
-    // 点击清单一与去重键，避免「25 个任务完成」但只清掉可见的 12 条。
+    // 与 items 里的 done 行一一对应（t22 / B-4 口径一致）；折叠行只保留代表 id（行上有 count）。
     doneUnreadIds,
-    items: items.slice(0, MAX_ITEMS),
+    items: visible,
     total: items.length,
     sources: { sessions: sessions.source, runs: runs.length, questions: dshQuestions.source },
     clientHalf: clientHalfState(),
@@ -1683,6 +1853,25 @@ function radarRoute(ctx) {
   const inner = async (request) => {
     const url = new URL(request.url, 'http://localhost')
     const tail = url.pathname.replace(/^\/x-radar(-[a-z])?\/?/, '')
+    // t22 / X-01、X-02：状态变更一律 GET（其它方法 405），并且必须同源（403 cross_origin_rejected）。
+    if (MUTATING_TAILS.has(tail)) {
+      const method = String(request?.method ?? 'GET').toUpperCase()
+      if (method !== 'GET') {
+        log(`write guard method=${method} tail=${tail} -> 405`)
+        return new Response(JSON.stringify({ ok: false, error: 'method_not_allowed' }), {
+          status: 405,
+          headers: { 'content-type': 'application/json; charset=utf-8', allow: 'GET' },
+        })
+      }
+      const reason = sameOriginReason(request)
+      if (reason !== null) {
+        log(`write guard tail=${tail} reason=${reason} -> 403`)
+        return new Response(JSON.stringify({ ok: false, error: 'cross_origin_rejected', code: 'cross_origin_rejected', detail: reason }), {
+          status: 403,
+          headers: { 'content-type': 'application/json; charset=utf-8' },
+        })
+      }
+    }
     if (tail === 'beacon') return beaconResponse(url)
     if (tail === 'radar') {
       let body
@@ -1692,7 +1881,7 @@ function radarRoute(ctx) {
         body = snapshot.body
         cached = snapshot.cached
       } catch (error) {
-        log(`radar error ${String(error && error.stack ? error.stack : error).slice(0, 600)}`)
+        log(`radar error ${uslice(String(error && error.stack ? error.stack : error), 600)}`)
         return new Response(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }), {
           status: 500,
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -1727,7 +1916,7 @@ function radarRoute(ctx) {
         writeFileSync(writtenPath, JSON.stringify({ sessionId, at: stamp, id: record.id }))
       } catch {}
       const half = clientHalfState()
-      log(`jump requested id=${record.id} session=${sessionId.slice(0, 8)} client=${half.active ? 'active' : 'inactive'}`)
+      log(`jump requested id=${record.id} session=${uslice(sessionId, 8)} client=${half.active ? 'active' : 'inactive'}`)
       setTimeout(() => {
         if (record.state !== 'pending') return
         // 只认「ack 路由把 record.state 改成 acked」这一条成功路径（N-16）：
@@ -1744,7 +1933,7 @@ function radarRoute(ctx) {
         log(`jump timeout id=${record.id} path=${path} queued=${queued ? 'yes' : 'no'} -> degraded`)
         if (process.env.DSH_TASK_RADAR_JUMP_OPEN === '0') {
           // 测试/回归用：不真的把 App 端到前台，只记降级结论。
-          log(`jump.degraded id=${record.id} session=${sessionId.slice(0, 8)} client=inactive open=skipped reason=${record.degradeReason}`)
+          log(`jump.degraded id=${record.id} session=${uslice(sessionId, 8)} client=inactive open=skipped reason=${record.degradeReason}`)
           try {
             unlinkSync(path)
           } catch {}
@@ -1752,11 +1941,11 @@ function radarRoute(ctx) {
         }
         try {
           execFile('/usr/bin/open', ['-a', 'DeepSeek Harness'], { timeout: 4000 }, (error) => {
-            if (error) log(`jump.degraded id=${record.id} session=${sessionId.slice(0, 8)} open=error ${error.message} reason=${record.degradeReason}`)
-            else log(`jump.degraded id=${record.id} session=${sessionId.slice(0, 8)} client=inactive open=ok reason=${record.degradeReason}`)
+            if (error) log(`jump.degraded id=${record.id} session=${uslice(sessionId, 8)} open=error ${error.message} reason=${record.degradeReason}`)
+            else log(`jump.degraded id=${record.id} session=${uslice(sessionId, 8)} client=inactive open=ok reason=${record.degradeReason}`)
           })
         } catch (error) {
-          log(`jump.degraded id=${record.id} session=${sessionId.slice(0, 8)} open=throw ${error?.message ?? error}`)
+          log(`jump.degraded id=${record.id} session=${uslice(sessionId, 8)} open=throw ${error?.message ?? error}`)
         }
         try {
           unlinkSync(path)
@@ -1779,11 +1968,11 @@ function radarRoute(ctx) {
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
       if (held === undefined) {
-        log(`question answer rejected request=${requestId.slice(0, 12)} reason=not-pending`)
+        log(`question answer rejected request=${uslice(requestId, 12)} reason=not-pending`)
         return fail(410, 'request not pending')
       }
       if (token === '' || token !== held.token) {
-        log(`question answer rejected request=${requestId.slice(0, 12)} reason=bad-token`)
+        log(`question answer rejected request=${uslice(requestId, 12)} reason=bad-token`)
         return fail(403, 'bad token')
       }
       let parsed
@@ -1794,7 +1983,7 @@ function radarRoute(ctx) {
       }
       const answers = normalizeDshAnswers(parsed, held.questions)
       if (answers === null) {
-        log(`question answer rejected request=${requestId.slice(0, 12)} reason=bad-shape`)
+        log(`question answer rejected request=${uslice(requestId, 12)} reason=bad-shape`)
         return fail(400, 'answers must be [{id, selected:[label], custom?}]')
       }
       held.settle('answered', answers)
@@ -1815,7 +2004,7 @@ function radarRoute(ctx) {
           questions: (tap.questions ?? []).map((question) => ({
             id: question.id,
             header: question.header,
-            question: String(question.question ?? '').slice(0, 120),
+            question: uslice(String(question.question ?? ''), 120),
             options: (question.options ?? []).map((option) => option.label),
           })),
         })
@@ -1905,14 +2094,14 @@ function radarRoute(ctx) {
       if (acked) {
         acked.state = 'acked'
         acked.ackedAt = Date.now()
-        log(`jump acked id=${acked.id} session=${String(acked.sessionId).slice(0, 8)} lag=${acked.ackedAt - acked.at}ms`)
+        log(`jump acked id=${acked.id} session=${uslice(String(acked.sessionId), 8)} lag=${acked.ackedAt - acked.at}ms`)
       }
       for (const path of jumpCandidatePaths()) {
         try {
           unlinkSync(path)
         } catch {}
       }
-      return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } })
+      return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } })
     }
     if (tail === 'debug-sessions') {
       // 排障用：把 sessionController / sessions 看到的原始条目吐出来。
@@ -1995,7 +2184,7 @@ function radarRoute(ctx) {
       const answersNote = answers ? JSON.stringify(answers) : '-'
       const rawNote = answers && rawAnswerMap !== answers ? ` raw=${JSON.stringify(rawAnswerMap)}` : ''
       const dismissedNote = result.dismissed === true ? ' dismissed=yes(reason=no_live_waiter)' : ''
-      log(`approval decide id=${approvalId.slice(0, 8)} decision=${decision} answers=${answersNote}${rawNote} ok=${result.ok === true} status=${result.status ?? '-'}${dismissedNote}`)
+      log(`approval decide id=${uslice(approvalId, 8)} decision=${decision} answers=${answersNote}${rawNote} ok=${result.ok === true} status=${result.status ?? '-'}${dismissedNote}`)
       // 桥回 404（审批不存在/已过期）和 403（token 不匹配）都要原样透出，
       // 不能一律 502 —— HUD 靠状态码区分「过时」和「桥挂了」。
       const passthrough = [400, 403, 404, 409]
@@ -2024,8 +2213,7 @@ function radarRoute(ctx) {
       for (const id of ids) seen[id] = now
       let persisted = true
       try {
-        mkdirSync(STATE_DIR, { recursive: true })
-        writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+        saveSeen(seen)
       } catch (error) {
         persisted = false
         log(`markSeen failed ids=${ids.length} error=${error?.message ?? error}`)
@@ -2047,11 +2235,13 @@ function radarRoute(ctx) {
               trackRemoved += 1
             }
           }
-          writeFileSync(file, JSON.stringify(saved))
-        } catch {}
+          writeJsonAtomic(file, saved)
+        } catch (error) {
+          log(`track clear failed ${String(error && error.message ? error.message : error)}`)
+        }
       }
       if (persisted) log(`markSeen ok ids=${ids.length} track=${trackRemoved}`)
-      if (missing.length > 0) log(`markSeen failed ids=${missing.length} missing=${missing.slice(0, 3).join(',')}`)
+      if (missing.length > 0) log(`markSeen failed ids=${missing.length} missing=${uslice(missing, 3).join(',')}`)
       invalidateSnapshot()
       return new Response(JSON.stringify({
         ok: persisted && missing.length === 0,
@@ -2104,7 +2294,7 @@ function radarRoute(ctx) {
         })
         const body = await created.json().catch(() => null)
         if (!created.ok || body === null || typeof body.runId !== 'string') {
-          log(`retry failed run=${runId.slice(0, 8)} status=${created.status} body=${JSON.stringify(body).slice(0, 160)}`)
+          log(`retry failed run=${uslice(runId, 8)} status=${created.status} body=${uslice(JSON.stringify(body), 160)}`)
           return new Response(JSON.stringify({ ok: false, error: 'bridge rejected retry', status: created.status, body }), {
             status: 502,
             headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -2114,17 +2304,16 @@ function radarRoute(ctx) {
         const seen = readSeen()
         seen[runId] = Date.now()
         try {
-          mkdirSync(STATE_DIR, { recursive: true })
-          writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+          saveSeen(seen)
         } catch {}
         invalidateSnapshot()
-        log(`retry run=${runId.slice(0, 8)} -> new=${body.runId.slice(0, 8)} agent=${body.agent ?? '?'}`)
+        log(`retry run=${uslice(runId, 8)} -> new=${uslice(body.runId, 8)} agent=${body.agent ?? '?'}`)
         return new Response(JSON.stringify({ ok: true, runId: body.runId, retryOf: runId, agent: body.agent ?? null }), {
           status: 200,
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         })
       } catch (error) {
-        log(`retry error run=${runId.slice(0, 8)} ${String(error && error.message ? error.message : error)}`)
+        log(`retry error run=${uslice(runId, 8)} ${String(error && error.message ? error.message : error)}`)
         return new Response(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }), {
           status: 502,
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -2145,11 +2334,10 @@ function radarRoute(ctx) {
       const seen = readSeen()
       seen[sessionId] = Date.now()
       try {
-        mkdirSync(STATE_DIR, { recursive: true })
-        writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+        saveSeen(seen)
       } catch {}
       invalidateSnapshot()
-      log(`session hidden id=${sessionId.slice(0, 8)}`)
+      log(`session hidden id=${uslice(sessionId, 8)}`)
       return new Response(JSON.stringify({ ok: true, hidden: sessionId }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -2198,8 +2386,7 @@ function radarRoute(ctx) {
         const now = Date.now()
         for (const id of ids) seen[id] = now
         try {
-          mkdirSync(STATE_DIR, { recursive: true })
-          writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+          saveSeen(seen)
         } catch {}
         try {
           const track = readJson(trackFile(), null)
@@ -2232,7 +2419,7 @@ function radarRoute(ctx) {
     try {
       return await inner(request)
     } catch (error) {
-      log(`radar route error ${String(error && error.message ? error.message : error).slice(0, 400)}`)
+      log(`radar route error ${uslice(String(error && error.message ? error.message : error), 400)}`)
       return new Response(JSON.stringify({ ok: false, error: 'internal' }), {
         status: 500,
         headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -2259,7 +2446,7 @@ const CLIENT_BUILD = (() => {
   try {
     const path = fileURLToPath(new URL('./client-build.json', import.meta.url))
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
-    return typeof parsed?.build === 'string' ? parsed.build.slice(0, 16) : 'unknown'
+    return typeof parsed?.build === 'string' ? uslice(parsed.build, 16) : 'unknown'
   } catch {
     return 'unknown'
   }
@@ -2321,7 +2508,7 @@ function jumpById(id) {
 function beaconResponse(url) {
   const event = url.searchParams.get('e') ?? 'unknown'
   const detail = url.searchParams.get('d') ?? ''
-  const build = (url.searchParams.get('b') ?? '').slice(0, 32)
+  const build = uslice((url.searchParams.get('b') ?? ''), 32)
   if (event.startsWith('client.') || event === 'apply') {
     clientBeacons += 1
     lastClientBeaconAt = Date.now()
@@ -2333,7 +2520,8 @@ function beaconResponse(url) {
   log(`client.${event}${detail ? ` ${detail}` : ''}`)
   // 页面收到 stale 就在自己这一侧重载（旧 bundle 的 client 半没有这段逻辑，所以第一次升级仍需手动刷新一次；
   // 之后每次升级都能自愈）。
-  const headers = { 'content-type': 'text/plain', 'cache-control': 'no-store' }
+  // t22 / F-07：显式 charset（缺省时部分客户端按 latin-1 解，中文提示会变乱码）。
+  const headers = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
   if (build && CLIENT_BUILD !== '' && build !== CLIENT_BUILD) headers['x-radar-reload'] = '1'
   return new Response('ok', { status: 200, headers })
 }
@@ -2365,13 +2553,18 @@ function isRadarProcess(pid) {
   }
 }
 
-function hudPid() {
+/** 解析任意 hud.pid 文件（hudPid 与「兄弟目录是否退役」共用同一套格式判断）。 */
+function readPidFile(file) {
   let raw
   try {
-    raw = String(readFileSync(hudPidFile(), 'utf8')).trim()
+    raw = String(readFileSync(file, 'utf8')).trim()
   } catch {
     return undefined
   }
+  return parsePidText(raw)
+}
+
+function parsePidText(raw) {
   if (raw.startsWith('{')) {
     try {
       const saved = JSON.parse(raw)
@@ -2385,6 +2578,10 @@ function hudPid() {
   }
   const pid = Number(raw)
   return Number.isFinite(pid) && pid > 1 ? { pid, owner: STATE_PORT } : undefined
+}
+
+function hudPid() {
+  return readPidFile(hudPidFile())
 }
 
 /** 归属校验：进程得真是 RadarHUD，且 pid 文件记的 ownerPort 必须是本宿主端口。 */
@@ -2604,6 +2801,8 @@ export function apply(ctx) {
         const verdict = takeoverVerdict(ctx)
         if (verdict !== 'ok') {
           // 不接管：HUD 不在 / 有活客户端（桌面卡会正常弹出）。旁听记录留着给 feed 用。
+          // t22 / S-01：有活跃 Web 客户端时**一律**不接管，桌面卡才是权威回执入口。
+          log(`question delegate reason=${verdict}`)
           return next()
         }
         return holdQuestion(ctx, request, next, tap)

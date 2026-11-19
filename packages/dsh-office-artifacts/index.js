@@ -10,6 +10,17 @@ import { readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { extname, isAbsolute, join, resolve } from 'node:path'
 
+/** 按「码点」截断，绝不在代理对中间砍断（emoji 安全）。
+ *  数组原样按元素切；其它值转字符串后按 Array.from 切。
+ *  审计项 E-02/F-03：`str.slice(0,N)` 可能产生孤立代理 → JSON/UTF-8 往返出现 U+FFFD。 */
+function uslice(value, count) {
+  if (Array.isArray(value)) return value.slice(0, count)
+  const text = value === null || value === undefined ? '' : String(value)
+  const chars = Array.from(text)
+  return chars.length > count ? chars.slice(0, count).join('') : text
+}
+
+
 const NAME = 'dsh-office-artifacts'
 export const name = NAME
 export const inject = ['webServer', 'sessionQuery', 'sessionController']
@@ -197,6 +208,10 @@ export function apply(ctx) {
                   ...file,
                   relative: file.path.slice(cwd.length + 1),
                   updatedAt: Math.round(file.mtime),
+                  // t22 / B-5：feed 与面板要能直接读这三项，不再让消费端各自兜底（null 会让行显示成「未命名产物」）。
+                  title: file.name,
+                  category: file.kind ?? (file.ext ?? '').replace('.', ''),
+                  sizeBytes: Number.isFinite(file.size) ? file.size : 0,
                 }))
               const payload = {
                 ok: true,
@@ -226,7 +241,7 @@ export function apply(ctx) {
             if (tail === 'review') {
               const target = url.searchParams.get('path') ?? ''
               const action = url.searchParams.get('action') ?? ''
-              const feedback = (url.searchParams.get('feedback') ?? '').slice(0, 600)
+              const feedback = uslice((url.searchParams.get('feedback') ?? ''), 600)
               if (!target || !existsSync(target)) return json(response, 404, { ok: false, error: 'file not found' })
               if (!pathAllowed(target, url)) return json(response, 403, { ok: false, error: 'path outside allowed roots', code: 'path_denied' })
               if (action !== 'accept' && action !== 'reject') return json(response, 400, { ok: false, error: 'action must be accept|reject' })

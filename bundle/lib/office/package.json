@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-office-artifacts",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "把工作区里新生成的办公产物（docx/xlsx/pptx/pdf）汇总成清单，供 HUD 与对话使用",

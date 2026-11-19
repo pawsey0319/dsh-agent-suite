@@ -34,6 +34,31 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
+/** 按「码点」截断，绝不在代理对中间砍断（emoji 安全）。
+ *  数组原样按元素切；其它值转字符串后按 Array.from 切。
+ *  审计项 E-02/F-03：`str.slice(0,N)` 可能产生孤立代理 → JSON/UTF-8 往返出现 U+FFFD。 */
+function uslice(value, count) {
+  if (Array.isArray(value)) return value.slice(0, count)
+  const text = value === null || value === undefined ? '' : String(value)
+  const chars = Array.from(text)
+  return chars.length > count ? chars.slice(0, count).join('') : text
+}
+
+/**
+ * 去掉终端控制序列（t22 / F-04）。
+ * 子进程的 stderr 直接进 feed 与飞书/HUD，ESC 序列会让日志行错乱、也让 diff 永远不相等。
+ */
+function stripAnsi(value) {
+  if (typeof value !== 'string' || value === '') return typeof value === 'string' ? value : ''
+  return value
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '')
+    // 残留的 C0 控制字符（BEL/BS 等）同样会污染 feed 与飞书文本。
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+}
+
+
 export const name = 'dsh-agent-bridge'
 // sessionController / sessionQuery 是可选的：用 ctx.get() 拿并逐项降级，
 // 不写进 inject，免得服务缺席时整个插件起不来。
@@ -56,7 +81,9 @@ function log(message) {
   try { process.stderr.write(line) } catch {}
 }
 
-const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+// t22 / B-04：审批 TTL 统一 10 分钟（radar 侧「等你决定」与孤儿清扫都以这里为准）。
+// 旧值是 5 分钟，与宿主重载遗留判定（10 分钟）不一致，5–10 分钟区间会出现「还能点」与「已失效」同屏。
+const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 // 还在跑的状态：这些之外都算终态（N-18 用来决定 SSE 是否立即结束）。
 const RUN_ACTIVE = new Set(['running', 'starting', 'queued', 'needs-approval', 'needs-answer'])
 // 无 waiter 的孤儿审批（宿主重载后遗留、且多半没有 token）留一个有限的观察窗口：
@@ -103,7 +130,7 @@ function internalDecision(decision) {
  * 放行别人的审批（F-02），所以队列里的每一项都配一个一次性 token。
  */
 function makeApprovalToken() {
-  return randomUUID().replace(/-/g, '').slice(0, 24)
+  return uslice(randomUUID().replace(/-/g, ''), 24)
 }
 
 /** 常量时间比较，避免 token 通过计时差异泄漏。 */
@@ -120,7 +147,7 @@ function sameToken(a, b) {
  */
 function redactToken(token) {
   if (typeof token !== 'string' || token.length === 0) return undefined
-  return `${token.slice(0, 4)}…${token.slice(-2)}`
+  return `${uslice(token, 4)}…${token.slice(-2)}`
 }
 
 /**
@@ -189,7 +216,7 @@ function lastCompletedTurnSeq(events) {
 /** 恢复会话时发给新会话的续跑提示。fork 自带上下文，new 需要带上原任务摘要。 */
 function resumePrompt({ mode, prompt, agent, cwd }) {
   const task = String(prompt ?? '').trim()
-  const short = task.length > 500 ? `${task.slice(0, 500)}…` : task
+  const short = task.length > 500 ? `${uslice(task, 500)}…` : task
   if (mode === 'fork') {
     return `继续上一次未完成的工作：从断点接着做，不要从头重来。${short === '' ? '' : `\n\n原任务：${short}`}`
   }
@@ -323,15 +350,23 @@ function reapOrphanApprovals({ store, approvals, now = Date.now(), ttlMs = ORPHA
   for (const entry of store.list()) {
     if (liveIds.has(String(entry.id))) continue
     if (entry.stale !== true) continue
-    const since = typeof entry.orphanedAt === 'number' ? entry.orphanedAt : entry.at ? Date.parse(entry.at) : NaN
-    if (!Number.isFinite(since)) continue
+    // t22 / T-03：at 可能落盘成 epoch 毫秒数字，Date.parse(1795…) 会得到 NaN → 孤儿永远不被回收。
+    const since = Number.isFinite(entry.orphanedAt)
+      ? Number(entry.orphanedAt)
+      : typeof entry.at === 'number' && Number.isFinite(entry.at)
+        ? entry.at
+        : entry.at ? Date.parse(entry.at) : NaN
+    if (!Number.isFinite(since)) {
+      log(`approval expire skipped id=${uslice(String(entry.id), 12)} reason=bad-age at=${uslice(String(entry.at ?? ''), 24)}`)
+      continue
+    }
     const ageMs = now - since
     if (ageMs < ttlMs) continue
     if (store.remove(entry.id)) expired.push({ id: entry.id, ageMs, tokenless: typeof entry.token !== 'string' || entry.token === '' })
   }
   const humanAge = (ms) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}min` : `${(ms / 1000).toFixed(1)}s`)
   for (const row of expired) {
-    log(`approval expire id=${String(row.id).slice(0, 12)} age=${humanAge(row.ageMs)} tokenless=${row.tokenless ? 'yes' : 'no'} reason=no-waiter-ttl ttl=${humanAge(ttlMs)}`)
+    log(`approval expire id=${uslice(String(row.id), 12)} age=${humanAge(row.ageMs)} tokenless=${row.tokenless ? 'yes' : 'no'} reason=no-waiter-ttl ttl=${humanAge(ttlMs)}`)
   }
   return expired
 }
@@ -407,10 +442,10 @@ function reconcileRuns({ store, approvals, log = () => {} }) {
             `${JSON.stringify({ seq, at: now, kind: 'run.reconcile', from: meta.status, to: 'failed', reason: 'process-exited', note })}\n`,
           )
         } catch (error) {
-          log(`reconcile persist failed id=${id.slice(0, 8)} ${String(error?.message ?? error)}`)
+          log(`reconcile persist failed id=${uslice(id, 8)} ${String(error?.message ?? error)}`)
         }
       }
-      log(`process-exited run=${id.slice(0, 8)} agent=${meta.agent ?? '?'} pid=${meta.pid} source=reconcile`)
+      log(`process-exited run=${uslice(id, 8)} agent=${meta.agent ?? '?'} pid=${meta.pid} source=reconcile`)
       reconciled.push(id)
       continue
     }
@@ -448,12 +483,12 @@ function reconcileRuns({ store, approvals, log = () => {} }) {
           `${JSON.stringify({ seq, at: now, kind: 'run.reconcile', from: 'needs-approval', to: 'failed', reason: 'no_live_waiter', note: '宿主重启后审批队列里没有这个 run 的 waiter，已归一为终态' })}\n`,
         )
       } catch (error) {
-        log(`run reconcile id=${String(id).slice(0, 8)} write failed: ${String(error?.message ?? error)}`)
+        log(`run reconcile id=${uslice(String(id), 8)} write failed: ${String(error?.message ?? error)}`)
         continue
       }
     }
     reconciled.push(id)
-    log(`run reconcile id=${String(id).slice(0, 8)} from=needs-approval to=failed reason=no_live_waiter`)
+    log(`run reconcile id=${uslice(String(id), 8)} from=needs-approval to=failed reason=no_live_waiter`)
   }
   return reconciled
 }
@@ -501,9 +536,9 @@ const CLAUDE_AUTO_ALLOW = new Set(['Read', 'Grep', 'Glob', 'LS', 'TodoWrite', 'N
 function summarizeToolInput(input) {
   if (input === null || typeof input !== 'object') return null
   const command = input.command ?? input.file_path ?? input.path ?? input.pattern ?? input.url ?? null
-  if (typeof command === 'string') return command.length > 160 ? `${command.slice(0, 160)}…` : command
+  if (typeof command === 'string') return command.length > 160 ? `${uslice(command, 160)}…` : command
   try {
-    return JSON.stringify(input).slice(0, 160)
+    return uslice(JSON.stringify(input), 160)
   } catch {
     return null
   }
@@ -564,7 +599,7 @@ function claudeRows(event, state) {
     const rows = []
     for (const block of content) {
       if (block?.type === 'tool_result') {
-        rows.push({ kind: 'item.end', itemType: 'tool_result', toolUseId: block.tool_use_id ?? null, ok: block.is_error !== true, title: 'tool_result', detail: typeof block.content === 'string' ? block.content.slice(0, 160) : null })
+        rows.push({ kind: 'item.end', itemType: 'tool_result', toolUseId: block.tool_use_id ?? null, ok: block.is_error !== true, title: 'tool_result', detail: typeof block.content === 'string' ? uslice(block.content, 160) : null })
       }
     }
     return rows
@@ -648,10 +683,10 @@ class CodexHost {
       env: applyUpstream({ ...process.env }, 'codex'),
     })
     this.child.stderr.on('data', (chunk) => {
-      this.lastError = chunk.toString().slice(0, 400)
+      this.lastError = uslice(stripAnsi(chunk.toString()), 400)
     })
     this.child.on('error', (error) => {
-      this.lastError = String(error && error.message ? error.message : error).slice(0, 400)
+      this.lastError = uslice(stripAnsi(String(error && error.message ? error.message : error)), 400)
       this.ready = false
     })
     this.child.on('exit', (code, signal) => {
@@ -881,7 +916,7 @@ class RunStore {
       .map((run) => ({
         id: run.id,
         agent: run.agent,
-        prompt: run.prompt.slice(0, 160),
+        prompt: uslice(run.prompt, 160),
         status: run.status,
         createdAt: run.createdAt,
         updatedAt: run.updatedAt,
@@ -1001,6 +1036,56 @@ function answerTerminalQueries(session, text) {
   if (text.includes('\u001b[>7u') || text.includes('\u001b[>4;')) reply('\u001b[?0u')
 }
 
+/**
+ * 状态变更路由的同源判定（t22 / X-01、X-02）：与 dsh-project-journal 的 crossOriginReason 同口径。
+ * 只用浏览器会自动带的请求头；curl / 插件内部调用不带这些头 ⇒ 视为同源。
+ */
+function sameOriginReason(request) {
+  const header = (name) => {
+    try {
+      return request?.headers?.get?.(name) ?? null
+    } catch {
+      return null
+    }
+  }
+  const site = String(header('sec-fetch-site') ?? '').toLowerCase()
+  if (site === 'cross-site' || site === 'same-site') return `Sec-Fetch-Site: ${site}`
+  const hostHeader = String(header('host') ?? '').toLowerCase()
+  const hostName = hostHeader.split(':')[0]
+  const hostPort = hostHeader.split(':')[1] ?? ''
+  const sameHost = (name, port) => {
+    const near = name === hostName
+      || (hostName === 'localhost' && name === '127.0.0.1')
+      || (hostName === '127.0.0.1' && name === 'localhost')
+    return near && (port === '' || hostPort === '' || port === hostPort)
+  }
+  for (const name of ['origin', 'referer']) {
+    const value = header(name)
+    if (value === null || value === '') continue
+    let parsed
+    try {
+      parsed = new URL(value)
+    } catch {
+      return `${name} 不是合法 URL：${uslice(value, 80)}`
+    }
+    const port = parsed.port === '' ? (parsed.protocol === 'https:' ? '443' : '80') : parsed.port
+    if (!sameHost(parsed.hostname.toLowerCase(), port)) return `${name} 与宿主不同源：${parsed.origin}`
+  }
+  return null
+}
+
+/**
+ * 会改宿主状态的桥路由（t22 / X-01）：只接受 GET/POST；其它方法一律 405，
+ * 且写操作必须同源（403 cross_origin_rejected）。
+ */
+const MUTATING_BRIDGE_PREFIXES = [
+  'workbuddy', 'runs', 'claude-hook', 'takeover', 'approvals', 'pending', 'approve', 'resume',
+]
+function isMutatingBridgePath(parts) {
+  const head = String(parts?.[0] ?? '')
+  return MUTATING_BRIDGE_PREFIXES.includes(head)
+}
+
 function json(res, status, body) {
   const text = JSON.stringify(body)
   res.writeHead?.(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -1105,7 +1190,7 @@ async function probeUpstream(upstream) {
       signal: AbortSignal.timeout(30000),
     })
     const body = await response.text()
-    return { ok: response.ok, status: response.status, model, ms: Date.now() - startedAt, sample: body.slice(0, 200) }
+    return { ok: response.ok, status: response.status, model, ms: Date.now() - startedAt, sample: uslice(body, 200) }
   } catch (error) {
     return { ok: false, reason: String(error?.message ?? error), model }
   }
@@ -1260,7 +1345,7 @@ export function apply(ctx) {
       for (const run of store.runs.values()) {
         if (run.status !== 'running' && run.status !== 'starting' && run.status !== 'needs-approval') continue
         store.setStatus(run, 'failed', { error: 'codex app-server exited', reason: 'process-exited' })
-        log(`process-exited run=${run.id.slice(0, 8)} agent=codex pid=${run.pid ?? 'unknown'} host=exit`)
+        log(`process-exited run=${uslice(run.id, 8)} agent=codex pid=${run.pid ?? 'unknown'} host=exit`)
       }
       return
     }
@@ -1306,12 +1391,12 @@ export function apply(ctx) {
         error: turn.error ?? null,
       })
       if (turnAnswer && turnAnswerSource !== 'final_answer') {
-        log(`finalAnswer fallback id=${run.id.slice(0, 8)} source=${turnAnswerSource}${turnAnswerSource === 'agentMessage' ? ` phase=${turnAnswerPhase ?? 'null'}` : ''} chars=${String(turnAnswer).length}`)
+        log(`finalAnswer fallback id=${uslice(run.id, 8)} source=${turnAnswerSource}${turnAnswerSource === 'agentMessage' ? ` phase=${turnAnswerPhase ?? 'null'}` : ''} chars=${String(turnAnswer).length}`)
       } else if (!turnAnswer && status === 'done') {
-        log(`finalAnswer missing id=${run.id.slice(0, 8)} agent=codex reason=no-agentMessage-text events=${Array.isArray(run.events) ? run.events.length : 0}`)
+        log(`finalAnswer missing id=${uslice(run.id, 8)} agent=codex reason=no-agentMessage-text events=${Array.isArray(run.events) ? run.events.length : 0}`)
       }
       // bridge.log 要能回答「这个 run 什么时候结束、成没成」（F-10）。
-      log(`run ${status} id=${run.id.slice(0, 8)} agent=codex duration=${turn.durationMs ?? '-'} error=${turn.error ? String(turn.error).slice(0, 120) : '-'}`)
+      log(`run ${status} id=${uslice(run.id, 8)} agent=codex duration=${turn.durationMs ?? '-'} error=${turn.error ? uslice(String(turn.error), 120) : '-'}`)
     }
   })
 
@@ -1339,7 +1424,7 @@ export function apply(ctx) {
       at: approval.at,
       token: approval.token,
     })
-    log(`approval request id=${approval.id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} agent=${approval.agent} method=${approval.method}`)
+    log(`approval request id=${uslice(approval.id, 8)} run=${uslice((approval.runId ?? '-'), 8)} agent=${approval.agent} method=${approval.method}`)
     if (run) {
       store.append(run, { kind: 'approval.request', notification: event.method, raw: event.params })
       store.setStatus(run, 'needs-approval')
@@ -1361,7 +1446,7 @@ export function apply(ctx) {
       const options = Array.isArray(question?.options) ? question.options : []
       const picked = options.find((o) => String(o?.id ?? o?.label ?? o) === String(rawValue))
       const label = picked ? String(picked.label ?? picked.id ?? picked) : String(rawValue)
-      const text = String(question?.question ?? question?.text ?? '').replace(/\s+/g, ' ').slice(0, 60)
+      const text = uslice(String(question?.question ?? question?.text ?? '').replace(/\s+/g, ' '), 60)
       list.push(`${questionId}=${label}${text ? ` («${text}»)` : ''}`)
     }
     return list.length ? list.join(', ') : '-'
@@ -1383,20 +1468,20 @@ export function apply(ctx) {
         // {answers}。按 method 分流，否则提问类请求会被上游判为无效（R-05）。
         host.respondApproval(Number(id), decision, approval.method, answers)
       } catch (error) {
-        log(`approval respond failed id=${id.slice(0, 8)} ${String(error && error.message ? error.message : error)}`)
+        log(`approval respond failed id=${uslice(id, 8)} ${String(error && error.message ? error.message : error)}`)
       }
     }
     if (/timeout/.test(String(reason ?? ''))) {
       // 超时必须是拒绝：旧行为等于静默放行，审计已实测到 hook 被自动 allow。
-      log(`approval timeout -> deny id=${id.slice(0, 8)} method=${approval.method} reason=${reason}`)
+      log(`approval timeout -> deny id=${uslice(id, 8)} method=${approval.method} reason=${reason}`)
     }
-    log(`approval settle id=${id.slice(0, 8)} decision=${decision} reason=${reason ?? '-'} run=${(approval.runId ?? '-').slice(0, 8)}`)
+    log(`approval settle id=${uslice(id, 8)} decision=${decision} reason=${reason ?? '-'} run=${uslice((approval.runId ?? '-'), 8)}`)
     // 用审批自带的 kind（claude 的 AskUserQuestion 在创建时已按工具名分类），
     // 仅看 method 会把它当成普通审批，question answered 日志就永远不出现。
     const approvalIsQuestion = (approval.kind ?? approvalKind(approval.method)) === 'question'
     if (approvalIsQuestion) {
       // 提问通道单独一条可 grep 的日志：question answered … option=…
-      log(`question answered id=${id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} decision=${decision} option=${describeAnswer(approval, answers)}`)
+      log(`question answered id=${uslice(id, 8)} run=${uslice((approval.runId ?? '-'), 8)} decision=${decision} option=${describeAnswer(approval, answers)}`)
     }
     const run = approval.runId ? store.runs.get(approval.runId) : null
     if (run) {
@@ -1417,7 +1502,7 @@ export function apply(ctx) {
     const approval = approvals.get(String(id))
     if (!approval) return false
     if (typeof approval.token === 'string' && !sameToken(token, approval.token)) {
-      log(`approval rejected id=${String(id).slice(0, 8)} reason=bad_token`)
+      log(`approval rejected id=${uslice(String(id), 8)} reason=bad_token`)
       return 'forbidden'
     }
     // 提问的回答也走这里：带 answers 就等价于「已采纳」，decision 记为 accept。
@@ -1454,11 +1539,11 @@ export function apply(ctx) {
       try {
         const child = spawnClaude(run, { prompt, cwd, model: body.model ?? null, port: ctx.webServer.port })
         store.setStatus(run, 'running')
-        log(`run start id=${run.id.slice(0, 8)} agent=claude pid=${child.pid ?? 'unknown'} cwd=${cwd}`)
+        log(`run start id=${uslice(run.id, 8)} agent=claude pid=${child.pid ?? 'unknown'} cwd=${cwd}`)
         return { runId: run.id, agent: 'claude', pid: child.pid ?? null, model: run.model, cwd }
       } catch (error) {
         store.setStatus(run, 'failed', { error: String(error && error.message ? error.message : error) })
-        log(`run failed id=${run.id.slice(0, 8)} agent=claude reason=${String(error && error.message ? error.message : error)}`)
+        log(`run failed id=${uslice(run.id, 8)} agent=claude reason=${String(error && error.message ? error.message : error)}`)
         error.status = 500
         error.runId = run.id
         throw error
@@ -1471,7 +1556,7 @@ export function apply(ctx) {
     run.pid = Number.isFinite(host.child?.pid) ? host.child.pid : null
     store.append(run, { kind: 'run.created', prompt })
     store.persist(run)
-    log(`run start id=${run.id.slice(0, 8)} agent=codex pid=${run.pid ?? 'unknown'} cwd=${cwd}`)
+    log(`run start id=${uslice(run.id, 8)} agent=codex pid=${run.pid ?? 'unknown'} cwd=${cwd}`)
     const thread = await host.request('thread/start', { cwd, ...(body.model ? { model: body.model } : {}) })
     run.threadId = thread.thread.id
     run.model = thread.model ?? run.model
@@ -1490,7 +1575,7 @@ export function apply(ctx) {
     })
     run.turnId = turn.turn?.id ?? null
     store.setStatus(run, 'running')
-    if (body.plan === true) log(`run plan-mode id=${run.id.slice(0, 8)} model=${run.model ?? '-'} (request_user_input enabled)`)
+    if (body.plan === true) log(`run plan-mode id=${uslice(run.id, 8)} model=${run.model ?? '-'} (request_user_input enabled)`)
     return { runId: run.id, threadId: run.threadId, turnId: run.turnId, model: run.model, cwd, plan: body.plan === true }
   }
 
@@ -1537,7 +1622,7 @@ export function apply(ctx) {
     // t16 F1：spawn 成功立刻把 pid 落盘（雷达据此判定进程是否还在）。
     run.pid = Number.isFinite(child.pid) ? child.pid : null
     store.persist(run)
-    log(`run pid id=${run.id.slice(0, 8)} agent=claude pid=${run.pid ?? 'unknown'}`)
+    log(`run pid id=${uslice(run.id, 8)} agent=claude pid=${run.pid ?? 'unknown'}`)
 
     const state = { sessionId: null, model: run.model, sawText: false }
     let buffer = ''
@@ -1581,7 +1666,7 @@ export function apply(ctx) {
       // running 计数会一直显示一个已经死掉的进程（F-11）。
       claudeChildren.delete(run.id)
       store.setStatus(run, 'failed', { error: String(error && error.message) })
-      log(`claude spawn error run=${run.id.slice(0, 8)} ${String(error && error.message)}`)
+      log(`claude spawn error run=${uslice(run.id, 8)} ${String(error && error.message)}`)
     })
     child.on('exit', (code, signal) => {
       claudeChildren.delete(run.id)
@@ -1589,10 +1674,10 @@ export function apply(ctx) {
         // 非零退出/被信号杀死 = 子进程没了：落 reason=process-exited，和雷达的读侧判定同一口径（t16 F1）。
         const abnormal = code !== 0
         store.setStatus(run, abnormal ? 'failed' : 'done', {
-          error: abnormal ? `${signal ?? code}: ${stderr.slice(-400)}` : null,
+          error: abnormal ? uslice(stripAnsi(`${signal ?? code}: ${stderr.slice(-400)}`), 400) : null,
           ...(abnormal ? { reason: 'process-exited' } : {}),
         })
-        if (abnormal) log(`process-exited run=${run.id.slice(0, 8)} agent=claude pid=${run.pid ?? 'unknown'} signal=${signal ?? code}`)
+        if (abnormal) log(`process-exited run=${uslice(run.id, 8)} agent=claude pid=${run.pid ?? 'unknown'} signal=${signal ?? code}`)
       }
     })
     return child
@@ -1769,6 +1854,21 @@ export function apply(ctx) {
     const parts = path.split('/').filter(Boolean)
     const method = request.method ?? 'GET'
 
+    // t22 / X-01、X-02：写路由先过方法闸门与同源闸门，再进业务分支。
+    if (parts.length > 0 && isMutatingBridgePath(parts)) {
+      if (method !== 'GET' && method !== 'POST') {
+        log(`write guard method=${method} path=${uslice(path, 40)} -> 405`)
+        return json(response, 405, { ok: false, error: 'method_not_allowed', allow: 'GET, POST' })
+      }
+      if (method !== 'GET') {
+        const reason = sameOriginReason(request)
+        if (reason !== null) {
+          log(`write guard path=${uslice(path, 40)} reason=${reason} -> 403`)
+          return json(response, 403, { ok: false, error: 'cross_origin_rejected', code: 'cross_origin_rejected', detail: reason })
+        }
+      }
+    }
+
     if (method === 'GET' && (path === '' || path === 'health')) {
       // ok 不再恒为 true：app-server 起不来 / 子进程死光时要说实话，
       // 否则 doctor 和 smoke 永远绿（F-11）。
@@ -1818,7 +1918,7 @@ export function apply(ctx) {
     if (method === 'GET' && parts[0] === 'beacon') {
       try {
         const name = url.searchParams.get('e') ?? 'event'
-        const detail = (url.searchParams.get('d') ?? '').slice(0, 1500)
+        const detail = uslice((url.searchParams.get('d') ?? ''), 1500)
         const line = `${new Date().toISOString().slice(11, 23)} ${name} ${detail}\n`
         appendFileSync('/tmp/dsh-agent-bridge-client.log', line)
       } catch {}
@@ -2008,7 +2108,7 @@ export function apply(ctx) {
           at: approval.at,
           token: approval.token,
         })
-        log(`approval request id=${id.slice(0, 8)} run=${(approval.runId ?? '-').slice(0, 8)} agent=claude method=PreToolUse tool=${toolName}`)
+        log(`approval request id=${uslice(id, 8)} run=${uslice((approval.runId ?? '-'), 8)} agent=claude method=PreToolUse tool=${toolName}`)
         if (run) {
           store.append(run, { kind: 'approval.request', notification: 'claude/PreToolUse', raw: { tool: toolName, input: body.tool_input ?? null } })
           store.setStatus(run, 'needs-approval')
@@ -2031,7 +2131,7 @@ export function apply(ctx) {
       let err = ''
       child.stderr.on('data', (chunk) => { err += String(chunk) })
       child.on('close', (code) => {
-        if (code !== 0) log(`[agent-bridge] takeover ${agent} code=${code} ${err.slice(0, 200)}`)
+        if (code !== 0) log(`[agent-bridge] takeover ${agent} code=${code} ${uslice(err, 200)}`)
       })
       return json(response, 200, { ok: true, agent, cwd, binary: bin })
     }
@@ -2099,7 +2199,7 @@ export function apply(ctx) {
       })
       wbClearPending()
       wbAuditDecision('user', { card, policy, source: 'approval' })
-      log(`approval workbuddy -> open for user (no auto click) policy=${policy} card=${card.slice(0, 40)}`)
+      log(`approval workbuddy -> open for user (no auto click) policy=${policy} card=${uslice(card, 40)}`)
       return json(response, 200, { ok: true, decision: 'allow', action: 'open-for-user', autoClicked: false, agent: 'workbuddy', mode: 'user', confirmPolicy: policy })
     }
     if (method === 'POST' && parts[0] === 'approvals' && parts.length === 2) {
@@ -2108,7 +2208,7 @@ export function apply(ctx) {
       // 提问回执没有 allow/deny：带 answers 即视为已采纳，decision 只为兼容旧客户端。
       const decision = answers ? 'allow' : normalizeDecision(body.decision)
       if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny (or pass answers)', code: 'bad_decision' })
-      const result = decide(parts[1], decision, typeof body.note === 'string' ? body.note.slice(0, 500) : null, body.token, answers)
+      const result = decide(parts[1], decision, typeof body.note === 'string' ? uslice(body.note, 500) : null, body.token, answers)
       if (result === 'forbidden') return json(response, 403, { ok: false, error: 'approval token mismatch', id: parts[1] })
       // 没有活 waiter：条目只可能是宿主重载后的遗留（多半没有 token）。
       // 这类条目对任何决策都不会有副作用，但仍然要能「被丢掉」——否则 HUD 点它
@@ -2117,7 +2217,7 @@ export function apply(ctx) {
         const leftover = pendingApprovals.get(parts[1])
         if (leftover !== null) {
           pendingApprovals.remove(parts[1])
-          log(`approval dismissed id=${String(parts[1]).slice(0, 12)} reason=no-live-waiter tokenless=${typeof leftover.token === 'string' && leftover.token !== '' ? 'no' : 'yes'}`)
+          log(`approval dismissed id=${uslice(String(parts[1]), 12)} reason=no-live-waiter tokenless=${typeof leftover.token === 'string' && leftover.token !== '' ? 'no' : 'yes'}`)
           try {
             reconcileRuns({ store, approvals, log })
           } catch (error) {
@@ -2151,7 +2251,7 @@ export function apply(ctx) {
       try {
         const id = (url.searchParams.get('id') ?? '').trim()
         const decision = normalizeDecision(url.searchParams.get('decision'))
-        const note = (url.searchParams.get('note') ?? '').slice(0, 500)
+        const note = uslice((url.searchParams.get('note') ?? ''), 500)
         if (id === '') return json(response, 400, { ok: false, error: 'id is required' })
         if (decision === null) return json(response, 400, { ok: false, error: 'decision must be allow|deny' })
         const token = url.searchParams.get('token') ?? ''
@@ -2161,7 +2261,7 @@ export function apply(ctx) {
           return json(response, 403, { ok: false, error: 'approval token mismatch', id })
         }
         if (applied) {
-          log(`approval ${id} ${decision}${note === '' ? '' : ` note=${note.slice(0, 80)}`}`)
+          log(`approval ${id} ${decision}${note === '' ? '' : ` note=${uslice(note, 80)}`}`)
           return json(response, 200, { ok: true, id, decision, delivered: true })
         }
         // 没有活 waiter：多半是宿主重载后遗留的条目，丢掉并如实告诉调用方。

@@ -11,10 +11,21 @@
  *   <runId>/history.jsonl    每次裁决追加一行（审计）
  *   <runId>/rounds.json      返工轮次计数
  */
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, statSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, statSync, renameSync, unlinkSync } from 'node:fs'
 import { join, dirname, isAbsolute, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
+
+/** 按「码点」截断，绝不在代理对中间砍断（emoji 安全）。
+ *  数组原样按元素切；其它值转字符串后按 Array.from 切。
+ *  审计项 E-02/F-03：`str.slice(0,N)` 可能产生孤立代理 → JSON/UTF-8 往返出现 U+FFFD。 */
+function uslice(value, count) {
+  if (Array.isArray(value)) return value.slice(0, count)
+  const text = value === null || value === undefined ? '' : String(value)
+  const chars = Array.from(text)
+  return chars.length > count ? chars.slice(0, count).join('') : text
+}
+
 
 export const name = 'dsh-judge'
 export const inject = ['webServer']
@@ -42,7 +53,63 @@ function readJson(p, fallback) {
     return fallback
   }
 }
-function writeJson(p, v) { ensureDir(dirname(p)); writeFileSync(p, JSON.stringify(v, null, 2)) }
+/** 原子写：先写同目录临时文件再 rename，避免半个 JSON 被下一次读进来（t22 / S-03）。 */
+function writeJson(p, v) {
+  ensureDir(dirname(p))
+  const tmp = `${p}.tmp-${process.pid}-${Date.now().toString(36)}`
+  writeFileSync(tmp, JSON.stringify(v, null, 2))
+  try {
+    renameSync(tmp, p)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch { /* ignore */ }
+    throw error
+  }
+}
+
+/**
+ * 读返工轮次（t22 / S-03）：rounds.json 读坏/被写坏时，用 history.jsonl 里最大的 round 兜底，
+ * 并且结果一律夹到 [0, maxRounds]，保证「文件坏了也不会多打回一轮」。
+ */
+function readRounds(runId, maxRounds) {
+  const paths = runPaths(runId)
+  const raw = readJson(paths.rounds, null)
+  let round = Number.isFinite(raw?.round) ? Number(raw.round) : null
+  let recoveredFrom = null
+  if (round === null) {
+    let max = 0
+    try {
+      if (existsSync(paths.history)) {
+        for (const line of readFileSync(paths.history, 'utf8').split('\n')) {
+          const text = line.trim()
+          if (text === '') continue
+          try {
+            const row = JSON.parse(text)
+            const value = Number(row?.round)
+            if (Number.isFinite(value) && value > max) max = value
+          } catch { /* 坏行忽略 */ }
+        }
+      }
+    } catch (error) {
+      log(`rounds history unreadable ${paths.history}: ${String(error && error.message ? error.message : error)}`)
+    }
+    if (raw !== null || max > 0) {
+      round = max
+      recoveredFrom = 'history'
+      log(`rounds recovered from history max=${max} run=${runId}`)
+    } else {
+      round = 0
+    }
+  }
+  if (!Number.isFinite(round) || round < 0) round = 0
+  if (Number.isFinite(maxRounds) && round > maxRounds) round = maxRounds
+  return {
+    agent: raw?.agent ?? null,
+    cwd: raw?.cwd ?? null,
+    lastRunId: raw?.lastRunId ?? null,
+    round,
+    recoveredFrom,
+  }
+}
 
 function readConfig() {
   const raw = readJson(CONFIG, {})
@@ -195,13 +262,13 @@ async function callJudge(cfg, contract, evidence) {
       signal: AbortSignal.timeout(judge.timeoutMs ?? 45000),
     })
     const raw = await res.text()
-    if (!res.ok) return { skipped: 'judge_http_error', detail: `${res.status} ${raw.slice(0, 300)}` }
+    if (!res.ok) return { skipped: 'judge_http_error', detail: `${res.status} ${uslice(raw, 300)}` }
     const data = JSON.parse(raw)
     const text = isAnthropic
       ? (data.content ?? []).map((c) => c.text ?? '').join('')
       : (data.choices?.[0]?.message?.content ?? '')
     const verdict = parseVerdict(text)
-    return verdict ? { verdict } : { skipped: 'judge_unparsable', detail: String(text).slice(0, 300) }
+    return verdict ? { verdict } : { skipped: 'judge_unparsable', detail: uslice(String(text), 300) }
   } catch (err) {
     return { skipped: 'judge_error', detail: String(err?.message ?? err) }
   }
@@ -305,7 +372,7 @@ async function rework({ runId, port, verdict, prompt }) {
     return { reworked: false, reason: `autonomy_${cfg.autonomy}` }
   }
   const paths = runPaths(runId)
-  const rounds = readJson(paths.rounds, { round: 0 })
+  const rounds = readRounds(runId, cfg.maxRounds)
   if (rounds.round >= cfg.maxRounds) {
     return { reworked: false, reason: 'max_rounds', round: rounds.round }
   }
@@ -425,7 +492,7 @@ export function apply(ctx) {
       const rows = ids.map((id) => ({
         runId: id,
         verdict: readJson(join(dir, id, 'verdict.json'), null)?.verdict ?? null,
-        rounds: readJson(join(dir, id, 'rounds.json'), { round: 0 }).round,
+        rounds: readRounds(id, readConfig().maxRounds).round,
       }))
       return json(res, 200, { ok: true, count: rows.length, rows })
     }

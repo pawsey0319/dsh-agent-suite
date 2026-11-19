@@ -24,6 +24,36 @@ import Darwin
 
 // MARK: - 常量
 
+/// query 值级 percent-encoding（F-02）。
+///
+/// `components.queryItems = …` 只按 `urlQueryAllowed` 编码，**不编码 `+`**；而服务端用
+/// `URLSearchParams` 解析时会把 `+` 解成空格 —— 用户答 `1+1` 到服务端就变成 `1 1`。
+/// 这里用更窄的 allowed 集合（字母数字 + `-._~!*'()`）显式编码，`+ & # 空格 中文` 全部转义。
+func queryEncoded(_ raw: String) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~!*'()")
+    return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
+}
+
+/// 已编码的 query items：配 `percentEncodedQueryItems` 使用（值必须已编码）。
+func encodedQueryItems(_ items: [URLQueryItem]) -> [URLQueryItem] {
+    items.map { URLQueryItem(name: queryEncoded($0.name), value: queryEncoded($0.value ?? "")) }
+}
+
+/// 单行尾部省略（F-05）：显式段落样式，宽度变化时给「…」而不是硬裁半个字。
+func ellipsisStyle() -> NSParagraphStyle {
+    let style = NSMutableParagraphStyle()
+    style.lineBreakMode = .byTruncatingTail
+    return style
+}
+
+/// 单行文本：自动带 byTruncatingTail。
+func drawSingleLine(_ text: String, in rect: NSRect, attributes: [NSAttributedString.Key: Any]) {
+    var attrs = attributes
+    attrs[.paragraphStyle] = ellipsisStyle()
+    (text as NSString).draw(in: rect, withAttributes: attrs)
+}
+
 private enum HUD {
     /// 收起态圆形的直径（要求 52–56pt，取上限更醒目）。
     static let circleSize: CGFloat = 56
@@ -1832,14 +1862,14 @@ private final class PanelContentView: PassthroughView {
         var titleText = item.title?.isEmpty == false ? item.title! : "（无标题）"
         // 同 agent 同标题的连续 done 在 feed 里已折叠，这里把条数标出来（t14）。
         if let count = item.count, count > 1 { titleText += "  ×\(count)" }
-        let title = titleText as NSString
         let titleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1.0,
                                       alpha: doneUnread ? 0.74 : (approval ? 0.97 : 0.92)),
         ]
-        title.draw(in: NSRect(x: textX, y: rect.minY + 20, width: textWidth, height: 17),
-                   withAttributes: titleAttrs)
+        // F-05：单行尾部省略（宽度变化时给「…」，不硬裁）。
+        drawSingleLine(titleText, in: NSRect(x: textX, y: rect.minY + 20, width: textWidth, height: 17),
+                       attributes: titleAttrs)
 
         var agentText: String
         if let review = reviewSubtitle(item) {
@@ -1861,8 +1891,8 @@ private final class PanelContentView: PassthroughView {
             let text = candidates
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 失败 · " +
-                (text.map { String($0.prefix(30)) } ?? "点击看日志")
+            let clipped = text.map { $0.count > 30 ? String($0.prefix(29)) + "…" : $0 } ?? "点击看日志"
+            agentText = "\((item.agent ?? "unknown").uppercased()) · 失败 · " + clipped
         } else if approval {
             agentText = "\((item.agent ?? "unknown").uppercased()) · 待批准 · 点击处理"
         } else if doneUnread {
@@ -1898,7 +1928,6 @@ private final class PanelContentView: PassthroughView {
             }
             agentText += teamText
         }
-        let agent = agentText as NSString
         let agentAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9, weight: .regular),
             .foregroundColor: approval
@@ -1907,8 +1936,8 @@ private final class PanelContentView: PassthroughView {
                     ? NSColor.systemRed.withAlphaComponent(0.90)
                     : NSColor(calibratedWhite: 1.0, alpha: doneUnread ? 0.52 : 0.42)),
         ]
-        agent.draw(in: NSRect(x: textX, y: rect.minY + 5, width: textWidth, height: 13),
-                   withAttributes: agentAttrs)
+        drawSingleLine(agentText, in: NSRect(x: textX, y: rect.minY + 5, width: textWidth, height: 13),
+                       attributes: agentAttrs)
 
         if index < HUD.maxRows - 1 {
             let line = NSBezierPath()
@@ -4802,7 +4831,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             segments.append("seen")
         }
         components.path = "/" + segments.joined(separator: "/")
-        components.queryItems = [URLQueryItem(name: "id", value: ids.joined(separator: ","))]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "id", value: ids.joined(separator: ","))])
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         request.httpMethod = "GET"
@@ -5601,11 +5630,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let answers: [[String: Any]] = [entry]
         guard let data = try? JSONSerialization.data(withJSONObject: answers),
               let json = String(data: data, encoding: .utf8) else { return }
-        components.queryItems = [
+        components.percentEncodedQueryItems = encodedQueryItems([
             URLQueryItem(name: "request", value: request),
             URLQueryItem(name: "token", value: token),
             URLQueryItem(name: "answers", value: json),
-        ]
+        ])
         guard let url = components.url else { return }
         log("[answer] submit request=\(request.prefix(8)) shape=array id=\(qid) n=\(selected.count) " +
             "custom=\(custom?.count ?? 0)")
@@ -5673,7 +5702,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
            let json = String(data: data, encoding: .utf8) {
             items.append(URLQueryItem(name: "answers", value: json))
         }
-        components.queryItems = items
+        components.percentEncodedQueryItems = encodedQueryItems(items)
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         request.httpMethod = "GET"
@@ -5762,7 +5791,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             segments.append("jump")
         }
         components.path = "/" + segments.joined(separator: "/")
-        components.queryItems = [URLQueryItem(name: "session", value: sessionId)]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "session", value: sessionId)])
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
         request.httpMethod = "GET"
@@ -5803,7 +5832,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             segments.append("jump-status")
         }
         components.path = "/" + segments.joined(separator: "/")
-        components.queryItems = [URLQueryItem(name: "id", value: id)]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "id", value: id)])
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
         request.httpMethod = "GET"
@@ -5846,7 +5875,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             return
         }
         components.path = (components.path.isEmpty ? "" : components.path) + "/jump"
-        components.queryItems = [URLQueryItem(name: "session", value: sessionId)]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "session", value: sessionId)])
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
         request.httpMethod = "GET"
@@ -5885,8 +5914,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
         guard var components = URLComponents(string: raw), components.host != nil else { return }
         components.path = "/office-artifacts/open"
-        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? path
-        components.query = "path=" + encoded
+        // F-01：路径里带 `&` / `+` 时，手拼 query 会被服务端当分隔符/空格切开（找不到产物）。
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "path", value: path)])
         guard let url = components.url else { return }
         log("artifact open \(path)")
         URLSession.shared.dataTask(with: url) { _, _, _ in }.resume()
@@ -5894,7 +5923,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     /// 打开某次外部运行的详情：先置为已读（计数立刻归零），再拉 events 补正文。
     /// 打开「子会话」页：一个父会话调了几个智能体、各自在干什么。
-    /// 把毫秒时间戳差转成「12 分钟」「1 小时 6 分」这种可读时长。
+        /// 把毫秒时间戳差转成「12 分钟」「1 小时 6 分」这种可读时长。
     private func humanDuration(_ ms: Double) -> String {
         let seconds = max(0, ms / 1000)
         if seconds < 60 { return "\(Int(seconds)) 秒" }
@@ -6154,7 +6183,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         var target = components
         target.path += "/retry"
-        target.queryItems = [URLQueryItem(name: "run", value: detail.runId)]
+        target.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "run", value: detail.runId)])
         guard let url = target.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
         request.httpMethod = "GET"
@@ -6210,7 +6239,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         var target = components
         target.path += "/hide-session"
-        target.queryItems = [URLQueryItem(name: "session", value: detail.runId)]
+        target.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "session", value: detail.runId)])
         guard let url = target.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
@@ -6315,7 +6344,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard let base = lastResolvedURLString.split(separator: "|").first,
               var comps = URLComponents(string: String(base)) else { return }
         comps.path = "/dsh-judge/verdict"
-        comps.queryItems = [URLQueryItem(name: "run", value: runId)]
+        comps.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "run", value: runId)])
         guard let url = comps.url else { return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let self, let data,
@@ -6345,12 +6374,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
               components.host != nil, components.scheme != nil else { return }
         components.path = "/agent-bridge/runs/\(id)"
         if append, detailLastSeq > 0 {
-            components.queryItems = [
+            components.percentEncodedQueryItems = encodedQueryItems([
                 URLQueryItem(name: "since", value: String(detailLastSeq)),
                 URLQueryItem(name: "limit", value: "500"),
-            ]
+            ])
         } else {
-            components.queryItems = [URLQueryItem(name: "limit", value: "2000")]
+            components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "limit", value: "2000")])
         }
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
@@ -6463,7 +6492,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard var components = URLComponents(string: raw),
               components.host != nil, components.scheme != nil else { return }
         components.path = "/agent-bridge/runs/\(id)"
-        components.queryItems = [URLQueryItem(name: "limit", value: "1")]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "limit", value: "1")])
         guard let url = components.url else { return }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "GET"
@@ -6666,7 +6695,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard var components = URLComponents(string: raw),
               components.path.hasSuffix("/radar") else { return nil }
         components.path = String(components.path.dropLast("/radar".count)) + "/seen"
-        components.queryItems = [URLQueryItem(name: "id", value: ids.joined(separator: ","))]
+        components.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "id", value: ids.joined(separator: ","))])
         return components.url
     }
 
