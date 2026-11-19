@@ -1876,7 +1876,7 @@ function radarRoute(ctx) {
     }
     if (tail === 'jump-pending') {
       // 页面侧的 client 半来取；超过 15 秒的请求视为过期，不再打扰用户。
-      let body = { sessionId: null, reload: lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD }
+      let body = { sessionId: null, reload: CLIENT_BUILD !== '' && lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD }
       for (const path of jumpCandidatePaths()) {
         try {
           const raw = JSON.parse(readFileSync(path, 'utf8'))
@@ -1884,7 +1884,7 @@ function radarRoute(ctx) {
             body = {
               sessionId: raw.sessionId,
               mailbox: path === jumpFile() ? 'host' : 'legacy',
-              reload: lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD,
+              reload: CLIENT_BUILD !== '' && lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD,
             }
             break
           }
@@ -2334,7 +2334,7 @@ function beaconResponse(url) {
   // 页面收到 stale 就在自己这一侧重载（旧 bundle 的 client 半没有这段逻辑，所以第一次升级仍需手动刷新一次；
   // 之后每次升级都能自愈）。
   const headers = { 'content-type': 'text/plain', 'cache-control': 'no-store' }
-  if (build && build !== CLIENT_BUILD) headers['x-radar-reload'] = '1'
+  if (build && CLIENT_BUILD !== '' && build !== CLIENT_BUILD) headers['x-radar-reload'] = '1'
   return new Response('ok', { status: 200, headers })
 }
 

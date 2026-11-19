@@ -50,14 +50,66 @@ window.__ModuleLoader__.load({
       return false
     }
 
-    /** 一次性打点：确认 client 半真的加载了（窗口内没有可见 UI，只能靠日志确认）。 */
+    /** 打点：确认 client 半真的加载了（窗口内没有可见 UI，只能靠日志确认）。 */
+    // 构建指纹：sync 脚本会把占位符替换成 client.js 的 sha16，宿主据此判断「页面加载的是不是
+    // 当前 bundle」；同时占位符存在与否决定 sync 是否走「改写 id + 指纹」分支（见 scripts/sync-suite-bundle.sh）。
+    const CLIENT_BUILD = '__RADAR_CLIENT_BUILD__'
+    const postBeacon = async (event) => {
+      try {
+        const response = await fetch(`/x-radar/beacon?e=${event}&b=${encodeURIComponent(CLIENT_BUILD)}`, { cache: 'no-store' })
+        return response.ok
+      } catch {
+        return false
+      }
+    }
+    // 尽力而为：失败也重试，但不阻塞调用方
     const beacon = (event) => {
-      fetch(`/x-radar/beacon?e=${event}`, { cache: 'no-store' }).catch(() => {})
+      postBeacon(event).then((ok) => {
+        if (!ok) retryBeacon(event)
+      })
+    }
+    const RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000]
+    const retryBeacon = (event) => {
+      let index = 0
+      const attempt = () => {
+        const delay = RETRY_DELAYS[Math.min(index, RETRY_DELAYS.length - 1)]
+        index += 1
+        setTimeout(async () => {
+          if (await postBeacon(event)) return
+          attempt()
+        }, delay)
+      }
+      attempt()
+    }
+    /**
+     * 心跳：页面若在宿主就绪前加载，apply 时那一次打点会落空且再无补打（R-03/U-04）。
+     * 这里每 20s 补一次 client.alive，宿主据此把 clientHalf.active 判活。
+     */
+    const HEARTBEAT_MS = 20000
+    const startHeartbeat = (isDisposed) => {
+      let timer = null
+      const beat = async () => {
+        if (isDisposed()) return
+        const ok = await postBeacon('client.alive')
+        if (!ok && timer !== null) {
+          // 失败就退化成密集重试，直到成功一次再回到 20s 节奏
+          setTimeout(beat, 3000)
+        }
+      }
+      const loop = () => {
+        if (isDisposed()) return
+        beat()
+        timer = setTimeout(loop, HEARTBEAT_MS)
+      }
+      loop()
+      return () => clearTimeout(timer)
     }
 
     const apply = (ctx) => {
-      beacon('client.apply')
       let disposed = false
+      const isDisposed = () => disposed
+      beacon('client.apply')
+      const stopHeartbeat = startHeartbeat(isDisposed)
       let busy = false
       const attempts = new Map()
 
@@ -97,6 +149,7 @@ window.__ModuleLoader__.load({
         return () => {
           disposed = true
           clearInterval(timer)
+          stopHeartbeat()
         }
       })
     }
