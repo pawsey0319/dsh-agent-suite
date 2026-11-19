@@ -51,6 +51,35 @@ DSH 桌面右上角的常驻胶囊：把「DSH 会话在跑什么」和「Agent 
 - `跳到 DSH 里删除`：只跳转，删不删由 DSH 本体决定。
 - `取消`：关掉确认卡。单击语义不变（进会话详情）。
 
+
+### 横幅点击（0.6.13）
+
+完成横幅会记住「是哪一条」：点它就一键到那条结果所在的地方。
+
+| 横幅 kind | 点击行为 |
+| --- | --- |
+| `session`（已完成） | 先标已读，再直接跳到该会话窗口；条目随即从胶囊消失 |
+| `run`（外部 codex/claude/workbuddy） | 打开该 run 的详情页 |
+| `approval` / `question` | 打开对应处置页（不跳转） |
+
+一次点击只消费一条，队列里剩下的会上移。日志契约：`banner click kind=… id=…` → 动作行（`banner done jump kind=session` / `open detail`）→ `markSeen ok` / `jump sent`。零 TCC 自检：`--banner-probe 0`（0 = 队首）。
+
+### 自检开关补遗（0.6.13）
+
+- `--banner-probe <index>`：按下标模拟点一条横幅，打印 `banner probe …` 与真实点击同款日志后自退。
+- `--bench <path>` 里的 `cpu_pct` 现在是真值（`proc_pid_rusage` 增量），可连续采 30 分钟看 M1/M3/M10。
+- `/x-radar/health` 增 `clientLive`：为 false 表示当前没有活着的 DSH Web 页面，`clientHalf` 相关判据此时不成立（门禁记 KNOWN-DEFERRED）。
+
+### 横幅与未读的收场规则（0.6.13）
+
+- **条目被消费，横幅立刻消失**：每轮 feed 之后比对 `items[].id` 与 `doneUnreadIds`，不在集合里的横幅
+  立即收掉并打 `banner dismiss reason=item-consumed`（在 DSH 里读完某个会话、或在雷达里置读之后，下一轮 2s 内生效）。
+- **超时**：可点横幅 30s（`reason=expired`）、纯提示 6s（`reason=timeout`）；点击是 `reason=clicked`；队列超 3 条挤掉最旧是 `reason=evict`。
+- **取数失败不吞提醒**：feed 500/断网时保留已有横幅，打 `banner keep reason=feed-error n=…`；自检 `--feed-fail`（第一次成功让横幅出来，之后必失败）。
+- **已完成未读以 DSH 事实为准**：宿主 `list()` 没有未读字段（只有 `running/blank/updatedAt/formatStatus/sessionListMetadata.lastPromptAt` 等），
+  所以只认三种硬事实清账 —— 行消失 → `session unread clear id=… source=dsh-gone`；会话又跑起来 → `source=dsh-running`；
+  完成之后还有人类输入（`lastPromptAt > finishedAt`）→ `source=dsh-prompt`。都不命中才回退雷达自己的 60 分钟保留与 `seen.json`。
+
 ## 已知限制（2026-11-18）
 
 1. **就地处置只做了选项类**：HUD 活着且没有 Web 客户端时，雷达会接管会话内提问，面板里点选项即提交

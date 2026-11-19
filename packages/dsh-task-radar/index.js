@@ -24,6 +24,7 @@ function zhTask(status) {
   return TASK_STATUS_ZH[status] ?? String(status)
 }
 
+import { fileURLToPath } from 'node:url'
 import { chmodSync, appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -255,6 +256,121 @@ function hiddenFile() {
   return join(STATE_DIR, 'hidden-sessions.json')
 }
 
+function hiddenRunsFile() {
+  return join(STATE_DIR, 'hidden-runs.json')
+}
+
+// ---- 后台任务（job）账本 ------------------------------------------------------
+// 用户口径（2026-11-19）：「后台任务在跑，但胶囊显示没有」——DSH 的 row.running 只表示
+// 「有一轮对话在跑」，bash 的 run_in_background 之类 job 在 turn 结束后仍然活着，此时
+// 会话 running=false，雷达就把它当空闲了。job 归 ctx.jobs 管，这里订阅它的生命周期事件
+// 维护「哪些会话还有活 job」，供 feed 把这类会话重新算作「进行中」。
+// 订阅失败（老宿主没有 jobs 服务）时退化成按需 list(sessionId) 扫描，绝不阻塞 feed。
+const liveJobs = new Map()
+let jobsSubscription = 'none'
+let jobsFallbackAt = 0
+const jobsFallbackCache = new Map()
+
+function jobOwnerId(job) {
+  const owner = job?.owner
+  if (owner === undefined || owner === null) return ''
+  const id = owner.id ?? owner
+  return typeof id === 'string' ? id : ''
+}
+
+function watchJobs(ctx) {
+  const jobs = ctx.get('jobs')
+  if (jobs === undefined || jobs === null) {
+    jobsSubscription = 'unavailable'
+    log('job watch unavailable ctx.jobs')
+    return () => {}
+  }
+  const events = jobs.events
+  if (events === undefined || typeof events.subscribe !== 'function') {
+    jobsSubscription = 'unavailable'
+    log('job watch unavailable jobs.events')
+    return () => {}
+  }
+  let dispose
+  try {
+    dispose = events.subscribe({ owners: 'all' }, (event) => {
+      const owner = jobOwnerId(event?.job)
+      if (owner === '') return
+      const status = event?.job?.status
+      if (event.type === 'registered' || event.type === 'progress' || event.type === 'stopping') {
+        if (event.type === 'registered') {
+          liveJobs.set(owner, (liveJobs.get(owner) ?? 0) + 1)
+          log(`job registered owner=${owner.slice(0, 12)} id=${event.job?.id} kind=${event.job?.kind}`)
+        }
+        return
+      }
+      if (event.type === 'settled' || event.type === 'removed') {
+        const next = Math.max(0, (liveJobs.get(owner) ?? 0) - 1)
+        if (next === 0) liveJobs.delete(owner)
+        else liveJobs.set(owner, next)
+        if (event.type === 'settled') {
+          log(`job settled owner=${owner.slice(0, 12)} id=${event.job?.id} status=${status}`)
+        }
+      }
+    })
+    jobsSubscription = 'events'
+    log('job watch listening')
+  } catch (error) {
+    jobsSubscription = 'unavailable'
+    log(`job watch subscribe failed ${error?.message ?? error}`)
+    return () => {}
+  }
+  return () => {
+    try { dispose?.() } catch {}
+  }
+}
+
+/// 兜底：没有事件流时按会话 list 一次（5s 缓存，最多看 60 个最近会话），只数为「活 job」。
+function jobCountFallback(ctx, sessionIds) {
+  const jobs = ctx.get('jobs')
+  if (jobs === undefined || typeof jobs.list !== 'function') return 0
+  const now = Date.now()
+  if (now - jobsFallbackAt > 5000) {
+    jobsFallbackAt = now
+    jobsFallbackCache.clear()
+    for (const id of sessionIds.slice(0, 60)) {
+      try {
+        const list = jobs.list(id) ?? []
+        const live = list.filter(
+          (job) =>
+            jobOwnerId(job) === id && (job.status === 'running' || job.status === 'stopping'),
+        ).length
+        if (live > 0) jobsFallbackCache.set(id, live)
+      } catch {}
+    }
+  }
+  return 0
+}
+
+function liveJobCount(ctx, sessionId, fallbackIds) {
+  if (jobsSubscription === 'events') {
+    const direct = liveJobs.get(sessionId)
+    if (direct !== undefined) return direct
+    return 0
+  }
+  if (jobsSubscription === 'none') return 0
+  jobCountFallback(ctx, fallbackIds ?? [])
+  return jobsFallbackCache.get(sessionId) ?? 0
+}
+
+function readHiddenRuns() {
+  return readMap(hiddenRunsFile())
+}
+
+function hideRun(runId) {
+  const map = readMap(hiddenRunsFile())
+  map[runId] = { at: Date.now() }
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(hiddenRunsFile(), JSON.stringify(map, null, 2))
+  } catch {}
+}
+
 function readMap(path) {
   const data = readJson(path, null)
   return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : {}
@@ -482,6 +598,13 @@ async function sessionItems(ctx) {
           catalog: Array.isArray(values?.subagentCatalog) ? values.subagentCatalog : [],
           tasks: Array.isArray(values?.agentTeam?.tasks) ? values.agentTeam.tasks : [],
           updatedAt: Number(row?.updatedAt ?? 0) || 0,
+          // DSH 侧唯一可信的「用户碰过这个会话」信号：最后一条人类输入的时间。
+          // 行上没有 completionUnread / retainedBy（实测字段只有 sessionId/updatedAt/
+          // agentAvailable/formatStatus/running/blank/cwd/origin/parentSessionId/projections），
+          // 所以未读对账只能用「又跑起来了 / 说过话 / 行消失」这些硬事实。
+          lastPromptAt: Number.isFinite(values?.sessionListMetadata?.lastPromptAt)
+            ? Number(values.sessionListMetadata.lastPromptAt)
+            : null,
         }
       }
       const described = rows.map(describe).filter((row) => row.id !== '')
@@ -569,6 +692,11 @@ async function sessionItems(ctx) {
         )
       }
 
+      // 后台 job 兜底扫描只看最近活跃的一批会话，避免每轮把 200+ 会话都 list 一遍。
+      const jobFallbackIds = described
+        .filter((row) => !row.parentId || !byId.has(row.parentId))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .map((row) => row.id)
       for (const row of described) {
         const kids = childrenOf.get(row.id) ?? []
         const isTop = !row.parentId || !byId.has(row.parentId)
@@ -582,13 +710,20 @@ async function sessionItems(ctx) {
           // 规则 B：主列表只放主会话，子会话一律挂到主会话详情里；
           // 普通会话的子 agent 也要能看到（不只是 agent team）。
           const visibleKids = kids.filter(fresh).map(toChild)
+          // 用户口径（2026-11-19）：后台 job 在跑也算「进行中」。row.running 只跟「有一轮
+          // 对话在跑」有关，turn 结束后 job 还活着时它是 false，胶囊就会把这条会话当空闲。
+          const jobCount = liveJobCount(ctx, row.id, jobFallbackIds)
+          const runningByJob = row.running !== true && jobCount > 0
           out.push({
             id: row.id,
             kind: 'session',
             agent: row.agent,
             preset: row.preset,
             title: row.title,
-            status: row.running || runningFromChildren ? 'running' : 'idle',
+            status: row.running || runningFromChildren || runningByJob ? 'running' : 'idle',
+            // 为什么算「进行中」：turn=真在跑对话，job=后台任务还在跑，children=子会话在跑。
+            runningBy: row.running ? 'turn' : runningByJob ? 'job' : runningFromChildren ? 'children' : undefined,
+            jobs: jobCount > 0 ? jobCount : undefined,
             // 只有 agent team 才展开成员进度；普通 session 的子 agent 不进列表（用户口径）。
             team: row.team,
             childCount: row.team ? members.length : visibleKids.length,
@@ -606,6 +741,9 @@ async function sessionItems(ctx) {
             tokens: row.tokens,
             goal: row.goal,
             formatStatus: row.formatStatus,
+            // 宿主没有「未读」字段，但行上有 lastPromptAt（最后一次人类输入时间）。
+            // 完成时间早于它 = 用户在这之后还进这个会话说过话 ⇒ 一定看过了。
+            lastPromptAt: row.lastPromptAt ?? null,
             updatedAt: row.updatedAt,
           })
         }
@@ -771,6 +909,26 @@ function normalizeQuestionAnswers(answers) {
   return Object.keys(out).length ? out : null
 }
 
+/**
+ * 审批/桥内提问是否已经没有活着的等待方（用户现场：胶囊停在一个点了必然失败的页面）。
+ * 判据（任一命中即失效）：
+ *   - 桥自己标了 stale（宿主重启后没有 waiter）；
+ *   - 关联 run 已是终态（done/failed/killed/cancelled）——没人再等这个决定；
+ *   - 关联 run 有 pid 且进程已经不在（`pidAlive === false`）。
+ * 返回失效原因字符串，活着返回 null。
+ */
+function staleApprovalReason(approval, runsById) {
+  if (approval?.stale === true) return 'no-waiter'
+  const runId = typeof approval?.runId === 'string' && approval.runId !== '' ? approval.runId : null
+  if (runId === null) return null
+  const run = runsById?.get(runId)
+  if (run === undefined) return null
+  const terminal = new Set(['done', 'failed', 'killed', 'cancelled'])
+  if (terminal.has(String(run.status))) return 'run-terminal'
+  if (run.pidAlive === false) return 'pid-dead'
+  return null
+}
+
 function describeApproval(approval) {
   const params = approval?.params ?? {}
   const input = params.input ?? {}
@@ -837,7 +995,8 @@ function tapQuestion(request) {
     if (sessionId === undefined || sessionId === null) return
     const questions = Array.isArray(request.questions)
       ? request.questions.slice(0, 9).map((question, index) => ({
-          id: String(question?.id ?? index),
+          // 没有 id 的题用 q0/q1 兜底：HUD 的自由文本入口用同一套，否则回执 id 对不上。
+          id: String(question?.id ?? `q${index}`),
           question: typeof question?.question === 'string' ? question.question : '',
           header: typeof question?.header === 'string' ? question.header : null,
           options: Array.isArray(question?.options)
@@ -947,7 +1106,11 @@ function holdQuestion(ctx, request, next, tap) {
       questionHold.delete(requestId)
       if (questionHold.size === 0) stopQuestionWatcher()
       if (why === 'answered') {
-        log(`question answered request=${requestId} session=${sessionId.slice(0, 12)} n=${answers.length}`)
+        // shape=array 是 t13 定稿的回执形状 {answers:[{id,selected,custom?}]}；日志留证便于门禁 grep。
+        const customCount = answers.filter((entry) => typeof entry?.custom === 'string').length
+        const ids = answers.map((entry) => String(entry?.id ?? '')).join(',')
+        log(`question answered request=${requestId} session=${sessionId.slice(0, 12)} ` +
+          `n=${answers.length} shape=array ids=${ids} custom=${customCount}`)
         resolve({ answers })
         return
       }
@@ -1015,6 +1178,18 @@ function dshQuestionItems(ctx, sessions) {
     if (typeof session?.id === 'string' && session.id !== '') byId.set(session.id, session)
   }
   const nowMs = Date.now()
+  // 已经没有等待方的接管条目立即作废（会话里答完了/超时让渡了）：不能留着可点入口。
+  for (const [id, held] of [...questionHold.entries()]) {
+    if (pending.has(held.sessionId)) continue
+    log(`stale question dropped id=${id} session=${String(held.sessionId).slice(0, 12)} reason=no-waiter`)
+    held.settle('yield', undefined)
+  }
+  for (const [id, tap] of [...questionTap.entries()]) {
+    if (pending.has(id)) continue
+    if (nowMs - Number(tap?.at ?? 0) < 5_000) continue
+    questionTap.delete(id)
+    log(`stale question dropped id=question:${String(id).slice(0, 12)} reason=no-waiter`)
+  }
   const items = []
   for (const id of pending) {
     const tap = questionTap.get(id)
@@ -1064,7 +1239,16 @@ async function buildRadar(ctx) {
   const pendingAnswerIds = dshQuestions.pending
   const items = []
 
+  const runsById = new Map(runs.map((run) => [run.id, run]))
   for (const approval of approvals) {
+    // 僵尸审批/提问（用户现场 2026-11-19：胶囊停在一个永远点不动的「取消/回答」页）：
+    // 没有活 waiter、run 已终态、或子进程已死 → 一律判失效，不进 feed，也不给可点入口。
+    const staleReason = staleApprovalReason(approval, runsById)
+    if (staleReason !== null) {
+      log(`stale approval dropped id=${String(approval.id).slice(0, 12)} ` +
+        `run=${String(approval.runId ?? '-').slice(0, 12)} agent=${approval.agent ?? '-'} reason=${staleReason}`)
+      continue
+    }
     const kind = approvalKind(approval)
     items.push({
       kind,
@@ -1097,7 +1281,15 @@ async function buildRadar(ctx) {
   const orphanNoted = new Set()
   const ACTIVE_RUN = new Set(['running', 'starting', 'queued', 'needs-approval'])
   const superseded = supersededRuns()
+  const hiddenRuns = readHiddenRuns()
+  // 「返工中/待验收」必须是**有活动的**：verdict=needs_revision 只是历史裁决，不代表现在
+  // 真有一次重跑在跑（用户口径 2026-11-19：「依旧显示 codex 返工中，实际没有任何东西」）。
+  // 真发起返工时桥会起一条新 run（雷达账本记 retryOf）→ 旧行被 superseded 隐藏、新行显示
+  // 「进行中」，所以这里不存在「有活的续跑却仍是 rework」的行；剩下的 rework 一律按无活动处理。
+  const REVISION_TTL_MS = 30 * 60 * 1000
   for (const run of runs) {
+    // 双击/批量清掉的测试 run：永久不再出现在列表（不删桥的数据）。
+    if (hiddenRuns[run.id] !== undefined) continue
     // 只有两类 run 进面板：①正在跑/等批准的；②有任务契约、真的过闸判别的。
     // 无契约的历史 run（含接入判别层之前的测试 run）一律不进胶囊，避免面板被噪声灌满。
     if (superseded[run.id] === true) {
@@ -1153,11 +1345,45 @@ async function buildRadar(ctx) {
             : 'idle'
     }
     if (status === 'idle') continue
+    // 无活动的裁决态降级：返工要绑定活的续跑，待验收/未验证超过 30 分钟就当作历史噪声。
+    let note = null
+    const revisionAge = Date.now() - Number(run.updatedAt ?? 0)
+    if (status === 'rework') {
+      if (revisionAge > REVISION_TTL_MS) {
+        log(`rework stale run=${run.id.slice(0, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
+        continue
+      } else {
+        // 降级成「已完成」，但诚实说明：验收没过，也没有自动返工。
+        status = 'done'
+        note = '验收未通过，未自动返工'
+        log(`rework unbound run=${run.id.slice(0, 8)} -> done (no live continuation)`)
+      }
+    } else if (status === 'verifying' || status === 'unverified') {
+      if (revisionAge > REVISION_TTL_MS) {
+        log(`${status} stale run=${run.id.slice(0, 8)} ageMin=${Math.round(revisionAge / 60000)} -> hidden`)
+        continue
+      }
+      note = status === 'verifying' ? '等裁决（判别层没有回话）' : '没签验收契约，按完成处理'
+    }
+    // 判别层判「受阻」但没有可处置的审批/提问（用户现场：行上写「需你决定」，点开却没有任何可点项）：
+    // 这种 blocked 是历史裁决，不是真在等人 → 降级为 failed 并写明原因，交给失败动作页（重试/复制/清掉）。
+    if (status === 'blocked') {
+      const actionable = approvals.some((approval) => approval?.runId === run.id)
+      if (!actionable) {
+        status = 'failed'
+        reason = 'blocked-no-action'
+        error = '判别层判「受阻」，但没有可处置的审批或提问（blocked-no-action）'
+        log(`blocked-no-action run=${run.id.slice(0, 8)} -> failed`)
+      } else {
+        log(`blocked actionable run=${run.id.slice(0, 8)} approvals=1`)
+      }
+    }
     if (run.seen === true && (status === 'done' || status === 'failed' || status === 'unverified')) continue
-    if (status === 'failed') {
+    if (status === 'failed' && error === null) {
+      // 降级时已经写过的人话原因（blocked-no-action 等）优先，别再被 run.error 覆盖掉。
       error = clipError(run.error) ?? clipError(lastRunErrorText(run.id)) ?? clipError(reasonText(reason)) ?? null
     }
-    items.push({ ...run, kind: 'run', status, reason, error })
+    items.push({ ...run, kind: 'run', status, reason, error, note })
   }
   // 会话完成后的保留：running→idle 的瞬间记一笔，60 分钟内且没看过就留在胶囊里可点。
   const TRACK_FILE = trackFile()
@@ -1205,7 +1431,26 @@ async function buildRadar(ctx) {
       delete track.running[id]
     }
   }
+  // DSH 事实优先：会话又跑起来 / 用户在它里面说过话 / 行已经消失 ⇒ 视为「已消费」，清掉自记未读。
+  const sessionById = new Map()
+  for (const item of sessions.items) {
+    if (item.kind === 'session' && typeof item.id === 'string') sessionById.set(item.id, item)
+  }
   for (const [id, at] of Object.entries(track.finished)) {
+    const finishedAtMs = Number(track.finishedAt[id] ?? at)
+    const row = sessionById.get(id)
+    const lastPrompt = row?.lastPromptAt
+    let clearSource = null
+    if (row === undefined) clearSource = 'dsh-gone'
+    else if (row.status === 'running') clearSource = 'dsh-running'
+    else if (Number.isFinite(lastPrompt) && lastPrompt > finishedAtMs) clearSource = 'dsh-prompt'
+    if (clearSource !== null) {
+      log(`session unread clear id=${id} source=${clearSource}`)
+      delete track.finished[id]
+      delete track.finishedAt[id]
+      delete track.started[id]
+      continue
+    }
     if (nowMs - Number(at) > FINISHED_KEEP_MS || seenSet.has(id)) {
       delete track.finished[id]
       delete track.started[id]
@@ -1213,12 +1458,22 @@ async function buildRadar(ctx) {
       continue
     }
     const title = track.titles[id] ?? id
+    // startedAt 是「第一次看到这个会话在跑」的时间，不是本次任务的开始时间：历史会话可能
+    // 落后几百上千小时，详情里算「耗时」会算出 3000+ 小时这种噪声（用户 2026-11-19 报）。
+    // 只有差值落在可解释的窗口内（≤6 小时）才把它当作本次耗时，否则不下发 startedAt，
+    // 让详情只显示「完成于 <相对时间>」。
+    const doneAtMs = track.finishedAt[id] ?? Number(at)
+    const startedAtMs = track.started[id]
+    const observedMs = Number.isFinite(startedAtMs) ? doneAtMs - Number(startedAtMs) : NaN
+    const usableStarted = Number.isFinite(observedMs) && observedMs > 0 && observedMs <= 6 * 60 * 60 * 1000
+      ? startedAtMs
+      : undefined
     items.push({
       kind: 'session',
       id,
       title,
-      startedAt: track.started[id],
-      finishedAt: track.finishedAt[id] ?? Number(at),
+      startedAt: usableStarted,
+      finishedAt: doneAtMs,
       status: 'done',
       agent: 'dsh',
       updatedAt: Number(at),
@@ -1530,7 +1785,16 @@ function radarRoute(ctx) {
     }
 
     if (tail === 'health') {
-      return new Response(JSON.stringify({ ok: true, clientHalf: clientHalfState(), host: { port: STATE_PORT ?? null, dir: STATE_DIR } }), {
+      // `clientLive`：宿主此刻是否有活着的 Web 客户端。R-03/U-04 的判据要用它区分
+      // 「页面没在轮询」和「压根没人打开页面」——后者不该记成产品缺陷（t14 门禁收紧项）。
+      const clientHalf = clientHalfState()
+      const clientLive = hasLiveWebClient(ctx) === true
+      return new Response(JSON.stringify({
+        ok: true,
+        clientLive,
+        clientHalf,
+        host: { port: STATE_PORT ?? null, dir: STATE_DIR, clientBuild: CLIENT_BUILD || null },
+      }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
@@ -1553,12 +1817,16 @@ function radarRoute(ctx) {
     }
     if (tail === 'jump-pending') {
       // 页面侧的 client 半来取；超过 15 秒的请求视为过期，不再打扰用户。
-      let body = { sessionId: null }
+      let body = { sessionId: null, reload: lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD }
       for (const path of jumpCandidatePaths()) {
         try {
           const raw = JSON.parse(readFileSync(path, 'utf8'))
           if (raw && typeof raw.sessionId === 'string' && Date.now() - Number(raw.at ?? 0) < 15000) {
-            body = { sessionId: raw.sessionId, mailbox: path === jumpFile() ? 'host' : 'legacy' }
+            body = {
+              sessionId: raw.sessionId,
+              mailbox: path === jumpFile() ? 'host' : 'legacy',
+              reload: lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD,
+            }
             break
           }
         } catch {}
@@ -1686,17 +1954,56 @@ function radarRoute(ctx) {
         .split(',')
         .map((s) => s.trim())
         .filter((s) => s.length > 0)
-      if (ids.length > 0) {
-        const seen = readSeen()
-        const now = Date.now()
-        for (const id of ids) seen[id] = now
-        try {
-          mkdirSync(STATE_DIR, { recursive: true })
-          writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
-        } catch {}
-        invalidateSnapshot()
+      if (ids.length === 0) {
+        return new Response(JSON.stringify({ ok: false, error: 'id is required' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
       }
-      return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } })
+      const seen = readSeen()
+      const now = Date.now()
+      for (const id of ids) seen[id] = now
+      let persisted = true
+      try {
+        mkdirSync(STATE_DIR, { recursive: true })
+        writeFileSync(seenFile(), JSON.stringify(seen, null, 2))
+      } catch (error) {
+        persisted = false
+        log(`markSeen failed ids=${ids.length} error=${error?.message ?? error}`)
+      }
+      // 回读校验：写没写进去用户看不出来（现场：点了「已完成」行，刷新后还在），所以必须自证。
+      const reread = persisted ? readSeen() : {}
+      const missing = ids.filter((id) => reread[id] === undefined)
+      // 会话完成条目置读后同步从 radar-sessions.json 删掉，不然 feed 与账本各说各话。
+      let trackRemoved = 0
+      if (persisted) {
+        try {
+          const file = trackFile()
+          const saved = JSON.parse(readFileSync(file, 'utf8'))
+          for (const id of ids) {
+            if (saved.finished?.[id] !== undefined) {
+              delete saved.finished[id]
+              delete saved.started[id]
+              delete saved.finishedAt[id]
+              trackRemoved += 1
+            }
+          }
+          writeFileSync(file, JSON.stringify(saved))
+        } catch {}
+      }
+      if (persisted) log(`markSeen ok ids=${ids.length} track=${trackRemoved}`)
+      if (missing.length > 0) log(`markSeen failed ids=${missing.length} missing=${missing.slice(0, 3).join(',')}`)
+      invalidateSnapshot()
+      return new Response(JSON.stringify({
+        ok: persisted && missing.length === 0,
+        marked: ids.length,
+        verified: missing.length === 0,
+        missing,
+        track: trackRemoved,
+      }), {
+        status: persisted ? 200 : 500,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
     }
     if (tail === 'retry') {
       // 失败行的「重试」：用同一个 prompt/agent/cwd 重新起一个 run。
@@ -1789,6 +2096,38 @@ function radarRoute(ctx) {
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
     }
+    if (tail === 'jobs') {
+      // 排障：后台 job 的观察状态（订阅是否装上、哪些会话还有活 job）。
+      const want = url.searchParams.get('session') ?? ''
+      const live = [...liveJobs.entries()].map(([owner, count]) => ({ session: owner, jobs: count }))
+      const probe = want === '' ? null : { session: want, jobs: liveJobCount(ctx, want, [want]) }
+      return new Response(JSON.stringify({ ok: true, subscription: jobsSubscription, live, probe }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+    if (tail === 'purge-tests') {
+      // 用户口径（2026-11-19）：自测用的 run（`只回答两个字：可以` 这类）不能长期占据列表。
+      // 只藏不删：桥的数据保持原样，雷达层写 hidden-runs.json 永久过滤。
+      const runs = bridgeRuns()
+      const patterns = ['只回答两个字', 'selftest', 'testproc', 'staletest']
+      const custom = String(url.searchParams.get('match') ?? '').trim()
+      if (custom !== '') patterns.push(custom)
+      const hit = []
+      for (const run of runs) {
+        if (readHiddenRuns()[run.id] !== undefined) continue
+        const title = typeof run.title === 'string' ? run.title : ''
+        if (!patterns.some((pattern) => title.includes(pattern))) continue
+        hideRun(run.id)
+        hit.push(run.id)
+      }
+      invalidateSnapshot()
+      log(`purge-tests matched=${hit.length} patterns=${patterns.join('|')}`)
+      return new Response(JSON.stringify({ ok: true, hidden: hit.length, runs: hit }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
     if (tail === 'clear-done') {
       // t14 bug 4：「清除已完成」= 全部标已读 + 清掉会话 finished 记账，
       // 否则下次重启 radar-sessions.json 里的 finished 会再把 done 行放回来。
@@ -1846,11 +2185,27 @@ function radarRoute(ctx) {
 // 客户端半边是否真的加载过：0.8.0 的整合包漏掉 client.js 时，HUD 点了行只会
 // 写信箱没人消费，所以 jump 的日志里要能看出「页面侧在不在」（R-01 诊断）。
 let clientBeacons = 0
+let lastClientBuild = ''
 let lastClientBeaconAt = 0
 
 // client 半边（页面里跑的 client.js 战报）是否真的在轮询。宿主刚起来的前 30s
 // 页面可能还没重载完成，所以 active 的判定要带启动宽限（N-14 / PRD 2.22）。
 const HOST_BOOT_AT = Date.now()
+// 页面侧 client 半的构建指纹：由 scripts/sync-suite-bundle.sh 在打包时把 __RADAR_CLIENT_BUILD__
+// 替换成 client.js 自己的 sha256。页面 beacon 回传它，宿主就能判断「这个页面加载的还是旧 bundle」，
+// 从而让页面自己 location.reload()（自愈），并在 HUD 上给一次可见提示。
+const CLIENT_BUILD = (() => {
+  // 打包时由 scripts/sync-suite-bundle.sh 写出的 sidecar（client.js 里注入的就是这个值）。
+  // 不能在这里现算 client.js 的 sha：文件里嵌着这个值，会自引用。
+  try {
+    const path = fileURLToPath(new URL('./client-build.json', import.meta.url))
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    return typeof parsed?.build === 'string' ? parsed.build.slice(0, 16) : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
+
 const CLIENT_BEACON_STALE_MS = Number(process.env.DSH_TASK_RADAR_CLIENT_STALE_MS) > 0 ? Number(process.env.DSH_TASK_RADAR_CLIENT_STALE_MS) : 30000
 const JUMP_ACK_TIMEOUT_MS = Number(process.env.DSH_TASK_RADAR_JUMP_ACK_MS) > 0 ? Number(process.env.DSH_TASK_RADAR_JUMP_ACK_MS) : 8000
 
@@ -1867,6 +2222,10 @@ function clientHalfState() {
     sinceBootMs: sinceBoot,
     staleAfterMs: CLIENT_BEACON_STALE_MS,
     beacons: clientBeacons,
+    build: lastClientBuild || null,
+    hostBuild: CLIENT_BUILD,
+    // 页面加载的是旧 bundle（指纹不一致）→ 需要整页重载才能恢复跳转能力。
+    reload: lastClientBuild !== '' && lastClientBuild !== CLIENT_BUILD,
     hint: fresh || booting ? null : '跳转需重载页面（client 半边没在轮询）',
   }
 }
@@ -1903,15 +2262,21 @@ function jumpById(id) {
 function beaconResponse(url) {
   const event = url.searchParams.get('e') ?? 'unknown'
   const detail = url.searchParams.get('d') ?? ''
+  const build = (url.searchParams.get('b') ?? '').slice(0, 32)
   if (event.startsWith('client.') || event === 'apply') {
     clientBeacons += 1
     lastClientBeaconAt = Date.now()
+    if (build && build !== lastClientBuild) {
+      lastClientBuild = build
+      log(`client build=${build} host=${CLIENT_BUILD} ${build === CLIENT_BUILD ? 'match' : 'stale → 需要整页重载'}`)
+    }
   }
   log(`client.${event}${detail ? ` ${detail}` : ''}`)
-  return new Response('ok', {
-    status: 200,
-    headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' },
-  })
+  // 页面收到 stale 就在自己这一侧重载（旧 bundle 的 client 半没有这段逻辑，所以第一次升级仍需手动刷新一次；
+  // 之后每次升级都能自愈）。
+  const headers = { 'content-type': 'text/plain', 'cache-control': 'no-store' }
+  if (build && build !== CLIENT_BUILD) headers['x-radar-reload'] = '1'
+  return new Response('ok', { status: 200, headers })
 }
 
 
@@ -2190,6 +2555,16 @@ export function apply(ctx) {
     }
   } else {
     log('question tap unavailable ctx.on')
+  }
+  // 后台 job 生命周期：订阅失败只是少了「后台任务算进行中」，不影响 feed。
+  if (typeof ctx?.effect === 'function') {
+    try {
+      ctx.effect(() => watchJobs(ctx))
+    } catch (error) {
+      log(`job watch effect failed ${error?.message ?? error}`)
+    }
+  } else {
+    watchJobs(ctx)
   }
   ctx.effect(() => {
     let bound

@@ -11,7 +11,7 @@
  * is loaded through `window.__ModuleLoader__` and shares the page's runtime.
  */
 window.__ModuleLoader__.load({
-  id: '@pawsey0319/dsh-agent-suite',
+  id: '@local/dsh-task-radar',
   factory(require) {
     const POLL_MS = 1200
 
