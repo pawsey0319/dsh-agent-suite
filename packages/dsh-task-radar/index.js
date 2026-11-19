@@ -76,6 +76,64 @@ function migrateLegacyState(dir) {
   }
 }
 
+// 跨端口迁移的用户态文件：宿主端口每次重启都会变（51164→62044→62212→53574…），
+// 只按根目录迁移会把「胶囊位置 / 隐藏名单 / 重试记录」全丢掉，用户看到的是窗口跳回默认位。
+const INHERIT_FILES = [
+  'hud-window.json',
+  'hidden-runs.json',
+  'hidden-sessions.json',
+  'retries.json',
+  'seen.json',
+  'radar-sessions.json',
+]
+
+/** 新宿主目录首次出现时，从最近活跃的兄弟宿主目录继承上面这些用户态文件。 */
+function migrateSiblingState(dir) {
+  let siblings = []
+  try {
+    siblings = readdirSync(HOSTS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && join(HOSTS_DIR, entry.name) !== dir)
+      .map((entry) => {
+        const base = join(HOSTS_DIR, entry.name)
+        return { port: entry.name, base, mtime: fileMtime(base) }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+  } catch {
+    return
+  }
+  if (siblings.length === 0) return
+  // 逐文件选源：最新兄弟目录可能只写过一个文件，所以每个文件各自找「最近写过它的那个目录」。
+  const copied = []
+  const sources = new Set()
+  for (const name of INHERIT_FILES) {
+    const target = join(dir, name)
+    if (existsSync(target)) continue
+    const source = siblings.find((item) => existsSync(join(item.base, name)))
+    if (!source) continue
+    try {
+      copyFileSync(join(source.base, name), target)
+      copied.push(name)
+      sources.add(source.port)
+    } catch (error) {
+      log(`state.inherit.failed ${name} from=${source.port} ${String(error && error.message ? error.message : error)}`)
+    }
+  }
+  if (copied.length > 0) {
+    log(`state migrated from=${[...sources].join('+')} files=${copied.join(',')}`)
+  }
+}
+
+/** 目录的活跃度代理值：radar-url.json / seen.json / hud.pid 三者里最新的 mtime。 */
+function fileMtime(base) {
+  let score = 0
+  for (const name of ['radar-url.json', 'seen.json', 'hud.pid']) {
+    try {
+      score = Math.max(score, statSync(join(base, name)).mtimeMs)
+    } catch {}
+  }
+  return score
+}
+
 /** 端口就绪后把状态目录切到 hosts/<port>/；重复调用是幂等的。 */
 function useHostState(port) {
   if (!Number.isFinite(port) || port <= 0) return STATE_DIR
@@ -88,6 +146,7 @@ function useHostState(port) {
     return STATE_DIR
   }
   migrateLegacyState(dir)
+  migrateSiblingState(dir)
   STATE_DIR = dir
   STATE_PORT = port
   log(`state.host port=${port} dir=${dir}`)
