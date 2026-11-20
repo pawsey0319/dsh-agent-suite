@@ -36,6 +36,7 @@ DSH 桌面右上角的常驻胶囊：把「DSH 会话在跑什么」和「Agent 
 | `--scroll-probe dy` | 造一次滚轮事件 | `scroll probe dy=… row=a->b` |
 | `--answer-probe request,token,qid=label` | 走真实回执写回请求（须 `--url` 模式） | `[answer] submit ok` / `submitted failed body=…` |
 | `--click-delay ms` | `--click-probe` 的触发延迟（默认 350；测「点击→面板」用 1500） | 配合 `--click-probe` |
+| `--m9-bench <file\|synthetic:N>` | 十万事件详情走真实管线，量主线程开销（t12 / M9） | `m9 n=… apply_main=…ms first_screen=…ms loading_paint=…ms scroll_p95=…ms` |
 | `--route-probe <name>` | 用 feed 基址请求 `/<name>` 后自退（验地址前缀） | `route probe name=… url=… status=… bytes=… body=…` |
 | `--grace-probe recent\|stale` | 验「点击后 800ms 内不收起」的宽限判据 | `collapse deferred reason=recent-click` / `collapse reason=cursor-outside` |
 

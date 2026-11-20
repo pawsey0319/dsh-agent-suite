@@ -332,6 +332,8 @@ private struct RadarItem: Decodable {
     var staleApproval: Bool?
     var runId: String?
     var childCount: Int?
+    /// 父会话 id：主列表只有顶层会话（为空），子会话行从 children 页带上来（t12 跳转语义）。
+    var parentId: String?
     var team: Bool?
     var children: [RadarChild]?
     var verdict: String?
@@ -366,7 +368,7 @@ private struct RadarItem: Decodable {
     var note: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, agent, title, status, finalAnswer, seen, updatedAt, approvalId, childCount, team, children
+        case id, kind, agent, title, status, finalAnswer, seen, updatedAt, approvalId, childCount, parentId, team, children
         case verdict, round, missing, path, approvalToken, runId, formatStatus, stages, startedAt, finishedAt, stale, questions
         case answerRequest, answerToken, answerExpiresInMs
         case error, priority, count, pidAlive, runningBy, jobs, note
@@ -384,6 +386,7 @@ private struct RadarItem: Decodable {
         updatedAt = try? c.decodeIfPresent(Int64.self, forKey: .updatedAt)
         approvalId = try? c.decodeIfPresent(String.self, forKey: .approvalId)
         childCount = try? c.decodeIfPresent(Int.self, forKey: .childCount)
+        parentId = try? c.decodeIfPresent(String.self, forKey: .parentId)
         team = try? c.decodeIfPresent(Bool.self, forKey: .team)
         children = try? c.decodeIfPresent([RadarChild].self, forKey: .children)
         verdict = try? c.decodeIfPresent(String.self, forKey: .verdict)
@@ -821,6 +824,8 @@ private struct Options {
     var scrollProbe: CGFloat?
     /// `--answer-probe request,token,qid=label`：直接跑一次回执写回请求后自退（验证 HUD→插件通道）。
     var answerProbe: String?
+    /// M9 自检：把一份 10 万事件的 events JSON 走**真实**详情管线，量主线程阻塞（t12）。
+    var m9Bench: String?
     /// `--decide-probe <approvalId>`：拿一个（通常已失效的）审批 id 走一遍拒绝，
     /// 验证「服务端不确认也要本地收页」这条路径（用户现场：点取消没反应、胶囊卡在桌面）。
     var decideProbe: String?
@@ -930,6 +935,12 @@ private struct Options {
                     return (opts, 2)
                 }
                 opts.answerProbe = v
+            case "--m9-bench":
+                guard let v = value(for: flag, inline: inline), !v.isEmpty else {
+                    log("error: --m9-bench 需要事件 JSON 文件路径（或 synthetic:N）")
+                    return (opts, 2)
+                }
+                opts.m9Bench = v
             case "--decide-probe":
                 guard let v = value(for: flag, inline: inline), !v.isEmpty else {
                     log("error: --decide-probe 需要 approvalId")
@@ -3046,6 +3057,100 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         super.init()
     }
 
+    // MARK: M9 自检（t12）
+
+    /// 把一份事件 JSON 走**真实**详情管线，量「后台解析/建行」与「主线程交接+首屏」。
+    ///
+    /// M9 的验收对象是主线程阻塞：`JSONSerialization` 与 `eventLine` 必须在后台队列完成，
+    /// 主线程只做一次数组交接与首屏绘制（虚拟化只画 `eventVisibleRows` 行）。
+    /// 输出一行可被门禁/PR 引用：`m9 n=… parse_bg=…ms rows_bg=…ms apply_main=…ms first_screen=…ms`
+    private func runM9Bench(_ spec: String) {
+        var payloadIn: [[String: Any]] = []
+        var readMs = 0.0
+        if spec.hasPrefix("synthetic:") {
+            let n = Int(spec.dropFirst("synthetic:".count)) ?? 100_000
+            payloadIn = (0..<n).map { index in
+                ["i": index,
+                 "type": "item.completed",
+                 "ts": 1_764_000_000_000 + index,
+                 "agent": "codex",
+                 "text": "事件 #\(index) 的正文内容，用来模拟十万事件的真实体量"]
+            }
+        } else {
+            let t = DispatchTime.now()
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: spec)) else {
+                log("m9 error=read-failed file=\(spec)")
+                exit(2)
+            }
+            readMs = Self.millis(since: t)
+            // 解析原始 JSON 也在后台队列里——和 fetchRunDetail 的 dataTask 回调同一性质。
+            let parseStart = DispatchTime.now()
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            payloadIn = obj["events"] as? [[String: Any]] ?? []
+            log(String(format: "m9 parse_json_bg=%.1fms bytes=%d", Self.millis(since: parseStart), data.count))
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let rowsStart = DispatchTime.now()
+            var lines: [RadarEventLine] = []
+            lines.reserveCapacity(payloadIn.count)
+            for event in payloadIn { lines.append(self.eventLine(from: event)) }
+            let rowsMs = Self.millis(since: rowsStart)
+
+            DispatchQueue.main.async {
+                // M9-c：先让用户看到「加载中」页（首屏），数据到了再增量填充。
+                let loadingStart = DispatchTime.now()
+                var loading = RadarDetail(title: "M9 bench", agent: "bench", meta: "加载中…", body: "")
+                loading.runStatus = "running"
+                self.detail = loading
+                self.detailMode = .events
+                self.panelContent?.detail = loading
+                self.panelContent?.detailMode = .events
+                self.setExpanded(true, animated: false)
+                self.refreshExpandedGeometry(animated: false)
+                self.panelContent?.needsDisplay = true
+                self.panelContent?.displayIfNeeded()
+                let loadingPaintMs = Self.millis(since: loadingStart)
+
+                let applyStart = DispatchTime.now()
+                var benchDetail = RadarDetail(title: "M9 bench", agent: "bench",
+                                              meta: "\(lines.count) 事件", body: "")
+                benchDetail.events = lines
+                benchDetail.runStatus = "done"
+                self.detail = benchDetail
+                self.detailMode = .events
+                self.panelContent?.detail = benchDetail
+                self.panelContent?.detailMode = .events
+                self.setExpanded(true, animated: false)
+                self.refreshExpandedGeometry(animated: false)
+                self.panelContent?.needsDisplay = true
+                self.panelContent?.displayIfNeeded()
+                let firstScreenMs = Self.millis(since: applyStart)
+
+                // 滚动帧：连续滚 20 次，每次都 force display，取最慢一帧近似 p95。
+                var frames: [Double] = []
+                for _ in 0..<20 {
+                    let f = DispatchTime.now()
+                    self.panelContent?.scrollEvents(by: -3)
+                    self.panelContent?.displayIfNeeded()
+                    frames.append(Self.millis(since: f))
+                }
+                frames.sort()
+                let p95 = frames.isEmpty ? 0 : frames[min(frames.count - 1, Int(Double(frames.count) * 0.95))]
+
+                log(String(format: "m9 n=%d parse_bg=%.1fms rows_bg=%.1fms apply_main=%.1fms first_screen=%.1fms loading_paint=%.1fms scroll_p95=%.2fms read=%.1fms",
+                           lines.count, 0.0, rowsMs, firstScreenMs, firstScreenMs, loadingPaintMs, p95, readMs))
+                self.cleanup()
+                exit(0)
+            }
+        }
+    }
+
+    static func millis(since start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e6
+    }
+
     // MARK: 启动
 
     func start() {
@@ -3147,6 +3252,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
         if let id = options.decideProbe {
             runDecideProbe(id)
+        }
+
+        // t12 M9 自检：只量「十万事件详情」的主线程开销，不进入常规轮询（bench 自己 exit）。
+        if let spec = options.m9Bench {
+            runM9Bench(spec)
+            return
         }
 
         startPolling()
@@ -5082,7 +5193,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                             backToEvents()
                         } else if detailMode == .children,
                                   let id = panelContent.childRowId(at: local) {
-                            // 点某个子会话 = 进子会话详情页；那一页右下角才是「跳到会话」。
+                            // t12：子 agent 行只在主点击路径上**展示信息**（角色/标题/状态/token），
+                            // 不跳转；要跳是次级动作（子详情页右下角「跳到会话」）。
+                            log("child row info-only id=\(self.shortId(id))")
                             openChildDetail(id)
                         }
                     }
@@ -5396,12 +5509,32 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if item.isApproval || item.isQuestion {
             openApproval((id: item.id ?? "", approvalId: item.approvalId ?? ""))
         } else if item.kind == "session" {
-            // 规则 A/B：不管进行中还是已完成，会话行都进会话详情（子会话列表 + 右下角跳到会话）。
-            // 已完成的行点开就置读：否则用户看完回来那行还在（现场 bug 2）。写入结果由 markSeen 自证。
+            // t12 跳转语义（用户 2026-11-19）：会话行**主点击就是跳回主会话**，
+            // 子 agent 的会话窗口不是用户要去的地方。看详情是次级动作：按住 ⌥ 再点。
+            // 已完成行先置读再跳（否则跳过去回来那行还在，现场 bug 2）。
+            let optionHeld = event?.modifierFlags.contains(.option) ?? false
             if item.status == "done", let id = item.id {
                 markSeen([id])
             }
-            openSessionDetail(item)
+            if optionHeld {
+                log("session row open detail (option) id=\(self.shortId(item.id ?? ""))")
+                openSessionDetail(item)
+            } else {
+                // t12：主点击一律跳回**顶层**会话。行上有父 id 就跳父；父 id 指向的会话
+                // 已经不在列表里（被归档/回收）就跳自身，并留 jump parent-missing 证据。
+                let selfId = item.id ?? ""
+                let parentId = item.parentId ?? ""
+                var target = selfId
+                if !parentId.isEmpty {
+                    if self.state.items.contains(where: { $0.id == parentId }) {
+                        target = parentId
+                    } else {
+                        log("jump parent-missing id=\(self.shortId(selfId)) parent=\(self.shortId(parentId)) -> self")
+                    }
+                }
+                log("jump session from-row id=\(self.shortId(target)) self=\(self.shortId(selfId)) kind=\(item.kind ?? "-") status=\(item.status ?? "-")")
+                jumpToSession(target)
+            }
         } else if let id = item.id, item.isArtifact, let path = item.path {
             openArtifact(path)
             _ = id
