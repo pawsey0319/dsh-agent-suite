@@ -80,6 +80,14 @@ private enum HUD {
     static let pillFontSize: CGFloat = 12.5
     static let pillChromeWidth: CGFloat = pillPadding + pillDot + pillGap + pillGap + pillIcon + pillPadding
 
+    /// 九态状态色（t4 §2.2）。只允许出现在点 / 环 / 描边(40%) / 右图标上，不得整条填充。
+    static let questionColor = NSColor(calibratedRed: 1.0, green: 0.839, blue: 0.039, alpha: 1)      // #FFD60A
+    static let approvalColor = NSColor(calibratedRed: 1.0, green: 0.478, blue: 0.102, alpha: 1)      // #FF7A1A
+    static let blockedColor = NSColor(calibratedRed: 1.0, green: 0.392, blue: 0.510, alpha: 1)       // #FF6482
+    static let failedColor = NSColor(calibratedRed: 1.0, green: 0.271, blue: 0.227, alpha: 1)        // #FF453A
+    static let reworkColor = NSColor(calibratedRed: 0.749, green: 0.353, blue: 0.949, alpha: 1)      // #BF5AF2
+    static let verifyingColor = NSColor(calibratedRed: 0.039, green: 0.518, blue: 1.0, alpha: 1)     // #0A84FF
+
     /// 圆形徽标所占的带状区域：12 上留白 + 56 圆 + 12 下留白。
     static let bandHeight: CGFloat = edgeMargin + circleSize + edgeMargin
     static let contentPadding: CGFloat = 12
@@ -249,9 +257,15 @@ private struct RadarCounts: Decodable {
     var failed = 0
     var doneUnread = 0
     var autoConfirmed = 0
+    /// 九态里的三态（U-13）：待验收 / 返工中 / 卡住。老宿主没有这些字段时一律按 0，
+    /// 由 UI 侧再从 items 的 status 兜底（§0.4「缺失按 0、不推断」）。
+    var verifying = 0
+    var rework = 0
+    var blocked = 0
 
     private enum CodingKeys: String, CodingKey {
         case pending, running, approvals, questions, failed, doneUnread, autoConfirmed
+        case verifying, rework, blocked
     }
 
     init() {}
@@ -265,6 +279,9 @@ private struct RadarCounts: Decodable {
         failed = RadarCounts.int(c, .failed)
         doneUnread = RadarCounts.int(c, .doneUnread)
         autoConfirmed = RadarCounts.int(c, .autoConfirmed)
+        verifying = RadarCounts.int(c, .verifying)
+        rework = RadarCounts.int(c, .rework)
+        blocked = RadarCounts.int(c, .blocked)
     }
 
     private static func int(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Int {
@@ -541,6 +558,17 @@ private struct RenderState {
     var items: [RadarItem] = []
     /// 宿主给的完整未读完成 id 清单（与 items 的 12 行截断无关），通知/清理共用它。
     var doneUnreadIds: [String] = []
+    /// 九态里的三态（U-13）。feed 没给（老宿主/测试 fixture）时按 items.status 兜底，
+    /// 绝不把这三态「推断」成 running/failed —— 那正是 R-06 判 FAIL 的原因。
+    var verifying = 0
+    var rework = 0
+    var blocked = 0
+
+    var blockedCount: Int { blocked > 0 ? blocked : items.filter { $0.status == "blocked" }.count }
+    var reworkCount: Int { rework > 0 ? rework : items.filter { $0.status == "rework" }.count }
+    var verifyingCount: Int {
+        verifying > 0 ? verifying : items.filter { $0.status == "verifying" || $0.status == "unverified" }.count
+    }
 
     /// 大数字口径 = 正在进行的顶层会话数（不含子智能体/子会话）。
     var taskCount: Int { running }
@@ -1260,6 +1288,11 @@ private final class CircleBadgeView: PassthroughView {
         if state.offline { return .none }
         if state.questions > 0 { return .gap }
         if state.approvals > 0 { return .double }
+        // 九态（U-13）：blocked 复用缺口环（红）、rework 复用双环（紫）、verifying 复用实心环（蓝）。
+        // 形态与颜色组合后三态彼此可分，也不与 question/approval/done 撞车。
+        if state.blockedCount > 0 { return .gap }
+        if state.reworkCount > 0 { return .double }
+        if state.verifyingCount > 0 { return .solid }
         if state.doneUnread > 0 { return .solid }
         return .none
     }
@@ -1367,9 +1400,17 @@ private final class CircleBadgeView: PassthroughView {
         case state.offline:
             accent = nil
         case state.questions > 0:
-            accent = .systemYellow
+            accent = HUD.questionColor
         case state.approvals > 0:
-            accent = .systemRed
+            accent = HUD.approvalColor
+        case state.blockedCount > 0:
+            accent = HUD.blockedColor
+        case state.failed > 0:
+            accent = HUD.failedColor
+        case state.reworkCount > 0:
+            accent = HUD.reworkColor
+        case state.verifyingCount > 0:
+            accent = HUD.verifyingColor
         case state.doneUnread > 0:
             accent = .systemGreen
         default:
@@ -1545,7 +1586,7 @@ private final class PanelContentView: PassthroughView {
     }
 
     /// 详情底部按钮的点击区域。
-    private var detailActionHits: [(rect: NSRect, action: DetailAction)] = []
+    fileprivate var detailActionHits: [(rect: NSRect, action: DetailAction)] = []
     /// 当前提问的可点选项：label 与它所属 questionId，点选后回执 {qid: label}（2.20）。
     var questionChoices: [(questionId: String, label: String)] = []
     /// 当前详情是不是「提问」类（无选项时把底部按钮换成「回复 / 取消」）。
@@ -1554,7 +1595,14 @@ private final class PanelContentView: PassthroughView {
     var questionIdFallback: String?
     /// 提问页按「问题」分组渲染：每个问题先出正文，再出它自己的选项芯片；
     /// 没有选项的问题额外给一个「自由回答」入口（用户口径 2026-11-19：不能只弹输入框、看不到问题）。
-    var questionBlocks: [(id: String, text: String, options: [String], free: Bool)] = []
+    var questionBlocks: [(id: String, text: String, options: [String], free: Bool,
+                          degraded: Bool, multi: Bool)] = []
+    /// 每问已选的 label（多选可多个）：用于「● 」高亮，也是 U-18 一次性提交的数据源。
+    var questionPicked: [String: [String]] = [:]
+    /// 多问/多选时底部要不要画「✓ 提交回答」行（U-18 / §3.3-a）。
+    var showsSubmitRow = false
+    /// 提交成功后的「已提交 · 不可撤回」提示（U-24）：非 nil 时整页只画这一行且不再响应点击。
+    var submittedNotice: String?
     /// 与 questionBlocks 一一对应：这个块有没有可点的自由回答入口（用来算 action 索引）。
     var questionFreeHits: [(rect: NSRect, block: Int)] = []
 
@@ -2069,6 +2117,40 @@ private final class PanelContentView: PassthroughView {
             in: NSRect(x: padding, y: headerY + 10, width: 200, height: 18),
             withAttributes: titleAttrs)
 
+        // U-24：提交成功后只留这一行，并且**不再提供任何可点动作**（不可撤回）。
+        if let notice = submittedNotice {
+            detailActionHits = []
+            questionFreeHits = []
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.96),
+                .paragraphStyle: para,
+            ]
+            (notice as NSString).draw(
+                in: NSRect(x: padding, y: bounds.midY - 10, width: bounds.width - 2 * padding, height: 20),
+                withAttributes: attrs)
+            return
+        }
+
+        // 多问时右上角给进度（§3.3-a）：第 k/N 问，k = 已答数 + 1。
+        let total = questionBlocks.count
+        if total > 1 {
+            let answered = questionBlocks.filter { !(questionPicked[$0.id] ?? []).isEmpty }.count
+            let progress = "第 \(min(answered + 1, total))/\(total) 问"
+            let para = NSMutableParagraphStyle()
+            para.alignment = .right
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.72),
+                .paragraphStyle: para,
+            ]
+            (progress as NSString).draw(
+                in: NSRect(x: bounds.width - padding - 90, y: headerY + 10, width: 90, height: 18),
+                withAttributes: attrs)
+        }
+
         var y = headerY - 4
         questionFreeHits = []
         var chipIndex = 0
@@ -2084,27 +2166,55 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.90),
         ]
+        let degradeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
+            .foregroundColor: HUD.questionColor.withAlphaComponent(0.92),
+        ]
         let multi = questionBlocks.count > 1
         for (bi, block) in questionBlocks.enumerated() {
             if y < HUD.contentPadding + 52 { break }
             let text = block.text.isEmpty ? "（这一题没有正文）" : block.text
-            let label = (multi ? "\(bi + 1)) \(text)" : text) as NSString
+            let head = multi ? "\(bi + 1)) \(text)" : text
             let para = NSMutableParagraphStyle()
             para.lineBreakMode = .byTruncatingTail
             para.lineSpacing = 1.5
             var attrs = blockAttrs
             attrs[.paragraphStyle] = para
-            label.draw(with: NSRect(x: padding, y: y - 30, width: bounds.width - 2 * padding, height: 32),
-                       options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
+            (head as NSString).draw(
+                with: NSRect(x: padding, y: y - 30, width: bounds.width - 2 * padding, height: 32),
+                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
             y -= 34
 
+            // U-40：没有 options 的提问不能就地作答（自由输入属 K3）。
+            // 旧实现在这里给「自由回答」芯片，用户点开只看到一个输入框，等于谎报能力。
+            if block.degraded {
+                ("该问题只能到会话里回答" as NSString).draw(
+                    in: NSRect(x: padding + 2, y: y - 16, width: bounds.width - 2 * padding - 4, height: 16),
+                    withAttributes: degradeAttrs)
+                y -= 20
+                let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 20)
+                let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+                NSColor.systemBlue.withAlphaComponent(0.26).setFill()
+                path.fill()
+                ("→ 打开会话" as NSString).draw(
+                    in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
+                    withAttributes: chipAttrs)
+                detailActionHits.append((rect: rect, action: .jumpSession))
+                log("no-options degrade qid=\(block.id) action=open-session")
+                y -= 30
+                continue
+            }
+
+            let picked = questionPicked[block.id] ?? []
             for option in block.options {
                 if y < HUD.contentPadding + 52 { break }
                 let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 20)
                 let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
-                NSColor.systemBlue.withAlphaComponent(0.30).setFill()
+                let chosen = picked.contains(option)
+                (chosen ? HUD.questionColor.withAlphaComponent(0.34) : NSColor.systemBlue.withAlphaComponent(0.30)).setFill()
                 path.fill()
-                ("· \(option)" as NSString).draw(
+                let mark = chosen ? "● " : "· "
+                ((mark + option) as NSString).draw(
                     in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
                     withAttributes: chipAttrs)
                 if questionChoices.indices.contains(chipIndex) {
@@ -2125,6 +2235,27 @@ private final class PanelContentView: PassthroughView {
                 y -= 24
             }
             y -= 6
+        }
+        // U-18：多问/多选时一次性提交全部答案（回执数组长度 == 问题数）。
+        if showsSubmitRow, y >= HUD.contentPadding + 30 {
+            let rect = NSRect(x: padding, y: y - 20, width: bounds.width - 2 * padding, height: 22)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            NSColor.systemGreen.withAlphaComponent(0.72).setFill()
+            path.fill()
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.98),
+                .paragraphStyle: para,
+            ]
+            (HUDController.multiSubmitLabel as NSString).draw(
+                in: NSRect(x: rect.minX + 8, y: rect.minY + 5, width: rect.width - 16, height: 14),
+                withAttributes: attrs)
+            if !questionChoices.isEmpty {
+                detailActionHits.append((rect: rect, action: .answer(questionChoices.count - 1)))
+            }
+            y -= 26
         }
         drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
@@ -2980,7 +3111,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private var pendingAnswerPicked: Set<String> = []
     private var pendingAnswerOptions: [String] = []
     /// 多选题的提交行：点它才把已选集合发出去（单击选项只切换选中态）。
-    private static let multiSubmitLabel = "✓ 提交已选"
+    fileprivate static let multiSubmitLabel = "✓ 提交答案"
+    /// U-24：提交成功后必须出现的文案（不可撤回）。
+    private static let submittedLabel = "已提交 · 不可撤回"
     /// N-10：当前审批对应的提问列表（无 options 时要逐条输入文本）。
     private var pendingQuestions: [RadarQuestion] = []
     /// 待审批项的一次性 token（桥用来确认「这次决定来自看到这条审批的人」）。
@@ -3854,6 +3987,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             state.questions = counts.questions
             state.failed = counts.failed
             state.doneUnread = counts.doneUnread
+            state.verifying = counts.verifying
+            state.rework = counts.rework
+            state.blocked = counts.blocked
             state.doneUnreadIds = payload.doneUnreadIds
             state.autoConfirmed = counts.autoConfirmed
             state.items = payload.items
@@ -4028,6 +4164,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 handleMouseUp(synthetic)
             }
         }
+        // 详情页里的可点区域（chips / 按钮）是绘制时登记的，探针打出来才能定位落点。
+        if detail != nil, !panelContent.detailActionHits.isEmpty {
+            let rects = panelContent.detailActionHits
+                .prefix(12)
+                .map { "\($0.action)@\(Int($0.rect.midX)),\(Int($0.rect.midY))" }
+                .joined(separator: " ")
+            log("click probe[\(index)] actions=[\(rects)]")
+        }
         log("click probe[\(index)] after mode=\(detailMode) detail=\(detail != nil) " +
             "jump=\(detail?.jumpSessionId ?? "-") children=\(detail?.children.count ?? 0)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -4106,6 +4250,26 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     // MARK: 展开 / 收起
 
+    /// 提问页正文高度：与 drawQuestionPage 的逐行推进保持一致，多一问就多一段，
+    /// 底部预留 52（圆盘带）与「取消」行，保证任何一题的芯片与提交行都在可视区内。
+    private func questionPageContentHeight() -> CGFloat {
+        let blocks = panelContent?.questionBlocks ?? []
+        var h: CGFloat = 6
+        for block in blocks {
+            h += 34
+            if block.degraded {
+                h += 20 + 26            // 「只能到会话里回答」+「打开会话」按钮
+            } else {
+                h += CGFloat(block.options.count) * 24
+            }
+            if block.free { h += 24 }
+            h += 6
+        }
+        if panelContent?.showsSubmitRow == true { h += 24 }
+        h += 26 + 52                    // 底部「取消」行 + 圆盘带安全区
+        return h
+    }
+
     private func panelHeight() -> CGFloat {
         if let detail {
             if detailMode == .raw {
@@ -4124,6 +4288,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     CGFloat(rows) * HUD.rowHeight + 22
             }
             if detailMode == .approval {
+                // 提问页按真实内容算：每个问题 34 + 芯片行 + 自由回答行；多问还要提交行。
+                // 旧公式只看 bodyLines，多问时芯片会被 `y < padding + 52` 截掉（U-18 实拍）。
+                if panelContent?.isQuestionDetail == true {
+                    return HUD.bandHeight + HUD.contentPadding + HUD.headerHeight +
+                        questionPageContentHeight()
+                }
                 // band(圆) + 上下 padding + 头部 + 标题/元信息/分隔 + 命令正文 + 底部按钮
                 return HUD.bandHeight + HUD.contentPadding * 2 + HUD.headerHeight + 60 +
                     CGFloat(max(1, detail.bodyLines)) * 15 + 14
@@ -4499,6 +4669,20 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private var notifiedQuestion: Set<String> = []
     private var notifiedReview: Set<String> = []
     private var notifiedFailed: Set<String> = []
+    /// U-18：一次提问里的多个 question 各自的选择；顺序按 answerOrder（= questions 原序，不排序）。
+    private var answerOrder: [String] = []
+    private var answerSelections: [String: [String]] = [:]
+    private var answerMulti: [String: Bool] = [:]
+    private var answerOptions: [String: [String]] = [:]
+    private var answerCustom: [String: String] = [:]
+    /// U-24：提交成功后的提示文案（非 nil 时页面不可点，等收页）。
+    private var answerSubmittedNotice: String?
+    /// 待答横幅聚合用：只维护一张，计数变化时换标题（U-54 / §2.4-c）。
+    private var questionBannerWindow: NSWindow?
+    private var questionBannerCount = 0
+    /// 评审三态（blocked/rework/verifying）各自一张聚合横幅。
+    private var reviewBannerWindows: [String: NSWindow] = [:]
+    private var reviewBannerCounts: [String: Int] = [:]
 
     /// 通知去重集合必须跟着「当前仍然存在的行」收缩，否则同一个 id 只会提醒
     /// 一次就永远静默：WorkBuddy 的合成 id 恒为 workbuddy、同一条会话第二次
@@ -4517,24 +4701,38 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     /// agent 在向你提问：必须有一条可读的横幅，而不是当成普通批准（R-05）。
+    /// U-54：多条待答**只留一张**，数量体现在标题 `等你回答(3)`，不再堆 3 张盖满屏幕。
     private func notifyQuestions() {
         // M5a（t5）：从「拿到 feed」到「横幅真的画出来」的 HUD 段耗时。
         // 单独量它是为了把「轮询间隔 2s」和「HUD 自身慢」分开，别混成一个数。
         let notifyStarted = Date()
-        for item in state.questionItems {
-            guard let id = item.id, !notifiedQuestion.contains(id) else { continue }
-            notifiedQuestion.insert(id)
-            // 点横幅 = 直接打开这条提问的选项面板（否则用户只知道「有事」，不知道点哪）。
-            showBanner(title: "等你回答", body: item.title ?? "agent 有问题要问你",
-                       bannerId: id, bannerKind: "question") { [weak self] in
-                // 提问横幅点击 = 打开处置页（不做跳转，跳转会让用户丢掉回执通道）。
-                self?.openApproval((id: item.id ?? "", approvalId: item.approvalId ?? item.id ?? ""))
+        let items = state.questionItems
+        let pending = max(state.questions, items.count)
+        guard let first = items.first else {
+            if let window = questionBannerWindow {
+                dismissBanner(window, reason: "no-questions")
+                log("banner aggregate cleared kind=question")
             }
-            log("banner question \(shortId(id)) \(item.title ?? "")")
+            questionBannerWindow = nil
+            questionBannerCount = 0
+            return
         }
-        if !state.questionItems.isEmpty {
+        // 计数没变 → 不重建（避免每 2s 轮询都闪一下横幅）；计数变了 → 换标题。
+        guard questionBannerWindow == nil || questionBannerCount != pending else { return }
+        if let old = questionBannerWindow { dismissBanner(old, reason: "regroup") }
+        let title = pending > 1 ? "等你回答(\(pending))" : "等你回答"
+        let body = first.title ?? "agent 有问题要问你"
+        let window = showBanner(title: title, body: body,
+                                bannerId: first.id, bannerKind: "question") { [weak self] in
+            // 提问横幅点击 = 打开处置页（不做跳转，跳转会让用户丢掉回执通道）。
+            self?.openApproval((id: first.id ?? "", approvalId: first.approvalId ?? first.id ?? ""))
+        }
+        questionBannerWindow = window
+        questionBannerCount = pending
+        log("banner aggregate kind=question n=\(pending) title=\(title) first=\(shortId(first.id ?? ""))")
+        if !items.isEmpty {
             let dt = Date().timeIntervalSince(notifyStarted) * 1000
-            log(String(format: "banner dt=%.2fms n=%d (M5a HUD 段)", dt, state.questionItems.count))
+            log(String(format: "banner dt=%.2fms n=%d (M5a HUD 段)", dt, items.count))
         }
     }
 
@@ -4665,14 +4863,37 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
             log("banner failed \(id.prefix(8))")
         }
-        for item in state.reviewRuns where item.status == "blocked" || item.status == "rework" {
-            guard let id = item.id, !notifiedReview.contains(id) else { continue }
-            notifiedReview.insert(id)
-            let title = item.status == "blocked" ? "需要你决定" : "任务被退回"
-            let body = item.title ?? (item.status == "blocked" ? "有任务在等你决定" : "有任务需要返工")
-            showBanner(title: title, body: body)
-            log("banner review \(shortId(id)) status=\(item.status ?? "-")")
+        // U-13：blocked / rework / verifying 三种状态在横幅里也必须能看到。
+        // 每态聚合成一张（标题带 (N)），同态计数不变就不重建，避免每 2s 刷屏。
+        notifyReviewState("blocked", title: "任务卡住", items: state.items.filter { $0.status == "blocked" })
+        notifyReviewState("rework", title: "审查未通过", items: state.items.filter { $0.status == "rework" })
+        notifyReviewState("verifying", title: "校验中",
+                          items: state.items.filter { $0.status == "verifying" || $0.status == "unverified" })
+    }
+
+    /// 某一评审态的聚合横幅：只留一张，标题 `任务卡住(2)`，点开最新一条的详情。
+    private func notifyReviewState(_ kind: String, title: String, items: [RadarItem]) {
+        guard let first = items.first else {
+            if let window = reviewBannerWindows[kind] {
+                dismissBanner(window, reason: "state-cleared")
+                log("banner aggregate cleared kind=\(kind)")
+            }
+            reviewBannerWindows[kind] = nil
+            reviewBannerCounts[kind] = 0
+            return
         }
+        let count = items.count
+        guard reviewBannerWindows[kind] == nil || reviewBannerCounts[kind] != count else { return }
+        if let old = reviewBannerWindows[kind] { dismissBanner(old, reason: "regroup") }
+        let text = count > 1 ? "\(title)(\(count))" : title
+        let id = first.id ?? ""
+        let body = first.title ?? first.error ?? first.note ?? "点开看这一条"
+        let window = showBanner(title: text, body: body, bannerId: id, bannerKind: kind) { [weak self] in
+            self?.openDetail(id)
+        }
+        reviewBannerWindows[kind] = window
+        reviewBannerCounts[kind] = count
+        log("banner aggregate kind=\(kind) n=\(count) title=\(text) first=\(shortId(id))")
     }
 
     /// 通知队列：index 0 是屏幕最上面那一条（最新），点击确认后下方的整体上移一格。
@@ -4680,6 +4901,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 每条横幅自己的来源（id/kind）：点击时按这条的事实派发，而不是"点谁都跳到最新一条"。
     private var bannerMeta: [ObjectIdentifier: (id: String, kind: String)] = [:]
     private var bannerActions: [ObjectIdentifier: () -> Void] = [:]
+    /// U-31：每条横幅的展示时刻，用来核对「60s / 30s / 6s」到底停在多久。
+    private var bannerShownAt: [ObjectIdentifier: Date] = [:]
+    /// U-31：到期时刻表（墙钟），由 0.5s 看门狗统一收割，避免依赖会被合并的单次计时器。
+    private var bannerDeadlines: [ObjectIdentifier: (deadline: Date, lifetime: TimeInterval,
+                                                     kind: String, clickable: Bool)] = [:]
+    private var bannerWatchdog: Timer?
     private var bannerTitles: [ObjectIdentifier: String] = [:]
     private let bannerWidth: CGFloat = 320
     private let bannerHeight: CGFloat = 88
@@ -4887,12 +5114,19 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             window.animator().alphaValue = 1
         }
         NSSound(named: NSSound.Name("Glass"))?.play()
-        // prd 2.24：可点的通知卡 30s 没被点就自动消失（旧值 60s 会把队列占住一整分钟）。
-        let lifetime: TimeInterval = onClick == nil ? 6 : 30
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self, weak window] in
-            guard let window else { return }
-            self?.dismissBanner(window, reason: onClick == nil ? "timeout" : "expired")
-        }
+        // 停留分档（t4 §2.4-b + R-06 U-31）：
+        //   待回答 = 60s（用户可能正在别的窗口，30s 太短会漏掉提问）
+        //   待批准/完成类/失败类 = 30s（prd 2.24）
+        //   不可点的纯提示 = 6s
+        let lifetime: TimeInterval = bannerKind == "question" ? 60 : (onClick == nil ? 6 : 30)
+        // U-31：**不用 asyncAfter 计时**。实测 `asyncAfter(.now()+60)` 在 accessory 应用里
+        // 会被系统计时器合并推迟到 63.0s（30s 档同样飘到 30.9s），横幅寿命就没法验收。
+        // 改为 0.5s 看门狗 + 墙钟比对：停留误差 ≤0.5s，且日志自带 elapsed 可复核。
+        let deadline = Date().addingTimeInterval(lifetime)
+        bannerShownAt[ObjectIdentifier(window)] = Date()
+        bannerDeadlines[ObjectIdentifier(window)] = (deadline: deadline, lifetime: lifetime,
+                                                     kind: bannerKind ?? "-", clickable: onClick != nil)
+        startBannerWatchdog()
         return window
     }
 
@@ -4913,8 +5147,38 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
     }
 
+    /// U-31：0.5s 看门狗——按墙钟判断哪条横幅到期，到点才 dismiss。
+    /// 这样即使主线程忙、系统合并计时器，停留也是「lifetime + ≤0.5s」，可验收。
+    private func startBannerWatchdog() {
+        guard bannerWatchdog == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.reapExpiredBanners()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        bannerWatchdog = timer
+    }
+
+    private func reapExpiredBanners() {
+        if bannerDeadlines.isEmpty, banners.isEmpty {
+            bannerWatchdog?.invalidate()
+            bannerWatchdog = nil
+            return
+        }
+        let now = Date()
+        for window in banners {
+            guard let entry = bannerDeadlines[ObjectIdentifier(window)] else { continue }
+            guard now >= entry.deadline else { continue }
+            let elapsed = now.timeIntervalSince(bannerShownAt[ObjectIdentifier(window)] ?? now)
+            log(String(format: "banner timer kind=%@ lifetime=%.0fs elapsed=%.2fs",
+                       entry.kind, entry.lifetime, elapsed))
+            dismissBanner(window, reason: entry.clickable ? "expired" : "timeout")
+        }
+    }
+
     private func dismissBanner(_ window: NSWindow, reason: String = "clicked") {
         guard let index = banners.firstIndex(where: { $0 === window }) else { return }
+        bannerShownAt.removeValue(forKey: ObjectIdentifier(window))
+        bannerDeadlines.removeValue(forKey: ObjectIdentifier(window))
         let title = bannerTitles[ObjectIdentifier(window)] ?? "-"
         banners.remove(at: index)
         bannerTitles.removeValue(forKey: ObjectIdentifier(window))
@@ -5316,8 +5580,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         var glyph = "?"
         var body: String?
         if state.questions > 0 {
-            prefix = "等回答："
-            accent = .systemYellow
+            // U-54：多条待答时胶囊必须带计数，不能只显示第一条（用户看不出还有几问答没处理）。
+            let pending = max(state.questions, state.questionItems.count)
+            prefix = pending > 1 ? "等回答(\(pending))：" : "等回答："
+            accent = HUD.questionColor
             glyph = "?"
             if let item = state.items.first(where: { $0.isQuestion }) {
                 // 首题可能没有正文（占位/空串）：往下找第一道有正文的，并把序号告诉用户，
@@ -5338,18 +5604,36 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             if firstSentence(body ?? "").isEmpty { body = "会话在等你回答" }
         } else if state.approvals > 0 {
             prefix = "要批准："
-            accent = .systemRed
+            accent = HUD.approvalColor
             glyph = "✓"
             if let item = state.items.first(where: { $0.isApproval }) {
                 body = item.title ?? item.error
             }
+        } else if state.blockedCount > 0 {
+            // U-13：卡住（等用户决定）以前在胶囊里根本不存在，被当成 idle。
+            prefix = "卡住："
+            accent = HUD.blockedColor
+            glyph = "!"
+            if let item = state.items.first(where: { $0.status == "blocked" }) {
+                body = item.title ?? item.error
+            }
+            if firstSentence(body ?? "").isEmpty { body = "有任务卡在等你决定" }
         } else if state.failed > 0 {
             prefix = "失败："
-            accent = .systemOrange
+            accent = HUD.failedColor
             glyph = "×"
             if let item = state.items.first(where: { $0.isFailedRun || $0.status == "failed" }) {
                 body = item.error ?? item.title
             }
+        } else if state.reworkCount > 0 {
+            // U-13：返工中（审查未通过）同样要能在胶囊上看见。
+            prefix = "要改："
+            accent = HUD.reworkColor
+            glyph = ""
+            if let item = state.items.first(where: { $0.status == "rework" }) {
+                body = item.title ?? item.note ?? item.error
+            }
+            if firstSentence(body ?? "").isEmpty { body = "有任务需要返工" }
         } else {
             return nil
         }
@@ -5574,7 +5858,16 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         detailLastSeq = 0
         let question = item.isQuestion
         var choices: [(questionId: String, label: String)] = []
-        var blocks: [(id: String, text: String, options: [String], free: Bool)] = []
+        var blocks: [(id: String, text: String, options: [String], free: Bool,
+                      degraded: Bool, multi: Bool)] = []
+        // U-18：多问要一次提交，先把「问题顺序 + 每问题选项」固化下来。
+        answerOrder = []
+        answerSelections = [:]
+        answerMulti = [:]
+        answerOptions = [:]
+        answerCustom = [:]
+        answerSubmittedNotice = nil
+        panelContent?.submittedNotice = nil
         if question {
             for (qi, ask) in (item.questions ?? []).enumerated() {
                 let qid = ask.id ?? "q\(qi)"
@@ -5582,16 +5875,29 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 let text = (ask.question ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let header = (ask.header ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let body = text.isEmpty ? (header.isEmpty ? (item.title ?? "") : header) : text
+                // U-40：无 options 不再给「自由回答」芯片（K3 未实现，给了就是谎报能力），
+                // 改为「该问题只能到会话里回答」+「打开会话」。
+                let degraded = labels.isEmpty
+                let multi = ask.multiSelect == true
                 blocks.append((id: qid, text: body, options: labels,
-                               free: labels.isEmpty || ask.multiSelect == true))
+                               free: !degraded && pendingAnswerRequest == nil,
+                               degraded: degraded, multi: multi))
+                answerOrder.append(qid)
+                answerMulti[qid] = multi
+                answerOptions[qid] = labels
                 for label in labels { choices.append((questionId: qid, label: label)) }
             }
         }
-        if question, pendingAnswerRequest != nil, pendingAnswerMulti, !choices.isEmpty {
-            choices.append((questionId: pendingAnswerQuestionId ?? "", label: Self.multiSubmitLabel))
+        // 多问或多选都需要一个显式的提交行（单问单选保持「点选即提交」）。
+        let needsSubmitRow = question && pendingAnswerRequest != nil &&
+            (answerOrder.count > 1 || answerMulti.values.contains(true))
+        if needsSubmitRow {
+            choices.append((questionId: answerOrder.first ?? "", label: Self.multiSubmitLabel))
         }
         panelContent?.questionChoices = choices
         panelContent?.questionBlocks = blocks
+        panelContent?.questionPicked = [:]
+        panelContent?.showsSubmitRow = needsSubmitRow
         panelContent?.isQuestionDetail = question
         panelContent?.questionIdFallback = (item.questions ?? []).first?.id
         detail = RadarDetail(
@@ -5614,6 +5920,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             runId: item.id ?? "",
             live: false
         )
+        // U-40：「打开会话」按钮要能真跳。提问条的 id 形如 `question:<sessionId>`，
+        // 没有现成 jumpSessionId 字段，这里就地反推，绝不跳空。
+        if question {
+            let raw = item.id ?? ""
+            let sid = raw.hasPrefix("question:") ? String(raw.dropFirst("question:".count)) : raw
+            detail?.jumpSessionId = sid
+        }
         panelContent?.detailMode = .approval
         panelContent?.detail = detail
         // N-06：点横幅（或列表行）后必须展开，否则「打开详情」是看不见的。
@@ -5707,39 +6020,79 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func answerQuestion(optionIndex: Int) {
         guard let panelContent, panelContent.questionChoices.indices.contains(optionIndex) else { return }
         let choice = panelContent.questionChoices[optionIndex]
-        // 插件接管了这条会话内提问：就地提交（单选点即发、多选先切换再点「提交已选」）。
-        if let request = pendingAnswerRequest, let token = pendingAnswerToken {
+        // 插件接管了这条会话内提问：就地提交（单选点即发、多问/多选集齐后一次提交）。
+        if pendingAnswerRequest != nil, pendingAnswerToken != nil {
             if choice.label == Self.multiSubmitLabel {
-                guard !pendingAnswerPicked.isEmpty else {
-                    _ = showBanner(title: "还没选", body: "先点选项，再点提交", onClick: nil)
-                    return
-                }
-                submitAnswer(request: request, token: token, selected: Array(pendingAnswerPicked).sorted())
+                submitAllAnswers()
                 return
             }
             let bare = choice.label.hasPrefix("● ") ? String(choice.label.dropFirst(2)) : choice.label
-            if pendingAnswerMulti {
-                if pendingAnswerPicked.contains(bare) { pendingAnswerPicked.remove(bare) } else { pendingAnswerPicked.insert(bare) }
-                rebuildAnswerChoices()
+            let qid = choice.questionId
+            if answerMulti[qid] == true {
+                var picked = answerSelections[qid] ?? []
+                if picked.contains(bare) { picked.removeAll { $0 == bare } } else { picked.append(bare) }
+                answerSelections[qid] = picked
+                log("answer question qid=\(qid) picked=\(picked.joined(separator: ","))")
+                refreshQuestionChoices()
                 return
             }
-            submitAnswer(request: request, token: token, selected: [bare])
+            answerSelections[qid] = [bare]
+            log("answer question qid=\(qid) selected=\(bare)")
+            refreshQuestionChoices()
+            // U-18：单问单选点选即提交；多问时答满最后一问就一次性提交全部答案。
+            if allQuestionsAnswered() { submitAllAnswers() }
             return
         }
         decideApproval(approve: true, answers: [choice.questionId: choice.label])
     }
 
-    /// 多选回显：把已选选项标成「● 」，并保证「提交已选」行始终在最后。
-    private func rebuildAnswerChoices() {
-        guard let panelContent, let qid = pendingAnswerQuestionId else { return }
-        var choices: [(questionId: String, label: String)] = []
-        for label in pendingAnswerOptions {
-            choices.append((questionId: qid, label: (pendingAnswerPicked.contains(label) ? "● " : "") + label))
+    /// 提交成功证据行：一条日志同时给出 via 通道、数组长度与停留时长（U-24 取证用）。
+    private func logAnswerSubmitted(entries: Int) {
+        log("[answer] submitted via=plugin-waterfall n=\(entries) notice=\(Self.submittedLabel) hold=1.5s")
+    }
+
+    /// 每一问都必须有选择（K2：避免把空的 selected 送回去，§3.3-c）。
+    private func allQuestionsAnswered() -> Bool {
+        for qid in answerOrder {
+            if (answerSelections[qid] ?? []).isEmpty && (answerCustom[qid] ?? "").isEmpty { return false }
         }
-        if pendingAnswerMulti { choices.append((questionId: qid, label: Self.multiSubmitLabel)) }
+        return !answerOrder.isEmpty
+    }
+
+    /// 一次提交全部答案：数组长度 == 问题数，顺序 = questions 原序（不排序）。
+    private func submitAllAnswers() {
+        guard let request = pendingAnswerRequest, let token = pendingAnswerToken else { return }
+        let entries = answerOrder.compactMap { qid -> (id: String, selected: [String], custom: String?)? in
+            let picked = answerSelections[qid] ?? []
+            let custom = answerCustom[qid]
+            guard !picked.isEmpty || !(custom ?? "").isEmpty else { return nil }
+            return (id: qid, selected: picked, custom: custom)
+        }
+        guard entries.count == answerOrder.count else {
+            let missing = answerOrder.count - entries.count
+            log("answer submit blocked unanswered=\(missing) of \(answerOrder.count)")
+            _ = showBanner(title: "还有 \(missing) 问没答", body: "每一问都要选一项才能提交", onClick: nil)
+            return
+        }
+        submitAnswer(request: request, token: token, entries: entries)
+    }
+
+    /// 芯片/高亮/提交行统一重建：顺序必须与 drawQuestionPage 的绘制顺序一致
+    /// （按 answerOrder 逐问、问内按 options 原序、最后是提交行），否则点击会错位。
+    private func refreshQuestionChoices() {
+        guard let panelContent else { return }
+        var choices: [(questionId: String, label: String)] = []
+        for qid in answerOrder {
+            for label in (answerOptions[qid] ?? []) { choices.append((questionId: qid, label: label)) }
+        }
+        let needsSubmit = answerOrder.count > 1 || answerMulti.values.contains(true)
+        if needsSubmit { choices.append((questionId: answerOrder.first ?? "", label: Self.multiSubmitLabel)) }
         panelContent.questionChoices = choices
+        panelContent.questionPicked = answerSelections
+        panelContent.showsSubmitRow = needsSubmit
         panelContent.needsDisplay = true
-        log("answer multi picked=\(pendingAnswerPicked.count)")
+        let answered = answerOrder.filter { !(answerSelections[$0] ?? []).isEmpty }.count
+        log("answer refreshed answered=\(answered)/\(answerOrder.count) chips=\(choices.count)")
     }
 
     /// 就地回执：GET `/x-radar/question-answer?request=…&token=…&answers=[{id,selected}]`。
@@ -5747,6 +6100,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func submitAnswer(request: String, token: String,
                               questionId: String? = nil, selected: [String],
                               custom: String? = nil) {
+        submitAnswer(request: request, token: token,
+                     entries: [(id: questionId ?? pendingAnswerQuestionId ?? "q0",
+                                selected: selected, custom: custom)])
+    }
+
+    /// U-18：一次提问的全部答案在一个数组里发出，顺序 = questions 原序（不排序）。
+    private func submitAnswer(request: String, token: String,
+                              entries: [(id: String, selected: [String], custom: String?)]) {
         let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
         guard var components = URLComponents(string: raw), components.host != nil else { return }
         var segments = components.path.split(separator: "/").map(String.init)
@@ -5756,11 +6117,15 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             segments.append("question-answer")
         }
         components.path = "/" + segments.joined(separator: "/")
-        let qid = questionId ?? pendingAnswerQuestionId ?? "q0"
-        var entry: [String: Any] = ["id": qid, "selected": selected]
-        // 自由文本走 custom（t13 定稿回执形状：{answers:[{id,selected,custom}]}）。
-        if let custom, !custom.isEmpty { entry["custom"] = custom }
-        let answers: [[String: Any]] = [entry]
+        var answers: [[String: Any]] = []
+        for entry in entries {
+            var item: [String: Any] = ["id": entry.id, "selected": entry.selected]
+            // 自由文本走 custom（t13 定稿回执形状：{answers:[{id,selected,custom}]}）。
+            if let custom = entry.custom, !custom.isEmpty { item["custom"] = custom }
+            answers.append(item)
+            log("[answer] entry id=\(entry.id) selected=[\(entry.selected.joined(separator: ","))] " +
+                "custom=\(entry.custom?.count ?? 0)")
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: answers),
               let json = String(data: data, encoding: .utf8) else { return }
         components.percentEncodedQueryItems = encodedQueryItems([
@@ -5769,8 +6134,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             URLQueryItem(name: "answers", value: json),
         ])
         guard let url = components.url else { return }
-        log("[answer] submit request=\(request.prefix(8)) shape=array id=\(qid) n=\(selected.count) " +
-            "custom=\(custom?.count ?? 0)")
+        // R-06 U-24：转换点必须能证明「走的是插件 waterfall 通道、发的是数组形状」。
+        log("[answer] submit request=\(request.prefix(8)) shape=array via=plugin-waterfall " +
+            "n=\(entries.count) ids=\(entries.map(\.id).joined(separator: ","))")
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         req.httpMethod = "GET"
         URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
@@ -5782,13 +6148,23 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             DispatchQueue.main.async {
                 if ok {
-                    log("[answer] submit ok")
+                    // U-24：芯片置灰 + 「已提交 · 不可撤回」停留（1.5s 规格，最少 0.6s），
+                    // 之后才收页；这期间页面不再响应点击 = 不可撤回。
+                    self.answerSubmittedNotice = Self.submittedLabel
+                    self.panelContent?.submittedNotice = Self.submittedLabel
+                    self.panelContent?.needsDisplay = true
+                    self.logAnswerSubmitted(entries: entries.count)
                     self.pendingAnswerRequest = nil
                     self.pendingAnswerToken = nil
-                    self.pendingAnswerPicked = []
-                    self.closeDetail()
+                    self.answerSelections = [:]
+                    self.answerCustom = [:]
                     self.fetchNow(reason: "answer-submitted")
                     _ = self.showBanner(title: "已提交", body: "AI 收到答案了", onClick: nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        self.answerSubmittedNotice = nil
+                        self.panelContent?.submittedNotice = nil
+                        self.closeDetail()
+                    }
                 } else {
                     log("[answer] submit failed error=\(error?.localizedDescription ?? "-") body=\(text.prefix(160))")
                     // 条目已经不在服务端（20s 让渡/已在别处答过）时同样本地收页，别把用户锁在输入页。
@@ -6603,8 +6979,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     self.stopLiveDetail()
                     if append, !self.detailFinalReloadPending {
                         self.detailFinalReloadPending = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                            guard let self else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                             self.detailFinalReloadPending = false
                             guard let current = self.detail, !current.runId.isEmpty else { return }
                             self.refreshRunSummary(id: current.runId)

@@ -1182,14 +1182,26 @@ async function probeUpstream(upstream) {
   if (!model) return { ok: false, reason: 'no_models' }
   const root = /\/v1$/.test(upstream.baseURL) ? upstream.baseURL : `${upstream.baseURL.replace(/\/$/, '')}/v1`
   const startedAt = Date.now()
-  try {
-    const response = await fetch(`${root}/chat/completions`, {
+  const callWith = async (tokenField) => {
+    const payload = { model, messages: [{ role: 'user', content: 'ping' }], stream: false }
+    payload[tokenField] = 8
+    return fetch(`${root}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8, stream: false }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(30000),
     })
-    const body = await response.text()
+  }
+  try {
+    // 2026-11-20：公司网关对 gpt-6.1-sol 起拒收 `max_tokens`，只认 `max_completion_tokens`
+    // （400 unsupported_parameter）。先按老字段探，被拒再换新字段重试一次，
+    // 这样新旧网关都能探通，doctor 不再误报整条链路不可用。
+    let response = await callWith('max_tokens')
+    let body = await response.text()
+    if (response.status === 400 && body.includes('max_completion_tokens')) {
+      response = await callWith('max_completion_tokens')
+      body = await response.text()
+    }
     return { ok: response.ok, status: response.status, model, ms: Date.now() - startedAt, sample: uslice(body, 200) }
   } catch (error) {
     return { ok: false, reason: String(error?.message ?? error), model }

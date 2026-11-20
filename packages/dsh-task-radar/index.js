@@ -1727,6 +1727,11 @@ async function buildRadar(ctx) {
     questions: items.filter((item) => item.kind === 'question').length,
     failed: items.filter((item) => item.kind === 'run' && item.status === 'failed').length,
     doneUnread: 0,
+    // 九态里的三态（U-13）：verifying/rework/blocked 必须在胶囊、面板行、横幅都能看见，
+    // 所以 counts 要给真实计数。老宿主没有这三个字段时 UI 按 0 处理、不推断（t4 §0.4）。
+    verifying: items.filter((item) => item.status === 'verifying' || item.status === 'unverified').length,
+    rework: items.filter((item) => item.status === 'rework').length,
+    blocked: items.filter((item) => item.status === 'blocked').length,
   }
   // 会话内提问（DSH 自己的 ask_user_question）单独计数：排障时能区分「桥在等」与「会话在等」。
   counts.questionsDsh = items.filter((item) => item.kind === 'question' && item.source === SOURCE_DSH).length
@@ -2376,12 +2381,16 @@ function radarRoute(ctx) {
       })
     }
     if (tail === 'clear-done') {
-      // t14 bug 4：「清除已完成」= 全部标已读 + 清掉会话 finished 记账，
-      // 否则下次重启 radar-sessions.json 里的 finished 会再把 done 行放回来。
-      const fresh = await buildRadar(ctx)
-      const ids = Array.isArray(fresh.doneUnreadIds) ? fresh.doneUnreadIds : []
+      // 一次点击必须清干净。doneUnreadIds 只含「最终渲染列表」里的 id（折叠与 slice 之后），
+      // 折叠行 "x2" 只贡献 1 个 id，所以单轮清理必然剩下一条 → 循环到没有新的可清条目为止。
+      let cleared = 0
       let trackCleared = 0
-      if (ids.length > 0) {
+      let passes = 0
+      for (let pass = 0; pass < 6; pass += 1) {
+        const fresh = await buildRadar(ctx)
+        const ids = Array.isArray(fresh.doneUnreadIds) ? fresh.doneUnreadIds : []
+        if (ids.length === 0) break
+        passes += 1
         const seen = readSeen()
         const now = Date.now()
         for (const id of ids) seen[id] = now
@@ -2402,10 +2411,11 @@ function radarRoute(ctx) {
             writeFileSync(trackFile(), JSON.stringify(track))
           }
         } catch {}
+        cleared += ids.length
         invalidateSnapshot()
       }
-      log(`panel clear-done n=${ids.length} track=${trackCleared}`)
-      return new Response(JSON.stringify({ ok: true, cleared: ids.length, track: trackCleared }), {
+      log(`panel clear-done cleared=${cleared} track=${trackCleared} passes=${passes}`)
+      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
