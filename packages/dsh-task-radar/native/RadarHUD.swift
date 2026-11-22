@@ -191,6 +191,294 @@ private func log(_ message: String) {
     }
 }
 
+// MARK: - 字符串表（U-34）
+
+/// HUD 的**所有**面向用户文案都在这张表里（zh / en 双语）。
+///
+/// 设计约束：
+/// 1. 视图层只允许调用 `L.s("key")` / `L.f("key", args…)`，不得再写字面量；
+/// 2. 语言在启动时确定一次（`--lang zh|en` 覆盖，否则跟随系统首选语言，`zh*` → zh，其余 → en），
+///    运行期不再变化，避免「同一屏一半中文一半英文」；
+/// 3. key 与 `plugins/dsh-task-radar/locale/{zh,en}.json` 的 `hud` 段一一对应，
+///    `--dump-strings` 会以 JSON 打印整张表，locale 文件由它生成（防止两边漂移）。
+private enum L {
+    /// 当前语言：`zh` / `en`。
+    private(set) static var lang: String = "en"
+    /// 语言来源（`system` / `flag`），只用于启动日志自证。
+    private(set) static var source: String = "system"
+
+    /// 语言判定：`--lang` 优先，其次系统首选语言（`zh*` → zh，其余 en）。
+    @discardableResult
+    static func resolve(flag: String?) -> (lang: String, source: String) {
+        let normalized = (flag ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        if normalized == "zh" || normalized == "en" {
+            lang = normalized
+            source = "flag"
+            return (lang, source)
+        }
+        let preferred = (Locale.preferredLanguages.first ?? "en").lowercased()
+        lang = preferred.hasPrefix("zh") ? "zh" : "en"
+        source = "system"
+        return (lang, source)
+    }
+
+    /// 取一条文案；缺 key 时回退 zh，再回退 key 本身（缺 key 一定会在 `--dump-strings` 里暴露）。
+    static func s(_ key: String) -> String {
+        guard let row = table[key] else { return key }
+        return row[lang] ?? row["zh"] ?? key
+    }
+
+    /// 带占位符的文案（`%@` / `%d`），用 `String(format:)` 组装。
+    static func f(_ key: String, _ args: CVarArg...) -> String {
+        String(format: s(key), arguments: args)
+    }
+
+    /// locale 文件里 `hud` 段的 JSON（`--dump-strings` 用）。
+    static func dumpJSON() -> String {
+        var lines: [String] = []
+        for key in table.keys.sorted() {
+            let row = table[key] ?? [:]
+            let zh = (row["zh"] ?? "").replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let en = (row["en"] ?? "").replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            lines.append("    \"\(key)\": {\"zh\": \"\(zh)\", \"en\": \"\(en)\"}")
+        }
+        return "{\n  \"schema\": \"dsh-radar-hud-strings/1\",\n  \"keys\": {\n" + lines.joined(separator: ",\n") + "\n  }\n}"
+    }
+
+    /// 文案表：key → [zh, en]。**新增文案先加 key 再改视图层**。
+    /// 文案表：key → [zh, en]。**新增文案先加 key 再改视图层**。
+    /// 文案表：key → [zh, en]。**新增文案先加 key 再改视图层**。
+    /// 文案表：key → [zh, en]。**新增文案先加 key 再改视图层**。
+    static let table: [String: [String: String]] = [
+        "action.answer": ["zh": "✎ 回答…", "en": "✎ Answer…"],
+        "action.cancel": ["zh": "取消", "en": "Cancel"],
+        "action.cancelCross": ["zh": "✕ 取消", "en": "✕ Cancel"],
+        "action.freeAnswer": ["zh": "✎ 自由回答…", "en": "✎ Free answer…"],
+        "action.gotIt": ["zh": "知道了", "en": "Got it"],
+        "action.openSession": ["zh": "→ 打开会话", "en": "→ Open session"],
+        "action.retry": ["zh": "↻ 重试", "en": "↻ Retry"],
+        "action.submit": ["zh": "✓ 提交答案", "en": "✓ Submit"],
+        "alert.answerHead": ["zh": "回答：%@", "en": "Answer: %@"],
+        "alert.answerInDsh": ["zh": "本次只能在 DSH 里回答", "en": "It can only be answered in DSH this time"],
+        "alert.answerNth": ["zh": "回答 %d/%d", "en": "Answer %d/%d"],
+        "alert.answerOne": ["zh": "回答这个提问", "en": "Answer this question"],
+        "alert.backToDsh": ["zh": "回 DSH 里回答", "en": "Answer in DSH"],
+        "alert.freeTextOnly": ["zh": "这条要自由文本", "en": "This question needs free text"],
+        "alert.inputHint": ["zh": "输入你的回答（可以是一整句话）", "en": "Type your answer (a full sentence is fine)"],
+        "alert.inputTitle": ["zh": "请输入你的回答", "en": "Your answer"],
+        "alert.noBody": ["zh": "（这个问题没有正文，请直接输入你的回答）", "en": "(no question body; just type your answer)"],
+        "alert.noChannel": ["zh": "胶囊没拿到回执通道（被接管才可答）", "en": "The capsule has no answer channel (only taken-over questions can be answered)"],
+        "alert.onlyInDsh": ["zh": "这条只能回 DSH 答", "en": "This one can only be answered in DSH"],
+        "alert.reminderOnly": ["zh": "胶囊暂时只能提醒；回执要在会话里提交", "en": "The capsule can only remind for now; submit the answer in the session"],
+        "alert.send": ["zh": "发送", "en": "Send"],
+        "answer.collapseBody": ["zh": "收起正文", "en": "Collapse"],
+        "answer.expandMore": ["zh": "展开全文（共 %d 行）", "en": "Show all (%d lines)"],
+        "answer.expired": ["zh": "问题已超时（agent 已按拒绝处理）", "en": "Question expired (the agent treated it as declined)"],
+        "answer.failedBar": ["zh": "提交失败：%@", "en": "Submit failed: %@"],
+        "answer.forbidden": ["zh": "没有权限处理此问题", "en": "You do not have permission to handle this"],
+        "answer.missingN": ["zh": "还有 %d 问没答", "en": "%d questions left"],
+        "answer.mustAnswerInSession": ["zh": "该问题只能到会话里回答", "en": "This question can only be answered in the session"],
+        "answer.selectEvery": ["zh": "每一问都要选一项才能提交", "en": "Pick one option for every question"],
+        "answer.submitted": ["zh": "已提交 · 不可撤回", "en": "Submitted · cannot be undone"],
+        "approval.approveFinal": ["zh": "✓ 批准（不可撤销）", "en": "✓ Approve (irreversible)"],
+        "approval.approved": ["zh": "已批准", "en": "Approved"],
+        "approval.reject": ["zh": "✕ 拒绝", "en": "✕ Reject"],
+        "approval.rejected": ["zh": "已拒绝", "en": "Rejected"],
+        "approval.requested": ["zh": "请求批准", "en": "requests approval"],
+        "approval.scrollRange": ["zh": "滚动查看（第 %d–%d / %d 行）", "en": "Scroll (%d–%d of %d lines)"],
+        "approval.title": ["zh": "任务审批", "en": "Task approval"],
+        "banner.apPlural": ["zh": "等你批准（%d 个）", "en": "%d approvals needed"],
+        "banner.approvalBody": ["zh": "有一个任务等你批准", "en": "A task needs your approval"],
+        "banner.approvalTitle": ["zh": "等你批准", "en": "Approval needed"],
+        "banner.donePlural": ["zh": "%d 个任务完成", "en": "%d tasks finished"],
+        "banner.doneSuffix": ["zh": " 任务完成", "en": " finished"],
+        "banner.doneTitle": ["zh": "任务已完成", "en": "Task finished"],
+        "banner.failed": ["zh": "%@ 任务失败", "en": "%@ failed"],
+        "banner.failedTitle": ["zh": "任务失败了", "en": "Task failed"],
+        "banner.foldedMore": ["zh": "%@ · 另有 %d 条", "en": "%@ · %d more"],
+        "banner.openOne": ["zh": "点开看这一条", "en": "Open this one"],
+        "banner.qPlural": ["zh": "等你回答(%d)", "en": "%d waiting for your answer"],
+        "banner.questionBody": ["zh": "agent 有问题要问你", "en": "An agent has a question for you"],
+        "banner.reloadBody": ["zh": "胶囊检测到页面还是旧版本，刷新后跳转恢复（会自动重试）", "en": "The page is still on an old build; refresh to restore jumps (it retries automatically)"],
+        "banner.reloadTitle": ["zh": "页面需刷新", "en": "Page needs a refresh"],
+        "banner.sessionDone": ["zh": "会话完成", "en": "Session finished"],
+        "banner.staleApproval": ["zh": "这条审批是宿主重启前留下的，已经没有进程在等它，可以直接忽略", "en": "This approval predates a host restart and nothing is waiting on it; safe to ignore"],
+        "banner.staleBody": ["zh": "页面里的雷达 client 半边没在轮询", "en": "The radar client half inside the page is not polling"],
+        "banner.staleTitle": ["zh": "跳转需刷新页面", "en": "Refresh to enable jumps"],
+        "common.missing": ["zh": "缺：", "en": "missing: "],
+        "common.networkError": ["zh": "网络错误", "en": "network error"],
+        "common.noDescription": ["zh": "（无描述）", "en": "(no description)"],
+        "common.option": ["zh": "选项", "en": "Option"],
+        "common.untitled": ["zh": "（无标题）", "en": "(untitled)"],
+        "detail.approvalResult": ["zh": "批准结果", "en": "approval result"],
+        "detail.childCount": ["zh": "%d 个子会话", "en": "%d child sessions"],
+        "detail.childSessions": ["zh": "子会话", "en": "Child sessions"],
+        "detail.createRun": ["zh": "创建运行", "en": "create run"],
+        "detail.current": ["zh": "当前：%@", "en": "Now: %@"],
+        "detail.currentMember": ["zh": "当前成员：%@", "en": "Current member: %@"],
+        "detail.doneSessions": ["zh": "已完成的会话", "en": "Finished sessions"],
+        "detail.elapsedPlain": ["zh": "耗时 %@", "en": "elapsed %@"],
+        "detail.elapsedSeconds": ["zh": "耗时 %.1fs", "en": "elapsed %.1fs"],
+        "detail.elapsedSuffix": ["zh": " · 耗时 %@", "en": " · %@ elapsed"],
+        "detail.eventCount": ["zh": "%d 事件", "en": "%d events"],
+        "detail.failedPrefix": ["zh": "失败：%@", "en": "failed: %@"],
+        "detail.finishedAt": ["zh": "完成于：%@", "en": "Finished: %@"],
+        "detail.finishedPlain": ["zh": "完成于 %@", "en": "finished %@"],
+        "detail.jumpHintDone": ["zh": "点下方「跳到会话」回到这段对话。", "en": "Use “Open session ›” below to return to this conversation."],
+        "detail.jumpHintRunning": ["zh": "点下方「跳到会话」可以进对话看具体输出。", "en": "Use “Open session ›” below to see the actual output."],
+        "detail.lastActivity": ["zh": "最近活动：%@", "en": "Last activity: %@"],
+        "detail.live": ["zh": "正在进行", "en": "In progress"],
+        "detail.liveBadge": ["zh": "● 直播中", "en": "● live"],
+        "detail.memberCount": ["zh": "%d 人", "en": "%d members"],
+        "detail.next": ["zh": "下一步：%@", "en": "Next: %@"],
+        "detail.noCommand": ["zh": "（没有可展示的命令）", "en": "(no command to show)"],
+        "detail.noEvents": ["zh": "没有可展示的事件（可能是历史 run）；可以从下面重试、复制错误或清掉这条。", "en": "No events to show (possibly a historical run); you can retry, copy the error, or dismiss it below."],
+        "detail.noEventsShort": ["zh": "（这次运行没有可展示的事件）", "en": "(this run has no events to show)"],
+        "detail.noRawPayload": ["zh": "（这条事件没有原始 payload）", "en": "(this event has no raw payload)"],
+        "detail.noText": ["zh": "（本次运行没有文本输出）", "en": "(this run produced no text)"],
+        "detail.rawEvents": ["zh": "原始事件", "en": "Raw events"],
+        "detail.result": ["zh": "任务结果", "en": "Result"],
+        "detail.resultGone": ["zh": "（这条任务的结果已不在宿主内存里）", "en": "(the result is no longer in host memory)"],
+        "detail.runningSessions": ["zh": "运行中的会话", "en": "Running sessions"],
+        "detail.runningSince": ["zh": "状态：进行中 · 已运行 %@", "en": "Status: running · %@ elapsed"],
+        "detail.sessionMeta": ["zh": "会话 %@", "en": "Session %@"],
+        "detail.stage": ["zh": "阶段 %d/%d：%@", "en": "Stage %d/%d: %@"],
+        "detail.statusDone": ["zh": "状态：已完成", "en": "Status: done"],
+        "detail.statusRunning": ["zh": "状态：进行中", "en": "Status: running"],
+        "detail.tapForRaw": ["zh": "点一条看原始", "en": "tap one for raw"],
+        "detail.teamProgress": ["zh": "团队进度：%d/%d 已完成", "en": "Team progress: %d/%d done"],
+        "detail.tokens": ["zh": "token 用量", "en": "tokens"],
+        "detail.unavailable": ["zh": "详情不可用 · 宿主已回收这条记录（%@）；已停止刷新", "en": "Detail unavailable · host reclaimed this record (%@); refresh stopped"],
+        "detail.verdictHead": ["zh": "验收结论：%@", "en": "Verdict: %@"],
+        "event.end": ["zh": "结束", "en": "end"],
+        "event.thinking": ["zh": "思考", "en": "thinking"],
+        "event.turnStart": ["zh": "回合开始", "en": "turn start"],
+        "failure.clear": ["zh": "✕ 清掉这条", "en": "✕ Dismiss"],
+        "failure.copy": ["zh": "⧉ 复制错误", "en": "⧉ Copy error"],
+        "failure.noText": ["zh": "（这次失败没有留下错误文本）", "en": "(this failure left no error text)"],
+        "failure.title": ["zh": "任务失败", "en": "Task failed"],
+        "footer.backToEvents": ["zh": "‹ 返回事件流", "en": "‹ Back"],
+        "footer.backToList": ["zh": "‹ 返回列表", "en": "‹ Back"],
+        "footer.backToResult": ["zh": "‹ 返回结果", "en": "‹ Back"],
+        "footer.events": ["zh": "事件流", "en": "Events"],
+        "footer.eventsCount": ["zh": "事件流 %d 条 ›", "en": "Events %d ›"],
+        "footer.jump": ["zh": "跳到会话 ›", "en": "Open session ›"],
+        "kind.session": ["zh": "会话", "en": "session"],
+        "menu.markAllSeen": ["zh": "完成未看全部置为已读", "en": "Mark all done-unread as read"],
+        "menu.quit": ["zh": "退出", "en": "Quit"],
+        "menu.refresh": ["zh": "刷新", "en": "Refresh"],
+        "menu.snooze": ["zh": "隐藏 5 分钟", "en": "Hide for 5 minutes"],
+        "menu.topmost": ["zh": "置顶开/关", "en": "Always on top on/off"],
+        "panel.clearDone": ["zh": "清除已完成", "en": "Clear done"],
+        "panel.doneUnread": ["zh": "完成未看", "en": "Done · unread"],
+        "panel.empty": ["zh": "暂无任务", "en": "No tasks"],
+        "panel.items": ["zh": "%d 项", "en": "%d items"],
+        "panel.loading": ["zh": "加载中…", "en": "Loading…"],
+        "panel.members": ["zh": "团队成员", "en": "Members"],
+        "panel.noChildren": ["zh": "没有子会话", "en": "No child sessions"],
+        "panel.scrollHint": ["zh": "滚轮翻页", "en": "scroll"],
+        "panel.scrollRange": ["zh": "%d–%d/%d · 滚轮翻页", "en": "%d–%d of %d · scroll"],
+        "panel.tapMember": ["zh": "点成员跳转", "en": "tap a member to jump"],
+        "panel.teamDone": ["zh": "已完成 %d/%d", "en": "%d/%d done"],
+        "panel.title": ["zh": "任务", "en": "Tasks"],
+        "pill.approvalPrefix": ["zh": "要批准：", "en": "Approve: "],
+        "pill.blockedFallback": ["zh": "有任务卡在等你决定", "en": "A task is blocked on your decision"],
+        "pill.blockedPrefix": ["zh": "卡住：", "en": "Blocked: "],
+        "pill.failedPrefix": ["zh": "失败：", "en": "Failed: "],
+        "pill.qPrefix": ["zh": "等回答：", "en": "Q: "],
+        "pill.qPrefixN": ["zh": "等回答(%d)：", "en": "Q (%d): "],
+        "pill.questionGeneric": ["zh": "有问题要问你", "en": "An agent has a question"],
+        "pill.questionNth": ["zh": "第 %d 个问题：", "en": "Question %d: "],
+        "pill.reworkFallback": ["zh": "有任务需要返工", "en": "A task needs rework"],
+        "pill.reworkPrefix": ["zh": "要改：", "en": "Rework: "],
+        "pill.sessionWaiting": ["zh": "会话在等你回答", "en": "A session is waiting for your answer"],
+        "q.noBody": ["zh": "（这一题没有正文）", "en": "(this question has no body)"],
+        "q.progress": ["zh": "第 %d/%d 问", "en": "Question %d/%d"],
+        "q.title": ["zh": "等你回答", "en": "Waiting for your answer"],
+        "review.blockedTitle": ["zh": "任务卡住", "en": "Task blocked"],
+        "review.reworkTitle": ["zh": "审查未通过", "en": "Review failed"],
+        "review.verifyingTitle": ["zh": "校验中", "en": "Verifying"],
+        "row.agentApproval": ["zh": "%@ · 待批准 · 点击处理", "en": "%@ · needs approval · open"],
+        "row.agentDone": ["zh": "%@ · 已完成", "en": "%@ · done"],
+        "row.agentDoneUnread": ["zh": "%@ · 已完成 · 未读", "en": "%@ · done · unread"],
+        "row.agentFailed": ["zh": "%@ · 失败 · %@", "en": "%@ · failed · %@"],
+        "row.agentJobs": ["zh": "%@ · 后台任务 %d 个在跑", "en": "%@ · %d background jobs running"],
+        "row.agentQuestion": ["zh": "%@ · 等你回答 · %@", "en": "%@ · waiting for answer · %@"],
+        "row.agentReview": ["zh": "%@ · 待判别", "en": "%@ · awaiting verdict"],
+        "row.agentRunning": ["zh": "%@ · 进行中", "en": "%@ · running"],
+        "row.approvalMeta": ["zh": "等你决定 · 5 分钟内不处理会自动拒绝", "en": "needs your call · auto-declined in 5 minutes"],
+        "row.blocked": ["zh": "需你决定 · 点击看", "en": "needs your call · open"],
+        "row.childTaskMeta": ["zh": " · 任务 %@", "en": " · task %@"],
+        "row.failureNoText": ["zh": "点击看日志", "en": "open for logs"],
+        "row.qBackToDsh": ["zh": "回 DSH 里答", "en": "answer in DSH"],
+        "row.qFree": ["zh": "点开看问题 · 就地输入", "en": "open to see the question · answer inline"],
+        "row.qFreeAnswerInHud": ["zh": "等你回答 · 这条提问要自由文本，点「✎ 回答…」输入后发送；不答超时按拒绝处理", "en": "waiting · free text: tap ✎ Answer… to type; timeout counts as decline"],
+        "row.qFreeTextOnly": ["zh": "等你回答 · 这条提问要自由文本，本次只能在 DSH 里回答", "en": "waiting · needs free text; answer in DSH"],
+        "row.qMultiMeta": ["zh": "等你回答 · 多选：点选项切换，点「%@」发送；20s 没答自动回桌面卡", "en": "waiting · multi-select: toggle options, tap “%@” to send; reverts in 20s"],
+        "row.qOptions": ["zh": "点选项即答", "en": "tap an option to answer"],
+        "row.qPickOption": ["zh": "等你回答 · 选一个选项 = 回执该选项；不答超时按拒绝处理", "en": "waiting · picking an option submits it; timeout counts as decline"],
+        "row.qTapSubmit": ["zh": "等你回答 · 点一个选项即提交；20s 没答自动回桌面卡", "en": "waiting · tap an option to submit; reverts to the desktop card in 20s"],
+        "row.reworkProgress": ["zh": "返工中 %d/2 · 点击看缺什么", "en": "rework %d/2 · open for findings"],
+        "row.teamCurrent": ["zh": " · 当前 %@", "en": " · now: %@"],
+        "row.teamDone": ["zh": " · 已完成 %d/%d", "en": " · %d/%d done"],
+        "row.unverified": ["zh": "未验证完成 · 还没通过验收", "en": "not verified · acceptance not passed"],
+        "row.verifying": ["zh": "待验收 · 点击看进展", "en": "verifying · open for progress"],
+        "run.finished": ["zh": "已结束", "en": "finished"],
+        "run.processExited": ["zh": "进程已退出", "en": "process exited"],
+        "sessionMenu.hide": ["zh": "仅从雷达移除（推荐）", "en": "Remove from radar (recommended)"],
+        "sessionMenu.jump": ["zh": "跳到 DSH 里删除", "en": "Open in DSH to delete"],
+        "sessionMenu.note": ["zh": "仅从雷达移除不会删除 DSH 里的会话数据", "en": "Removing from radar does not delete the DSH session"],
+        "sessionMenu.title": ["zh": "要处理这个会话吗？", "en": "Handle this session?"],
+        "stat.appr": ["zh": "需批准 %d", "en": "%d to approve"],
+        "stat.auto": ["zh": "代你确认 %d 次", "en": "auto-confirmed %d"],
+        "stat.doneUnread": ["zh": "已完成 %d · 未读", "en": "%d done · unread"],
+        "stat.failed": ["zh": "失败 %d", "en": "%d failed"],
+        "stat.q": ["zh": "等你回答 %d", "en": "%d waiting"],
+        "status.done": ["zh": "已完成", "en": "done"],
+        "status.failed": ["zh": "失败", "en": "failed"],
+        "status.idle": ["zh": "空闲", "en": "idle"],
+        "status.offline": ["zh": "离线", "en": "Offline"],
+        "status.ready": ["zh": "就绪", "en": "Ready"],
+        "status.running": ["zh": "进行中", "en": "running"],
+        "time.daysAgo": ["zh": "%d 天前", "en": "%d d ago"],
+        "time.hoursAgo": ["zh": "%d 小时前", "en": "%d h ago"],
+        "time.hoursMinutes": ["zh": "%d 小时 %d 分", "en": "%d h %d min"],
+        "time.justNow": ["zh": "刚刚", "en": "just now"],
+        "time.minutes": ["zh": "%d 分钟", "en": "%d min"],
+        "time.minutesAgo": ["zh": "%d 分钟前", "en": "%d min ago"],
+        "time.seconds": ["zh": "%d 秒", "en": "%d s"],
+        "toast.answerDelivered": ["zh": "AI 收到答案了", "en": "The AI received your answer"],
+        "toast.badUrl": ["zh": "地址不完整", "en": "Incomplete address"],
+        "toast.clearFailed": ["zh": "清除没成功", "en": "Clear failed"],
+        "toast.clearFailedShort": ["zh": "清除失败", "en": "clear failed"],
+        "toast.copied": ["zh": "错误已复制", "en": "Error copied"],
+        "toast.copiedHint": ["zh": "粘贴到 DSH 里就能追问", "en": "Paste into DSH to follow up"],
+        "toast.decidePending": ["zh": "服务端没确认；这条还会留在列表里", "en": "Server did not confirm; it stays in the list"],
+        "toast.decideUnconfirmed": ["zh": "服务端未确认，已本地关闭", "en": "Server did not confirm; closed locally"],
+        "toast.decideUnconfirmedHint": ["zh": "这条审批可能已经失效；详情已收起，可刷新再看", "en": "This approval may have expired; the detail is closed, refresh to check"],
+        "toast.jumpDegraded": ["zh": "页面侧 client 没在轮询，重载页面后再点会直接跳转", "en": "Page client is not polling; reload the page and click again to jump directly"],
+        "toast.jumpFailed": ["zh": "跳转没成功，未标记已读", "en": "Jump failed; not marked as read"],
+        "toast.jumpFailedBody": ["zh": "会话 %@：%@", "en": "Session %@: %@"],
+        "toast.jumpNoSession": ["zh": "已打开 DSH，但没定位到会话", "en": "Opened DSH but could not locate the session"],
+        "toast.markSeenFailed": ["zh": "标记已读没生效", "en": "Mark-as-read did not take effect"],
+        "toast.noError": ["zh": "没有可复制的错误", "en": "No error to copy"],
+        "toast.noErrorBody": ["zh": "这条任务没有留下错误文本", "en": "This task left no error text"],
+        "toast.noRadarUrl": ["zh": "拿不到雷达地址", "en": "Radar URL unavailable"],
+        "toast.offline": ["zh": "还没连上雷达服务", "en": "Not connected to the radar service yet"],
+        "toast.removeFailed": ["zh": "移除没成功", "en": "Remove failed"],
+        "toast.removed": ["zh": "已从雷达移除", "en": "Removed from radar"],
+        "toast.removedHint": ["zh": "DSH 里的会话数据没动", "en": "The DSH session itself is untouched"],
+        "toast.retried": ["zh": "已重试", "en": "Retried"],
+        "toast.retryFailed": ["zh": "重试没成功", "en": "Retry failed"],
+        "toast.retryQueued": ["zh": "新任务已排队，稍后看列表", "en": "New task queued; check the list shortly"],
+        "toast.serverSaid": ["zh": "服务返回 %d", "en": "server said %d"],
+        "toast.submitted": ["zh": "已提交", "en": "Submitted"],
+        "toast.tryLater": ["zh": "下次再试", "en": "Try again later"],
+    ]
+}
+
 /// 完成提醒横幅（应用内绘制，不依赖系统通知权限）。
 private final class BannerView: NSView {
     private let title: String
@@ -249,7 +537,7 @@ private final class BannerView: NSView {
         paragraph.lineBreakMode = .byTruncatingTail
         var attrs = bodyAttrs
         attrs[.paragraphStyle] = paragraph
-        let shownBody = foldedCount > 0 ? "\(body) · 另有 \(foldedCount) 条" : body
+        let shownBody = foldedCount > 0 ? L.f("banner.foldedMore", body, foldedCount) : body
         (shownBody as NSString).draw(in: NSRect(x: 14, y: 12, width: bounds.width - 28, height: 34),
                                     withAttributes: attrs)
     }
@@ -321,7 +609,7 @@ private struct RadarOption: Decodable {
         description = try? c.decodeIfPresent(String.self, forKey: .description)
     }
 
-    var display: String { label ?? id ?? "选项" }
+    var display: String { label ?? id ?? L.s("common.option") }
 }
 
 private struct RadarQuestion: Decodable {
@@ -705,15 +993,15 @@ private struct RenderState {
     /// 面板底部/顶部副行：需批准 > 完成未看，取前两个非零。
     var statLines: [(String, NSColor)] {
         var out: [(String, NSColor)] = []
-        if questions > 0 { out.append(("等你回答 \(questions)", NSColor.systemYellow)) }
-        if approvals > 0 { out.append(("需批准 \(approvals)", NSColor.systemRed)) }
-        if failed > 0 { out.append(("失败 \(failed)", NSColor.systemRed)) }
+        if questions > 0 { out.append((L.f("stat.q", questions), NSColor.systemYellow)) }
+        if approvals > 0 { out.append((L.f("stat.appr", approvals), NSColor.systemRed)) }
+        if failed > 0 { out.append((L.f("stat.failed", failed), NSColor.systemRed)) }
         if doneUnread > 0 {
-            out.append(("已完成 \(doneUnread) · 未读", NSColor(calibratedWhite: 0.78, alpha: 0.75)))
+            out.append((L.f("stat.doneUnread", doneUnread), NSColor(calibratedWhite: 0.78, alpha: 0.75)))
         }
         // 用户 2026-11-16 要求：自动代确认要可回溯，胶囊里留一行计数。
         if autoConfirmed > 0 {
-            out.append(("代你确认 \(autoConfirmed) 次", NSColor(calibratedWhite: 0.62, alpha: 0.72)))
+            out.append((L.f("stat.auto", autoConfirmed), NSColor(calibratedWhite: 0.62, alpha: 0.72)))
         }
         return Array(out.prefix(3))
     }
@@ -802,7 +1090,7 @@ private struct RadarChild: Decodable {
     var updatedAt: Int64?
 
     var isRunning: Bool { status == "running" }
-    var displayTitle: String { title ?? role ?? "（无标题）" }
+    var displayTitle: String { title ?? role ?? L.s("common.untitled") }
 }
 
 /// 详情面板的形态。
@@ -903,6 +1191,10 @@ private struct Options {
     var clickProbeCounts: [Int] = []
     /// `--hold <秒>`：探针跑完后不立刻退出，留出截图时间（只用于取证）。
     var holdSeconds: Double = 0
+    /// `--lang zh|en`：强制 UI 语言（U-34）。缺省跟随系统首选语言（`zh*` → zh，其余 en）。
+    var lang: String?
+    /// `--dump-strings`：以 JSON 打印整张字符串表后退出（生成 locale 文件的唯一来源）。
+    var dumpStrings = false
 
     static func parse(_ args: [String]) -> (Options, exitCode: Int32?) {
         var opts = Options()
@@ -996,6 +1288,19 @@ private struct Options {
                     return (opts, 2)
                 }
                 opts.scrollProbe = CGFloat(dy)
+            case "--lang":
+                guard let v = value(for: flag, inline: inline) else {
+                    log("error: --lang 缺少值")
+                    return (opts, 2)
+                }
+                let normalized = v.lowercased()
+                guard normalized == "zh" || normalized == "en" else {
+                    log("error: --lang 只接受 zh 或 en")
+                    return (opts, 2)
+                }
+                opts.lang = normalized
+            case "--dump-strings":
+                opts.dumpStrings = true
             case "--expand":
                 opts.forceExpanded = true
             case "--state-dir":
@@ -1118,6 +1423,8 @@ private struct Options {
           --hover-probe near|far  把窗口放到指针下（near）或放到默认锚点（far），展开后主动触发
                               一次收起计时，验证「指针在窗口内就不收」，跑完自退。
                              多宿主并存时宿主会传 hosts/<port>，避免互相覆盖。
+          --lang zh|en       UI 语言；缺省跟随系统首选语言（zh* → zh，其余 en），启动日志打 lang=/source=。
+          --dump-strings     以 JSON 打印整张文案表（locale/*.json 的 hud 段由它生成）后退出。
           -h, --help         显示本帮助。
 
         交互：鼠标移入圆形徽标展开面板，离开 250ms 后收回；
@@ -1490,7 +1797,7 @@ private final class CircleBadgeView: PassthroughView {
                 .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.55),
                 .paragraphStyle: offlineCentered,
             ]
-            let text = "离线" as NSString
+            let text = L.s("status.offline") as NSString
             let size = text.size(withAttributes: attrs)
             let rect = NSRect(x: 0, y: 3, width: bounds.width, height: size.height)
             text.draw(in: rect, withAttributes: attrs)
@@ -1735,7 +2042,7 @@ private final class PanelContentView: PassthroughView {
         if answerFailure != nil, answerFailure?.kind != "retry" { h += 40 }
         for block in questionBlocks {
             let head = questionBlocks.count > 1 ? "\(questionBlocks.firstIndex(where: { $0.id == block.id }).map { $0 + 1 } ?? 1)) \(block.text)" : block.text
-            let lines = questionTextLines(head.isEmpty ? "（这一题没有正文）" : head, width: 320 - 2 * HUD.contentPadding)
+            let lines = questionTextLines(head.isEmpty ? L.s("q.noBody") : head, width: 320 - 2 * HUD.contentPadding)
             let visible = questionExpanded.contains(block.id) ? lines : min(lines, HUD.approvalBodyVisibleLines)
             h += CGFloat(visible) * 15 + 4
             if lines > HUD.approvalBodyVisibleLines { h += 20 }
@@ -1911,19 +2218,19 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.90),
         ]
-        ("任务" as NSString).draw(in: NSRect(x: padding, y: headerY + 10,
+        (L.s("panel.title") as NSString).draw(in: NSRect(x: padding, y: headerY + 10,
                                               width: 160, height: 18),
                                    withAttributes: titleAttrs)
 
         let rows = state.panelRows
         // 只有真的带团队任务时才谈完成度；普通会话不给 d/n（用户看不懂 0/1 是什么意思）。
-        var headerRight = "\(rows.count) 项"
+        var headerRight = L.f("panel.items", rows.count)
         let teamKids = rows.filter { $0.team == true }.flatMap { $0.children ?? [] }
         if !teamKids.isEmpty {
             let done = teamKids.filter { ($0.taskStatus ?? "").contains("已完成") }.count
-            headerRight = "已完成 \(done)/\(teamKids.count)"
+            headerRight = L.f("panel.teamDone", done, teamKids.count)
         }
-        let statusText = state.offline ? "离线" : headerRight
+        let statusText = state.offline ? L.s("status.offline") : headerRight
         let statusColor = state.offline
             ? NSColor.systemOrange.withAlphaComponent(0.85)
             : NSColor(calibratedWhite: 1.0, alpha: 0.42)
@@ -1965,7 +2272,7 @@ private final class PanelContentView: PassthroughView {
                 .font: NSFont.systemFont(ofSize: 11, weight: .regular),
                 .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.40),
             ]
-            ("暂无任务" as NSString).draw(
+            (L.s("panel.empty") as NSString).draw(
                 in: NSRect(x: padding, y: contentMinY + 8,
                            width: bounds.width - 2 * padding, height: 18),
                 withAttributes: attrs)
@@ -2001,7 +2308,7 @@ private final class PanelContentView: PassthroughView {
                 ]
                 // N/M：让用户知道现在停在哪一页，而不是只看到「还有 N 条」。
                 let last = min(rows.count, listScrollRow + HUD.maxRows)
-                let indicator = "\(listScrollRow + 1)–\(last)/\(rows.count) · 滚轮翻页" as NSString
+                let indicator = L.f("panel.scrollRange", listScrollRow + 1, last, rows.count) as NSString
                 indicator.draw(
                     in: NSRect(x: padding, y: y,
                                width: bounds.width - 2 * padding, height: 16),
@@ -2018,10 +2325,10 @@ private final class PanelContentView: PassthroughView {
     private func reviewSubtitle(_ item: RadarItem) -> String? {
         guard item.isReviewRun else { return nil }
         switch item.status ?? "" {
-        case "verifying": return "待验收 · 点击看进展"
-        case "rework": return "返工中 \(item.round ?? 1)/2 · 点击看缺什么"
-        case "blocked": return "需你决定 · 点击看"
-        case "unverified": return "未验证完成 · 还没通过验收"
+        case "verifying": return L.s("row.verifying")
+        case "rework": return L.f("row.reworkProgress", item.round ?? 1)
+        case "blocked": return L.s("row.blocked")
+        case "unverified": return L.s("row.unverified")
         default: return nil
         }
     }
@@ -2064,7 +2371,7 @@ private final class PanelContentView: PassthroughView {
 
         let textX = badgeRect.maxX + 10
         let textWidth = rect.maxX - textX
-        var titleText = item.title?.isEmpty == false ? item.title! : "（无标题）"
+        var titleText = item.title?.isEmpty == false ? item.title! : L.s("common.untitled")
         // 同 agent 同标题的连续 done 在 feed 里已折叠，这里把条数标出来（t14）。
         if let count = item.count, count > 1 { titleText += "  ×\(count)" }
         let titleAttrs: [NSAttributedString.Key: Any] = [
@@ -2084,11 +2391,11 @@ private final class PanelContentView: PassthroughView {
             let hasOptions = (item.questions ?? []).contains { !($0.options ?? []).isEmpty }
             let tail: String
             if item.answerRequest != nil {
-                tail = hasOptions ? "点选项即答" : "点开看问题 · 就地输入"
+                tail = hasOptions ? L.s("row.qOptions") : L.s("row.qFree")
             } else {
-                tail = "回 DSH 里答"
+                tail = L.s("row.qBackToDsh")
             }
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 等你回答 · \(tail)"
+            agentText = L.f("row.agentQuestion", (item.agent ?? "unknown").uppercased(), tail)
         } else if item.isFailedRun {
             // 失败行必须说清「失败什么」（t14 bug 3）：优先 feed 给的 error 首句，
             // 老数据没有 error 时退回 finalAnswer / reason 码，最后才是「点击看日志」。
@@ -2096,25 +2403,25 @@ private final class PanelContentView: PassthroughView {
             let text = candidates
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
-            let clipped = text.map { $0.count > 30 ? String($0.prefix(29)) + "…" : $0 } ?? "点击看日志"
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 失败 · " + clipped
+            let clipped = text.map { $0.count > 30 ? String($0.prefix(29)) + "…" : $0 } ?? L.s("row.failureNoText")
+            agentText = L.f("row.agentFailed", (item.agent ?? "unknown").uppercased(), clipped)
         } else if approval {
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 待批准 · 点击处理"
+            agentText = L.f("row.agentApproval", (item.agent ?? "unknown").uppercased())
         } else if doneUnread {
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 已完成 · 未读"
+            agentText = L.f("row.agentDoneUnread", (item.agent ?? "unknown").uppercased())
         } else if item.isRunningSession {
             // 后台 job 撑起来的「进行中」要说清是什么在跑，否则用户会以为界面在等他（2026-11-19）。
             if item.runningBy == "job", let jobs = item.jobs, jobs > 0 {
-                agentText = "\((item.agent ?? "unknown").uppercased()) · 后台任务 \(jobs) 个在跑"
+                agentText = L.f("row.agentJobs", (item.agent ?? "unknown").uppercased(), jobs)
             } else {
-                agentText = "\((item.agent ?? "unknown").uppercased()) · 进行中"
+                agentText = L.f("row.agentRunning", (item.agent ?? "unknown").uppercased())
             }
         } else if item.isRunningRun {
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 进行中"
+            agentText = L.f("row.agentRunning", (item.agent ?? "unknown").uppercased())
         } else if item.kind == "session" {
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 已完成"
+            agentText = L.f("row.agentDone", (item.agent ?? "unknown").uppercased())
         } else if item.isReviewRun {
-            agentText = "\((item.agent ?? "unknown").uppercased()) · 待判别"
+            agentText = L.f("row.agentReview", (item.agent ?? "unknown").uppercased())
         } else {
             agentText = (item.agent ?? "unknown").uppercased()
         }
@@ -2126,10 +2433,10 @@ private final class PanelContentView: PassthroughView {
             let kids = item.children ?? []
             let done = kids.filter { ($0.taskStatus ?? "").contains("已完成") }.count
             let current = kids.first { $0.isRunning }
-            var teamText = " · 已完成 \(done)/\(count)"
+            var teamText = L.f("row.teamDone", done, count)
             if let current, current.id != item.id {
                 let label = current.role ?? current.displayTitle
-                teamText += " · 当前 \(label)"
+                teamText += L.f("row.teamCurrent", label)
             }
             agentText += teamText
         }
@@ -2163,7 +2470,7 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.90),
         ]
-        ((detail.live ? "正在进行" : "任务结果") as NSString).draw(
+        ((detail.live ? L.s("detail.live") : L.s("detail.result")) as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 160, height: 18),
             withAttributes: titleAttrs)
 
@@ -2182,7 +2489,7 @@ private final class PanelContentView: PassthroughView {
         var y = headerY - 6
 
         // 任务标题
-        let titleText = (detail.title.isEmpty ? "（无标题）" : detail.title) as NSString
+        let titleText = (detail.title.isEmpty ? L.s("common.untitled") : detail.title) as NSString
         let rowTitleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.92),
@@ -2236,16 +2543,16 @@ private final class PanelContentView: PassthroughView {
         let bodyHeight = CGFloat(detail.bodyLines) * 15
         let bodyRect = NSRect(x: padding, y: y - bodyHeight, width: bounds.width - 2 * padding,
                               height: bodyHeight)
-        (((detail.body.isEmpty ? "（本次运行没有文本输出）" : detail.body)) as NSString)
+        (((detail.body.isEmpty ? L.s("detail.noText") : detail.body)) as NSString)
             .draw(with: bodyRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
                   attributes: bodyAttrs)
 
         // 底部按钮：左「返回列表」，右「完整事件流」
-        drawFooterButton(text: "‹ 返回列表", align: .left, action: .backToList)
+        drawFooterButton(text: L.s("footer.backToList"), align: .left, action: .backToList)
         if detail.isSession {
-            drawFooterButton(text: "跳到会话 ›", align: .right, action: .jumpSession)
+            drawFooterButton(text: L.s("footer.jump"), align: .right, action: .jumpSession)
         } else {
-            drawFooterButton(text: "事件流 \(detail.events.count) 条 ›", align: .right, action: .showEvents)
+            drawFooterButton(text: L.f("footer.eventsCount", detail.events.count), align: .right, action: .showEvents)
         }
     }
 
@@ -2259,7 +2566,7 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.systemYellow.withAlphaComponent(0.95),
         ]
-        ("等你回答" as NSString).draw(
+        (L.s("q.title") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 200, height: 18),
             withAttributes: titleAttrs)
 
@@ -2284,7 +2591,7 @@ private final class PanelContentView: PassthroughView {
         let total = questionBlocks.count
         if total > 1 {
             let answered = questionBlocks.filter { !(questionPicked[$0.id] ?? []).isEmpty }.count
-            let progress = "第 \(min(answered + 1, total))/\(total) 问"
+            let progress = L.f("q.progress", min(answered + 1, total), total)
             let para = NSMutableParagraphStyle()
             para.alignment = .right
             let attrs: [NSAttributedString.Key: Any] = [
@@ -2315,10 +2622,10 @@ private final class PanelContentView: PassthroughView {
                     .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.96),
                     .paragraphStyle: para,
                 ]
-                ("没有权限处理此问题" as NSString).draw(
+                (L.s("answer.forbidden") as NSString).draw(
                     in: NSRect(x: padding, y: bounds.midY + 4, width: bounds.width - 2 * padding, height: 20),
                     withAttributes: attrs)
-                drawFooterButton(text: "→ 打开会话", align: .right, action: .jumpSession,
+                drawFooterButton(text: L.s("action.openSession"), align: .right, action: .jumpSession,
                                  color: NSColor.white.withAlphaComponent(0.98),
                                  background: NSColor.systemBlue.withAlphaComponent(0.72))
                 return
@@ -2330,7 +2637,7 @@ private final class PanelContentView: PassthroughView {
                     .foregroundColor: NSColor.systemOrange.withAlphaComponent(0.96),
                     .paragraphStyle: para,
                 ]
-                ("问题已超时（agent 已按拒绝处理）" as NSString).draw(
+                (L.s("answer.expired") as NSString).draw(
                     in: NSRect(x: padding, y: headerY - 2, width: bounds.width - 2 * padding, height: 16),
                     withAttributes: attrs)
                 y -= 20
@@ -2338,7 +2645,7 @@ private final class PanelContentView: PassthroughView {
                 let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 18)
                 NSColor.systemRed.withAlphaComponent(0.82).setFill()
                 NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
-                ("提交失败：\(failure.reason)" as NSString).draw(
+                (L.f("answer.failedBar", failure.reason) as NSString).draw(
                     in: NSRect(x: rect.minX + 8, y: rect.minY + 3, width: rect.width - 16, height: 13),
                     withAttributes: barAttrs)
                 y -= 22
@@ -2365,7 +2672,7 @@ private final class PanelContentView: PassthroughView {
         let multi = questionBlocks.count > 1
         for (bi, block) in questionBlocks.enumerated() {
             if y < HUD.contentPadding + 52 { break }
-            let text = block.text.isEmpty ? "（这一题没有正文）" : block.text
+            let text = block.text.isEmpty ? L.s("q.noBody") : block.text
             let head = multi ? "\(bi + 1)) \(text)" : text
             // §3.1-b / U-37：正文必须完整可读——按实测行数排版，最多先给 4 行，
             // 超出时给「展开全文」，绝不用省略号把问题本身糊掉。
@@ -2384,7 +2691,7 @@ private final class PanelContentView: PassthroughView {
                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
             y -= bodyHeight + 4
             if bodyLines > HUD.approvalBodyVisibleLines {
-                let label = expandedBody ? "收起正文" : "展开全文（共 \(bodyLines) 行）"
+                let label = expandedBody ? L.s("answer.collapseBody") : L.f("answer.expandMore", bodyLines)
                 let expandRect = NSRect(x: padding, y: y - 16, width: min(textWidth, 156), height: 16)
                 let expandAttrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.systemFont(ofSize: 10, weight: .medium),
@@ -2401,7 +2708,7 @@ private final class PanelContentView: PassthroughView {
             // U-40：没有 options 的提问不能就地作答（自由输入属 K3）。
             // 旧实现在这里给「自由回答」芯片，用户点开只看到一个输入框，等于谎报能力。
             if block.degraded {
-                ("该问题只能到会话里回答" as NSString).draw(
+                (L.s("answer.mustAnswerInSession") as NSString).draw(
                     in: NSRect(x: padding + 2, y: y - 16, width: bounds.width - 2 * padding - 4, height: 16),
                     withAttributes: degradeAttrs)
                 y -= 20
@@ -2409,7 +2716,7 @@ private final class PanelContentView: PassthroughView {
                 let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
                 NSColor.systemBlue.withAlphaComponent(0.26).setFill()
                 path.fill()
-                ("→ 打开会话" as NSString).draw(
+                (L.s("action.openSession") as NSString).draw(
                     in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
                     withAttributes: chipAttrs)
                 detailActionHits.append((rect: rect, action: .jumpSession))
@@ -2473,7 +2780,7 @@ private final class PanelContentView: PassthroughView {
                 let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
                 NSColor.systemYellow.withAlphaComponent(0.22).setFill()
                 path.fill()
-                ("✎ 自由回答…" as NSString).draw(
+                (L.s("action.freeAnswer") as NSString).draw(
                     in: NSRect(x: rect.minX + 10, y: rect.minY + 9, width: rect.width - 20, height: 14),
                     withAttributes: freeAttrs)
                 detailActionHits.append((rect: rect.insetBy(dx: 0, dy: -HUD.chipHitPad), action: .freeAnswer(bi)))
@@ -2496,7 +2803,7 @@ private final class PanelContentView: PassthroughView {
                 .foregroundColor: NSColor.white.withAlphaComponent(0.98),
                 .paragraphStyle: para,
             ]
-            let submitLabel = answerFailure?.kind == "retry" ? "↻ 重试" : HUDController.multiSubmitLabel
+            let submitLabel = answerFailure?.kind == "retry" ? L.s("action.retry") : HUDController.multiSubmitLabel
             (submitLabel as NSString).draw(
                 in: NSRect(x: rect.minX + 8, y: rect.minY + 5, width: rect.width - 16, height: 14),
                 withAttributes: attrs)
@@ -2507,13 +2814,13 @@ private final class PanelContentView: PassthroughView {
         }
         if expiredNow {
             // 已让渡：唯一动作是收起（不再提交，也不假装还能答）。
-            drawFooterButton(text: "知道了", align: .right, action: .dismiss,
+            drawFooterButton(text: L.s("action.gotIt"), align: .right, action: .dismiss,
                              color: NSColor.white.withAlphaComponent(0.98),
                              background: NSColor.systemBlue.withAlphaComponent(0.72))
             logChipLayoutIfChanged()
             return
         }
-        drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
+        drawFooterButton(text: L.s("action.cancelCross"), align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
                          background: NSColor.systemRed.withAlphaComponent(0.72))
         logChipLayoutIfChanged()
@@ -2532,13 +2839,13 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.systemOrange.withAlphaComponent(0.95),
         ]
-        ("任务审批" as NSString).draw(
+        (L.s("approval.title") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 160, height: 18),
             withAttributes: titleAttrs)
 
         var y = headerY - 6
 
-        let titleText = (detail.title.isEmpty ? "（无描述）" : detail.title) as NSString
+        let titleText = (detail.title.isEmpty ? L.s("common.noDescription") : detail.title) as NSString
         let rowTitleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.94),
@@ -2573,7 +2880,7 @@ private final class PanelContentView: PassthroughView {
         ]
         // §3.1-b / U-37：正文最多显示 4 行，超出靠滚动读全文；绝不省略号截断。
         let bodyWidth = bounds.width - 2 * padding
-        let bodyString = (detail.body.isEmpty ? "（没有可展示的命令）" : detail.body) as NSString
+        let bodyString = (detail.body.isEmpty ? L.s("detail.noCommand") : detail.body) as NSString
         let measured = bodyString.boundingRect(
             with: NSSize(width: bodyWidth, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin], attributes: bodyAttrs)
@@ -2598,7 +2905,7 @@ private final class PanelContentView: PassthroughView {
                 .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.55),
             ]
             let last = min(measuredLines, approvalBodyScroll + visibleLines)
-            ("滚动查看（第 \(approvalBodyScroll + 1)–\(last) / \(measuredLines) 行）" as NSString).draw(
+            (L.f("approval.scrollRange", approvalBodyScroll + 1, last, measuredLines) as NSString).draw(
                 in: NSRect(x: padding, y: bodyBottom - 13, width: bodyWidth, height: 12),
                 withAttributes: hintAttrs)
             bodyBottom -= 14
@@ -2624,7 +2931,7 @@ private final class PanelContentView: PassthroughView {
                 detailActionHits.append((rect: rect, action: .answer(index)))
                 optionY -= 24
             }
-            drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
+            drawFooterButton(text: L.s("action.cancelCross"), align: .left, action: .reject,
                              color: NSColor.white.withAlphaComponent(0.95),
                              background: NSColor.systemRed.withAlphaComponent(0.72))
             return
@@ -2633,10 +2940,10 @@ private final class PanelContentView: PassthroughView {
         // 底部：左「拒绝」（红），右「批准」（绿）
         if isQuestionDetail {
             // 无选项提问：不能给「批准/拒绝」这种语义，退化成「回复 / 取消」。
-            drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
+            drawFooterButton(text: L.s("action.cancelCross"), align: .left, action: .reject,
                              color: NSColor.white.withAlphaComponent(0.95),
                              background: NSColor.systemRed.withAlphaComponent(0.72))
-            drawFooterButton(text: "✎ 回答…", align: .right, action: .confirmAnswer,
+            drawFooterButton(text: L.s("action.answer"), align: .right, action: .confirmAnswer,
                              color: NSColor.white.withAlphaComponent(0.98),
                              background: NSColor.systemBlue.withAlphaComponent(0.72))
             return
@@ -2655,10 +2962,10 @@ private final class PanelContentView: PassthroughView {
                 withAttributes: attrs)
             return
         }
-        drawFooterButton(text: "✕ 拒绝", align: .left, action: .reject,
+        drawFooterButton(text: L.s("approval.reject"), align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
                          background: NSColor.systemRed.withAlphaComponent(0.72))
-        drawFooterButton(text: "✓ 批准（不可撤销）", align: .right, action: .approve,
+        drawFooterButton(text: L.s("approval.approveFinal"), align: .right, action: .approve,
                          color: NSColor.white.withAlphaComponent(0.98),
                          background: NSColor.systemGreen.withAlphaComponent(0.72))
     }
@@ -2673,12 +2980,12 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.systemRed.withAlphaComponent(0.95),
         ]
-        ("任务失败" as NSString).draw(
+        (L.s("failure.title") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 160, height: 18),
             withAttributes: titleAttrs)
 
         var y = headerY - 6
-        let titleText = (detail.title.isEmpty ? "（无描述）" : detail.title) as NSString
+        let titleText = (detail.title.isEmpty ? L.s("common.noDescription") : detail.title) as NSString
         let rowTitleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.94),
@@ -2716,21 +3023,21 @@ private final class PanelContentView: PassthroughView {
         let bodyHeight = max(30, bodyTop - bodyFloor)
         let bodyRect = NSRect(x: padding, y: bodyTop - bodyHeight, width: bounds.width - 2 * padding,
                               height: bodyHeight)
-        let body = detail.body.isEmpty ? "（这次失败没有留下错误文本）" : detail.body
+        let body = detail.body.isEmpty ? L.s("failure.noText") : detail.body
         (body as NSString).draw(with: bodyRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
                                 attributes: bodyAttrs)
 
         // 两行按钮，避免 320pt 宽挤成一条。
-        drawFooterButton(text: "↻ 重试", align: .left, action: .retryRun,
+        drawFooterButton(text: L.s("action.retry"), align: .left, action: .retryRun,
                          color: NSColor.white.withAlphaComponent(0.98),
                          background: NSColor.systemGreen.withAlphaComponent(0.66))
-        drawFooterButton(text: "⧉ 复制错误", align: .right, action: .copyError,
+        drawFooterButton(text: L.s("failure.copy"), align: .right, action: .copyError,
                          color: NSColor.white.withAlphaComponent(0.92),
                          background: NSColor.systemBlue.withAlphaComponent(0.55))
-        drawFooterButton2(text: "✕ 清掉这条", align: .left, action: .clearRun,
+        drawFooterButton2(text: L.s("failure.clear"), align: .left, action: .clearRun,
                           color: NSColor(calibratedWhite: 1.0, alpha: 0.86),
                           background: NSColor(calibratedWhite: 1.0, alpha: 0.14))
-        drawFooterButton2(text: "事件流 \(detail.events.count) 条 ›", align: .right, action: .showEvents)
+        drawFooterButton2(text: L.f("footer.eventsCount", detail.events.count), align: .right, action: .showEvents)
     }
 
     /// 双击会话行的确认卡（HUD 内，不用 NSAlert）。
@@ -2742,7 +3049,7 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.92),
         ]
-        ("要处理这个会话吗？" as NSString).draw(
+        (L.s("sessionMenu.title") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: bounds.width - 2 * padding, height: 18),
             withAttributes: titleAttrs)
 
@@ -2750,14 +3057,14 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.52),
         ]
-        ((detail.title.isEmpty ? "（无标题）" : detail.title) as NSString).draw(
+        ((detail.title.isEmpty ? L.s("common.untitled") : detail.title) as NSString).draw(
             in: NSRect(x: padding, y: headerY - 10, width: bounds.width - 2 * padding, height: 15),
             withAttributes: nameAttrs)
 
         let choices: [(String, DetailAction)] = [
-            ("仅从雷达移除（推荐）", .sessionHide),
-            ("跳到 DSH 里删除", .sessionJump),
-            ("取消", .sessionCancel),
+            (L.s("sessionMenu.hide"), .sessionHide),
+            (L.s("sessionMenu.jump"), .sessionJump),
+            (L.s("action.cancel"), .sessionCancel),
         ]
         var optionY = headerY - 42
         let optionAttrs: [NSAttributedString.Key: Any] = [
@@ -2776,7 +3083,7 @@ private final class PanelContentView: PassthroughView {
             detailActionHits.append((rect: rect, action: choice.1))
             optionY -= 28
         }
-        drawFooterLabel(text: "仅从雷达移除不会删除 DSH 里的会话数据", align: .left)
+        drawFooterLabel(text: L.s("sessionMenu.note"), align: .left)
     }
 
     /// 详情页底部按钮（左/右对齐），点击区域记进 detailActionHits。
@@ -2853,7 +3160,7 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.90),
         ]
-        ("事件流" as NSString).draw(
+        (L.s("footer.events") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 160, height: 18),
             withAttributes: titleAttrs)
 
@@ -2874,7 +3181,7 @@ private final class PanelContentView: PassthroughView {
 
         // 「直播中」：这次运行还没结束时，新事件会自动追加。
         if detail.live {
-            let liveText = "● 直播中"
+            let liveText = L.s("detail.liveBadge")
             let liveAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 9, weight: .medium),
                 .foregroundColor: NSColor(calibratedRed: 0.45, green: 0.92, blue: 0.62, alpha: 0.95),
@@ -2922,7 +3229,7 @@ private final class PanelContentView: PassthroughView {
                 .font: NSFont.systemFont(ofSize: 10, weight: .regular),
                 .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.44),
             ]
-            ("（这次运行没有可展示的事件）" as NSString).draw(in: NSRect(x: padding, y: y, width: bounds.width - 2 * padding, height: 14),
+            (L.s("detail.noEventsShort") as NSString).draw(in: NSRect(x: padding, y: y, width: bounds.width - 2 * padding, height: 14),
                                                   withAttributes: attrs)
         }
 
@@ -2942,8 +3249,8 @@ private final class PanelContentView: PassthroughView {
                          xRadius: 1, yRadius: 1).fill()
         }
 
-        drawFooterButton(text: "‹ 返回结果", align: .left, action: .backToSummary)
-        drawFooterLabel(text: "点一条看原始", align: .right)
+        drawFooterButton(text: L.s("footer.backToResult"), align: .left, action: .backToSummary)
+        drawFooterLabel(text: L.s("detail.tapForRaw"), align: .right)
     }
 
     private func kindColor(_ kind: String) -> NSColor {
@@ -3001,13 +3308,13 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.92),
         ]
-        ("团队成员" as NSString).draw(in: NSRect(x: padding, y: headerY + 11, width: 200, height: 17),
+        (L.s("panel.members") as NSString).draw(in: NSRect(x: padding, y: headerY + 11, width: 200, height: 17),
                                   withAttributes: titleAttrs)
         let countAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.45),
         ]
-        let countText = "\(detail.children.count) 人"
+        let countText = L.f("detail.memberCount", detail.children.count)
         (countText as NSString).draw(in: NSRect(x: bounds.width - padding - 120, y: headerY + 12,
                                                 width: 120, height: 16),
                                      withAttributes: countAttrs)
@@ -3048,8 +3355,8 @@ private final class PanelContentView: PassthroughView {
             (child.displayTitle as NSString).draw(
                 in: NSRect(x: textX, y: rect.minY + 20, width: rect.maxX - textX, height: 17),
                 withAttributes: titleAttrs)
-            var meta = child.isRunning ? "进行中" : "空闲"
-            if let taskStatus = child.taskStatus, !taskStatus.isEmpty { meta += " · 任务 \(taskStatus)" }
+            var meta = child.isRunning ? L.s("status.running") : L.s("status.idle")
+            if let taskStatus = child.taskStatus, !taskStatus.isEmpty { meta += L.f("row.childTaskMeta", taskStatus) }
             if let tokens = child.tokens, tokens > 0 {
                 meta += tokens >= 1000 ? String(format: " · %.1fk tokens", Double(tokens) / 1000) : " · \(tokens) tokens"
             }
@@ -3069,11 +3376,11 @@ private final class PanelContentView: PassthroughView {
             }
             if let id = child.id { childRowHits.append((rect: rect, id: id)) }
         }
-        drawFooterButton(text: "‹ 返回列表", align: .left, action: .backToList)
+        drawFooterButton(text: L.s("footer.backToList"), align: .left, action: .backToList)
         if !detail.jumpSessionId.isEmpty {
-            drawFooterButton(text: "跳到会话 ›", align: .right, action: .jumpSession)
+            drawFooterButton(text: L.s("footer.jump"), align: .right, action: .jumpSession)
         } else {
-            drawFooterLabel(text: detail.children.isEmpty ? "没有子会话" : "点成员跳转", align: .right)
+            drawFooterLabel(text: detail.children.isEmpty ? L.s("panel.noChildren") : L.s("panel.tapMember"), align: .right)
         }
     }
 
@@ -3085,7 +3392,7 @@ private final class PanelContentView: PassthroughView {
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.90),
         ]
-        ("原始事件" as NSString).draw(
+        (L.s("detail.rawEvents") as NSString).draw(
             in: NSRect(x: padding, y: headerY + 10, width: 160, height: 18),
             withAttributes: titleAttrs)
 
@@ -3119,7 +3426,7 @@ private final class PanelContentView: PassthroughView {
                 .font: NSFont.systemFont(ofSize: 10, weight: .regular),
                 .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.44),
             ]
-            ("（这条事件没有原始 payload）" as NSString).draw(
+            (L.s("detail.noRawPayload") as NSString).draw(
                 in: NSRect(x: padding, y: y, width: bounds.width - 2 * padding, height: 14),
                 withAttributes: attrs)
         } else {
@@ -3149,8 +3456,8 @@ private final class PanelContentView: PassthroughView {
                          xRadius: 1, yRadius: 1).fill()
         }
 
-        drawFooterButton(text: "‹ 返回事件流", align: .left, action: .backToEvents)
-        drawFooterLabel(text: "滚轮翻页", align: .right)
+        drawFooterButton(text: L.s("footer.backToEvents"), align: .left, action: .backToEvents)
+        drawFooterLabel(text: L.s("panel.scrollHint"), align: .right)
     }
 
     /// 原始 payload 翻页。
@@ -3193,7 +3500,7 @@ private final class PanelContentView: PassthroughView {
             ]
             let lineRect = NSRect(x: statsX, y: y, width: statsWidth, height: lineHeight)
             (line.0 as NSString).draw(in: lineRect, withAttributes: attrs)
-            if line.0.hasPrefix("完成未看") {
+            if line.0.hasPrefix(L.s("panel.doneUnread")) {
                 doneStatsRect = lineRect.insetBy(dx: -4, dy: -3)
             }
         }
@@ -3223,7 +3530,7 @@ private final class PanelContentView: PassthroughView {
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.78),
             .paragraphStyle: centered,
         ]
-        ("清除已完成" as NSString).draw(
+        (L.s("panel.clearDone") as NSString).draw(
             in: NSRect(x: rect.minX, y: rect.midY - 7, width: rect.width, height: 14),
             withAttributes: attrs)
         clearDoneRect = rect
@@ -3408,9 +3715,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private var pendingAnswerPicked: Set<String> = []
     private var pendingAnswerOptions: [String] = []
     /// 多选题的提交行：点它才把已选集合发出去（单击选项只切换选中态）。
-    fileprivate static let multiSubmitLabel = "✓ 提交答案"
+    fileprivate static let multiSubmitLabel = L.s("action.submit")
     /// U-24：提交成功后必须出现的文案（不可撤回）。
-    private static let submittedLabel = "已提交 · 不可撤回"
+    private static let submittedLabel = L.s("answer.submitted")
     /// N-10：当前审批对应的提问列表（无 options 时要逐条输入文本）。
     private var pendingQuestions: [RadarQuestion] = []
     /// 待审批项的一次性 token（桥用来确认「这次决定来自看到这条审批的人」）。
@@ -3531,7 +3838,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             DispatchQueue.main.async {
                 // M9-c：先让用户看到「加载中」页（首屏），数据到了再增量填充。
                 let loadingStart = DispatchTime.now()
-                var loading = RadarDetail(title: "M9 bench", agent: "bench", meta: "加载中…", body: "")
+                var loading = RadarDetail(title: "M9 bench", agent: "bench", meta: L.s("panel.loading"), body: "")
                 loading.runStatus = "running"
                 self.detail = loading
                 self.detailMode = .events
@@ -3592,6 +3899,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
 
         installSignalHandlers()
+
+        log("lang=\(resolvedLanguage.lang) source=\(resolvedLanguage.source)")
 
         let restored = restoredCircleOrigin()
         circleOrigin = restored ?? defaultCircleOrigin()
@@ -4981,6 +5290,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 待答横幅聚合用：只维护一张，计数变化时换标题（U-54 / §2.4-c）。
     private var questionBannerWindow: NSWindow?
     private var questionBannerCount = 0
+    /// 横幅当前代表的那一条（id）。列表头变了要重建，否则横幅会指着一个已消失的条目。
+    private var questionBannerId = ""
+    /// 审批同样只留一张聚合横幅（规格 §2.4-c：常驻只留一条，数量体现在标题）。
+    private var approvalBannerWindow: NSWindow?
+    private var approvalBannerCount = 0
+    private var approvalBannerId = ""
     /// 评审三态（blocked/rework/verifying）各自一张聚合横幅。
     private var reviewBannerWindows: [String: NSWindow] = [:]
     private var reviewBannerCounts: [String: Int] = [:]
@@ -5016,13 +5331,15 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
             questionBannerWindow = nil
             questionBannerCount = 0
+            questionBannerId = ""
             return
         }
         // 计数没变 → 不重建（避免每 2s 轮询都闪一下横幅）；计数变了 → 换标题。
-        guard questionBannerWindow == nil || questionBannerCount != pending else { return }
+        let headId = first.id ?? ""
+        guard questionBannerWindow == nil || questionBannerCount != pending || questionBannerId != headId else { return }
         if let old = questionBannerWindow { dismissBanner(old, reason: "regroup") }
-        let title = pending > 1 ? "等你回答(\(pending))" : "等你回答"
-        let body = first.title ?? "agent 有问题要问你"
+        let title = pending > 1 ? L.f("banner.qPlural", pending) : L.s("q.title")
+        let body = first.title ?? L.s("banner.questionBody")
         let window = showBanner(title: title, body: body,
                                 bannerId: first.id, bannerKind: "question") { [weak self] in
             // 提问横幅点击 = 打开处置页（不做跳转，跳转会让用户丢掉回执通道）。
@@ -5030,6 +5347,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         questionBannerWindow = window
         questionBannerCount = pending
+        questionBannerId = headId
         log("banner aggregate kind=question n=\(pending) title=\(title) first=\(shortId(first.id ?? ""))")
         if !items.isEmpty {
             let dt = Date().timeIntervalSince(notifyStarted) * 1000
@@ -5046,21 +5364,34 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     /// 新完成的任务发一条 macOS 通知（同一任务只提醒一次）。
     private func notifyApproval() {
-        let fresh = state.approvalItems.filter { item in
-            guard let id = item.id else { return false }
-            return !notifiedApproval.contains(id)
-        }
-        for item in fresh {
-            guard let id = item.id else { continue }
-            notifiedApproval.insert(id)
-            let count = state.approvalItems.count
-            let title = count > 1 ? "等你批准（\(count) 个）" : "等你批准"
-            showBanner(title: title, body: item.title ?? "有一个任务等你批准",
-                       bannerId: id, bannerKind: "approval") { [weak self] in
-                self?.openApproval((id: item.id ?? "", approvalId: item.approvalId ?? item.id ?? ""))
+        // 规格 §2.4-c：常驻只留**一条**，数量体现在标题（`N approvals needed`）。
+        // 旧实现逐条弹卡 —— 2 条待批会出现 2 张同标题横幅，用户以为有 4 条（t30 复现）。
+        let items = state.approvalItems
+        guard let first = items.first else {
+            if let window = approvalBannerWindow {
+                dismissBanner(window, reason: "no-approvals")
+                log("banner aggregate cleared kind=approval")
             }
-            log("banner approval \(shortId(id)) \(item.title ?? "")")
+            approvalBannerWindow = nil
+            approvalBannerCount = 0
+            approvalBannerId = ""
+            return
         }
+        let count = max(state.approvals, items.count)
+        let headId = first.id ?? ""
+        // 计数或队首没变 → 不重建（避免每 2s 轮询闪一下）。
+        guard approvalBannerWindow == nil || approvalBannerCount != count || approvalBannerId != headId else { return }
+        if let old = approvalBannerWindow { dismissBanner(old, reason: "regroup") }
+        for item in items { if let id = item.id { notifiedApproval.insert(id) } }
+        let title = count > 1 ? L.f("banner.apPlural", count) : L.s("banner.approvalTitle")
+        let window = showBanner(title: title, body: first.title ?? L.s("banner.approvalBody"),
+                                bannerId: headId, bannerKind: "approval") { [weak self] in
+            self?.openApproval((id: first.id ?? "", approvalId: first.approvalId ?? first.id ?? ""))
+        }
+        approvalBannerWindow = window
+        approvalBannerCount = count
+        approvalBannerId = headId
+        log("banner aggregate kind=approval n=\(count) title=\(title) first=\(shortId(headId))")
     }
 
     /// 完成提醒：折叠成一条队列卡（2.21）。新完成不断并进同一张卡，标题是
@@ -5097,11 +5428,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             log("banner done mismatch feed=\(state.doneUnread) ids=\(unreadIds.count) visible=\(visibleIds.count)")
         }
         let newest = fresh.max { ($0.updatedAt ?? 0) < ($1.updatedAt ?? 0) } ?? fresh[0]
-        let body = newest.title ?? "任务已完成"
+        let body = newest.title ?? L.s("banner.doneTitle")
         // 旧卡先撤掉，避免「一张单条卡 + 一张折叠卡」同时挂着互相覆盖。
         if let old = doneBanner { dismissBanner(old, reason: "merge"); doneBanner = nil }
         let count = pendingDoneCount
-        let title = count > 1 ? "\(count) 个任务完成" : (newest.kind == "session" ? "会话完成" : (newest.agent ?? "agent").uppercased() + " 任务完成")
+        let title = count > 1 ? L.f("banner.donePlural", count) : (newest.kind == "session" ? L.s("banner.sessionDone") : (newest.agent ?? "agent").uppercased() + L.s("banner.doneSuffix"))
         let ids = pendingDoneIds
         let newestKind = newest.kind ?? "run"
         let newestStatus = newest.status ?? "done"
@@ -5152,13 +5483,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         for item in state.failedRuns {
             guard let id = item.id, !notifiedFailed.contains(id) else { continue }
             notifiedFailed.insert(id)
-            let body = (item.finalAnswer?.isEmpty == false ? item.finalAnswer! : item.title) ?? "任务失败了"
+            let body = (item.finalAnswer?.isEmpty == false ? item.finalAnswer! : item.title) ?? L.s("banner.failedTitle")
             // N-08：插值必须整体加括号，否则 Swift 会把 `.uppercased()` 当字面量打进标题
             // （实测横幅出现过 `codex.uppercased() 任务失败`）。
             let who = (item.agent ?? "agent").uppercased()
             // 失败卡也可点：点开就是这次 run 的日志/结果（否则用户只能自己去找）。
             let failedId = id
-            showBanner(title: "\(who) 任务失败", body: body,
+            showBanner(title: L.f("banner.failed", who), body: body,
                        bannerId: failedId, bannerKind: "run") { [weak self] in
                 self?.openDetail(failedId)
             }
@@ -5166,9 +5497,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         // U-13：blocked / rework / verifying 三种状态在横幅里也必须能看到。
         // 每态聚合成一张（标题带 (N)），同态计数不变就不重建，避免每 2s 刷屏。
-        notifyReviewState("blocked", title: "任务卡住", items: state.items.filter { $0.status == "blocked" })
-        notifyReviewState("rework", title: "审查未通过", items: state.items.filter { $0.status == "rework" })
-        notifyReviewState("verifying", title: "校验中",
+        notifyReviewState("blocked", title: L.s("review.blockedTitle"), items: state.items.filter { $0.status == "blocked" })
+        notifyReviewState("rework", title: L.s("review.reworkTitle"), items: state.items.filter { $0.status == "rework" })
+        notifyReviewState("verifying", title: L.s("review.verifyingTitle"),
                           items: state.items.filter { $0.status == "verifying" || $0.status == "unverified" })
     }
 
@@ -5188,7 +5519,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if let old = reviewBannerWindows[kind] { dismissBanner(old, reason: "regroup") }
         let text = count > 1 ? "\(title)(\(count))" : title
         let id = first.id ?? ""
-        let body = first.title ?? first.error ?? first.note ?? "点开看这一条"
+        let body = first.title ?? first.error ?? first.note ?? L.s("banner.openOne")
         let window = showBanner(title: text, body: body, bannerId: id, bannerKind: kind) { [weak self] in
             self?.openDetail(id)
         }
@@ -5847,13 +6178,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func clearDone() {
         guard var components = feedBaseComponents() else {
             log("clear-done: no resolved url last=\(lastResolvedURLString)")
-            showBanner(title: "清除失败", body: "还没连上雷达服务")
+            showBanner(title: L.s("toast.clearFailedShort"), body: L.s("toast.offline"))
             return
         }
         components.path = (components.path.isEmpty ? "" : components.path) + "/clear-done"
         guard let url = components.url else {
             log("clear-done: bad url path=\(components.path)")
-            showBanner(title: "清除失败", body: "地址不完整")
+            showBanner(title: L.s("toast.clearFailedShort"), body: L.s("toast.badUrl"))
             return
         }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
@@ -5868,13 +6199,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 log("clear-done status=\(status) bytes=\(data?.count ?? 0) body=\(text.prefix(160))")
                 if let error {
                     log("clear-done failed \(error.localizedDescription)")
-                    self.showBanner(title: "清除没成功", body: "下次再试")
+                    self.showBanner(title: L.s("toast.clearFailed"), body: L.s("toast.tryLater"))
                     return
                 }
                 let okStatus = (200...299).contains(status)
                 let okBody = !text.isEmpty && text.contains("\"ok\"") && !text.contains("\"ok\":false")
                 guard okStatus, okBody else {
-                    self.showBanner(title: "清除没成功", body: "服务返回 \(status)")
+                    self.showBanner(title: L.s("toast.clearFailed"), body: L.f("toast.serverSaid", status))
                     return
                 }
                 log("clear-done ok cleared=\(text.prefix(80))")
@@ -5898,7 +6229,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if state.questions > 0 {
             // U-54：多条待答时胶囊必须带计数，不能只显示第一条（用户看不出还有几问答没处理）。
             let pending = max(state.questions, state.questionItems.count)
-            prefix = pending > 1 ? "等回答(\(pending))：" : "等回答："
+            prefix = pending > 1 ? L.f("pill.qPrefixN", pending) : L.s("pill.qPrefix")
             accent = HUD.questionColor
             glyph = "?"
             if let item = state.items.first(where: { $0.isQuestion }) {
@@ -5910,16 +6241,16 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     if index == 0 {
                         body = text
                     } else {
-                        prefix = "第 \(index + 1) 个问题："
+                        prefix = L.f("pill.questionNth", index + 1)
                         body = text
                     }
                 } else {
                     body = firstSentence(item.title ?? "")
                 }
             }
-            if firstSentence(body ?? "").isEmpty { body = "会话在等你回答" }
+            if firstSentence(body ?? "").isEmpty { body = L.s("pill.sessionWaiting") }
         } else if state.approvals > 0 {
-            prefix = "要批准："
+            prefix = L.s("pill.approvalPrefix")
             accent = HUD.approvalColor
             glyph = "✓"
             if let item = state.items.first(where: { $0.isApproval }) {
@@ -5927,15 +6258,15 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
         } else if state.blockedCount > 0 {
             // U-13：卡住（等用户决定）以前在胶囊里根本不存在，被当成 idle。
-            prefix = "卡住："
+            prefix = L.s("pill.blockedPrefix")
             accent = HUD.blockedColor
             glyph = "!"
             if let item = state.items.first(where: { $0.status == "blocked" }) {
                 body = item.title ?? item.error
             }
-            if firstSentence(body ?? "").isEmpty { body = "有任务卡在等你决定" }
+            if firstSentence(body ?? "").isEmpty { body = L.s("pill.blockedFallback") }
         } else if state.failed > 0 {
-            prefix = "失败："
+            prefix = L.s("pill.failedPrefix")
             accent = HUD.failedColor
             glyph = "×"
             if let item = state.items.first(where: { $0.isFailedRun || $0.status == "failed" }) {
@@ -5943,13 +6274,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
         } else if state.reworkCount > 0 {
             // U-13：返工中（审查未通过）同样要能在胶囊上看见。
-            prefix = "要改："
+            prefix = L.s("pill.reworkPrefix")
             accent = HUD.reworkColor
             glyph = ""
             if let item = state.items.first(where: { $0.status == "rework" }) {
                 body = item.title ?? item.note ?? item.error
             }
-            if firstSentence(body ?? "").isEmpty { body = "有任务需要返工" }
+            if firstSentence(body ?? "").isEmpty { body = L.s("pill.reworkFallback") }
         } else {
             return nil
         }
@@ -6219,21 +6550,21 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         panelContent?.isQuestionDetail = question
         panelContent?.questionIdFallback = (item.questions ?? []).first?.id
         detail = RadarDetail(
-            title: "\((item.agent ?? "codex").uppercased()) " + (question ? "有问题要问你" : "请求批准"),
+            title: "\((item.agent ?? "codex").uppercased()) " + (question ? L.s("pill.questionGeneric") : L.s("approval.requested")),
             agent: item.agent ?? "codex",
             meta: item.staleApproval == true
-                ? "这条审批是宿主重启前留下的，已经没有进程在等它，可以直接忽略"
+                ? L.s("banner.staleApproval")
                 : question
                     ? item.answerRequest != nil
                         ? ((item.questions ?? []).allSatisfy { ($0.options ?? []).isEmpty }
-                            ? "等你回答 · 这条提问要自由文本，本次只能在 DSH 里回答"
+                            ? L.s("row.qFreeTextOnly")
                             : (pendingAnswerMulti
-                                ? "等你回答 · 多选：点选项切换，点「\(Self.multiSubmitLabel)」发送；20s 没答自动回桌面卡"
-                                : "等你回答 · 点一个选项即提交；20s 没答自动回桌面卡"))
+                                ? L.f("row.qMultiMeta", Self.multiSubmitLabel)
+                                : L.s("row.qTapSubmit")))
                         : ((item.questions ?? []).allSatisfy { ($0.options ?? []).isEmpty }
-                            ? "等你回答 · 这条提问要自由文本，点「✎ 回答…」输入后发送；不答超时按拒绝处理"
-                            : "等你回答 · 选一个选项 = 回执该选项；不答超时按拒绝处理")
-                    : "等你决定 · 5 分钟内不处理会自动拒绝",
+                            ? L.s("row.qFreeAnswerInHud")
+                            : L.s("row.qPickOption"))
+                    : L.s("row.approvalMeta"),
             body: item.title ?? "",
             runId: item.id ?? "",
             live: false
@@ -6261,8 +6592,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let qid = block.id.isEmpty ? "q\(blockIndex)" : block.id
         let head = block.text.count > 60 ? String(block.text.prefix(60)) + "…" : block.text
         inputFocused = true
-        let text = promptText(title: "回答：\(head)",
-                              message: block.text.isEmpty ? "（这个问题没有正文，请直接输入你的回答）" : block.text)
+        let text = promptText(title: L.f("alert.answerHead", head),
+                              message: block.text.isEmpty ? L.s("alert.noBody") : block.text)
         inputFocused = false
         guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             log("free-answer cancelled qid=\(qid)")
@@ -6270,7 +6601,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         guard let request = pendingAnswerRequest, let token = pendingAnswerToken else {
             log("free-answer blocked: no receipt channel qid=\(qid)")
-            _ = showBanner(title: "这条只能回 DSH 答", body: "胶囊没拿到回执通道（被接管才可答）", onClick: nil)
+            _ = showBanner(title: L.s("alert.onlyInDsh"), body: L.s("alert.noChannel"), onClick: nil)
             return
         }
         log("free-answer submit qid=\(qid) len=\(text.count)")
@@ -6286,14 +6617,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func promptAnswers() {
         if pendingAnswerRequest != nil {
             log("prompt blocked: dsh question is answered in place only")
-            _ = showBanner(title: "这条要自由文本", body: "本次只能在 DSH 里回答", onClick: nil)
+            _ = showBanner(title: L.s("alert.freeTextOnly"), body: L.s("alert.answerInDsh"), onClick: nil)
             return
         }
         let asks = pendingQuestions
         let fallbackQid = panelContent?.questionIdFallback ?? "reply"
         var collected: [String: String] = [:]
         if asks.isEmpty {
-            guard let text = promptText(title: "回答这个提问", message: detail?.body ?? "") else {
+            guard let text = promptText(title: L.s("alert.answerOne"), message: detail?.body ?? "") else {
                 log("question free-text cancelled (no question metadata)")
                 return
             }
@@ -6301,7 +6632,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         } else {
             for (index, ask) in asks.enumerated() {
                 let qid = ask.id ?? "q\(index)"
-                let title = asks.count > 1 ? "回答 \(index + 1)/\(asks.count)" : "回答这个提问"
+                let title = asks.count > 1 ? L.f("alert.answerNth", index + 1, asks.count) : L.s("alert.answerOne")
                 guard let text = promptText(title: title, message: ask.question ?? detail?.body ?? "") else {
                     log("question free-text cancelled qid=\(qid)")
                     return
@@ -6320,11 +6651,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = title
-        alert.informativeText = message.isEmpty ? "请输入你的回答" : message
-        alert.addButton(withTitle: "发送")
-        alert.addButton(withTitle: "取消")
+        alert.informativeText = message.isEmpty ? L.s("alert.inputTitle") : message
+        alert.addButton(withTitle: L.s("alert.send"))
+        alert.addButton(withTitle: L.s("action.cancel"))
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "输入你的回答（可以是一整句话）"
+        field.placeholderString = L.s("alert.inputHint")
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         let response = alert.runModal()
@@ -6389,7 +6720,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard entries.count == answerOrder.count else {
             let missing = answerOrder.count - entries.count
             log("answer submit blocked unanswered=\(missing) of \(answerOrder.count)")
-            _ = showBanner(title: "还有 \(missing) 问没答", body: "每一问都要选一项才能提交", onClick: nil)
+            _ = showBanner(title: L.f("answer.missingN", missing), body: L.s("answer.selectEvery"), onClick: nil)
             return
         }
         submitAnswer(request: request, token: token, entries: entries)
@@ -6480,7 +6811,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     self.answerSelections = [:]
                     self.answerCustom = [:]
                     self.fetchNow(reason: "answer-submitted")
-                    _ = self.showBanner(title: "已提交", body: "AI 收到答案了", onClick: nil)
+                    _ = self.showBanner(title: L.s("toast.submitted"), body: L.s("toast.answerDelivered"), onClick: nil)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                         self.answerSubmittedNotice = nil
                         self.panelContent?.submittedNotice = nil
@@ -6499,7 +6830,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         log("[answer] failure kind=expired status=\(status) body=\(text.prefix(80))")
                     } else {
                         let reason = text.isEmpty
-                            ? (error?.localizedDescription ?? "网络错误")
+                            ? (error?.localizedDescription ?? L.s("common.networkError"))
                             : String(text.prefix(60))
                         self.panelContent?.setAnswerFailure(kind: "retry", reason: reason)
                         log("[answer] failure kind=retry status=\(status) reason=\(reason)")
@@ -6517,7 +6848,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // 不拦的话点「回答/批准」会拿 question:<sessionId> 去打 approval-decide → 桥 404 → 假失败。
         if approvalId.hasPrefix("question:") {
             log("decide blocked: dsh question has no bridge approval id=\(approvalId)")
-            _ = showBanner(title: "回 DSH 里回答", body: "胶囊暂时只能提醒；回执要在会话里提交", onClick: nil)
+            _ = showBanner(title: L.s("alert.backToDsh"), body: L.s("alert.reminderOnly"), onClick: nil)
             return
         }
         let raw = lastResolvedURLString.split(separator: "|").first.map(String.init) ?? ""
@@ -6563,14 +6894,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     self.pendingAnswerToken = nil
                     self.pendingQuestions = []
                     self.closeDetail()
-                    self.showBanner(title: "服务端未确认，已本地关闭",
-                                    body: "这条审批可能已经失效；详情已收起，可刷新再看", onClick: nil)
+                    self.showBanner(title: L.s("toast.decideUnconfirmed"),
+                                    body: L.s("toast.decideUnconfirmedHint"), onClick: nil)
                     self.fetchNow(reason: "after-approval-failed")
                     return
                 }
                 // U-21/U-53：先原地显示「已批准 / 已拒绝」，1.5s 后再收起（不可撤销要说清）。
                 let notice = answers?.isEmpty == false ? Self.submittedLabel
-                    : (approve ? "已批准" : "已拒绝")
+                    : (approve ? L.s("approval.approved") : L.s("approval.rejected"))
                 log("approval notice \(notice) decision=\(decision)")
                 self.panelContent?.setDecisionNotice(notice)
                 self.pendingApprovalId = nil
@@ -6604,7 +6935,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // 已经明确报告「页面加载的是旧 bundle」→ 优先按 reload 处理（自愈在页面侧，HUD 只负责说清楚）。
         if half.reload == true, !clientHalfReloadHintShown {
             clientHalfReloadHintShown = true
-            _ = showBanner(title: "页面需刷新", body: "胶囊检测到页面还是旧版本，刷新后跳转恢复（会自动重试）")
+            _ = showBanner(title: L.s("banner.reloadTitle"), body: L.s("banner.reloadBody"))
             log("banner client-half reload host=\(half.hostBuild ?? "-") page=\(half.build ?? "-")")
             return
         }
@@ -6617,7 +6948,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard !clientHalfStaleShown else { return }
         clientHalfStaleShown = true
         // 快速短暂提示（4 秒自动消失），不抢焦点、不重复打扰。
-        _ = showBanner(title: "跳转需刷新页面", body: half.hint ?? "页面里的雷达 client 半边没在轮询")
+        _ = showBanner(title: L.s("banner.staleTitle"), body: half.hint ?? L.s("banner.staleBody"))
         log("banner client-half stale ageMs=\(ageText) lastBeacon=\(half.lastBeacon ?? "never")")
     }
 
@@ -6706,10 +7037,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     private func bannerJumpFailed(sessionId: String, reason: String) {
-        let title = reason == "degraded" ? "已打开 DSH，但没定位到会话" : "跳转没成功，未标记已读"
+        let title = reason == "degraded" ? L.s("toast.jumpNoSession") : L.s("toast.jumpFailed")
         let body = reason == "degraded"
-            ? "页面侧 client 没在轮询，重载页面后再点会直接跳转"
-            : "会话 \(sessionId.prefix(8))：\(reason)"
+            ? L.s("toast.jumpDegraded")
+            : L.f("toast.jumpFailedBody", String(sessionId.prefix(8)), reason)
         _ = showBanner(title: title, body: body)
     }
 
@@ -6771,26 +7102,26 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         /// 把毫秒时间戳差转成「12 分钟」「1 小时 6 分」这种可读时长。
     private func humanDuration(_ ms: Double) -> String {
         let seconds = max(0, ms / 1000)
-        if seconds < 60 { return "\(Int(seconds)) 秒" }
+        if seconds < 60 { return L.f("time.seconds", Int(seconds)) }
         let minutes = seconds / 60
-        if minutes < 60 { return "\(Int(minutes)) 分钟" }
+        if minutes < 60 { return L.f("time.minutes", Int(minutes)) }
         let hours = minutes / 60
-        return "\(Int(hours)) 小时 \(Int(minutes) - Int(hours) * 60) 分"
+        return L.f("time.hoursMinutes", Int(hours), Int(minutes) - Int(hours) * 60)
     }
 
     /// 统一相对时间文案（用户 2026-11-19 要求）：
     /// 刚刚 / N 分钟前 / N 小时前 / N 天前，超过 30 天给日期（MM-dd）。
     /// 禁止出现负数与「0 小时」这类噪声。
     private func relativeTime(_ ms: Double, now: Double) -> String {
-        guard ms > 0, ms.isFinite else { return "刚刚" }
+        guard ms > 0, ms.isFinite else { return L.s("time.justNow") }
         let diff = now - ms
-        if !diff.isFinite || diff < 60_000 { return "刚刚" }
+        if !diff.isFinite || diff < 60_000 { return L.s("time.justNow") }
         let minutes = Int(diff / 60_000)
-        if minutes < 60 { return "\(minutes) 分钟前" }
+        if minutes < 60 { return L.f("time.minutesAgo", minutes) }
         let hours = minutes / 60
-        if hours < 24 { return "\(hours) 小时前" }
+        if hours < 24 { return L.f("time.hoursAgo", hours) }
         let days = hours / 24
-        if days <= 30 { return "\(days) 天前" }
+        if days <= 30 { return L.f("time.daysAgo", days) }
         return dateText(ms)
     }
 
@@ -6823,61 +7154,61 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let startedMs = (item.startedAt ?? 0) > 0 ? (item.startedAt! * 1000) : nil
         let finishedMs = (item.finishedAt ?? 0) > 0 ? (item.finishedAt! * 1000) : nil
         if let fs = item.formatStatus, !fs.isEmpty {
-            body.append("当前：\(fs)")
+            body.append(L.f("detail.current", fs))
         }
         if let stages = item.stages, !stages.isEmpty {
-            let activeIndex = stages.firstIndex { ($0.status ?? "").contains("进行中") }
-                ?? stages.firstIndex { ($0.status ?? "").contains("就绪") }
+            let activeIndex = stages.firstIndex { ($0.status ?? "").contains(L.s("status.running")) }
+                ?? stages.firstIndex { ($0.status ?? "").contains(L.s("status.ready")) }
                 ?? 0
             let current = stages[activeIndex]
-            body.append("阶段 \(activeIndex + 1)/\(stages.count)：\(current.subject ?? "")")
+            body.append(L.f("detail.stage", activeIndex + 1, stages.count, current.subject ?? ""))
             if let next = stages.dropFirst(activeIndex + 1).first(where: {
                 !($0.status ?? "").contains("已完成")
             }) {
-                body.append("下一步：\(next.subject ?? "")")
+                body.append(L.f("detail.next", next.subject ?? ""))
             }
         }
         if running {
             if let started = startedMs, nowMs - started <= 6 * 60 * 60 * 1000 {
-                body.append("状态：进行中 · 已运行 \(humanDuration(nowMs - started))")
+                body.append(L.f("detail.runningSince", humanDuration(nowMs - started)))
             } else {
-                body.append("状态：进行中")
+                body.append(L.s("detail.statusRunning"))
             }
             let touchedMs = Double(item.updatedAt ?? 0) > 0 ? Double(item.updatedAt!) : nil
             if let touchedMs, nowMs - touchedMs < 365.0 * 24 * 3600 * 1000 {
-                body.append("最近活动：\(relativeTime(touchedMs, now: nowMs))")
+                body.append(L.f("detail.lastActivity", relativeTime(touchedMs, now: nowMs)))
             }
             if let kids = item.children, !kids.isEmpty {
                 let done = kids.filter { ($0.taskStatus ?? "").contains("已完成") }.count
-                body.append("团队进度：\(done)/\(kids.count) 已完成")
+                body.append(L.f("detail.teamProgress", done, kids.count))
                 if let current = kids.first(where: { $0.isRunning }) {
-                    body.append("当前成员：\(current.role ?? current.displayTitle)")
+                    body.append(L.f("detail.currentMember", current.role ?? current.displayTitle))
                 }
             }
-            body.append("点下方「跳到会话」可以进对话看具体输出。")
+            body.append(L.s("detail.jumpHintRunning"))
         } else {
             // 完成态不再用「已运行」：只给一句话结论 + 完成于 <相对时间>；
             // 耗时只在可解释窗口内（≤6 小时）才追加，避免「耗时 3000+ 小时」。
-            var statusLine = "状态：已完成"
+            var statusLine = L.s("detail.statusDone")
             if let note = item.note, !note.isEmpty { statusLine += "（\(note)）" }
             if let span = plausibleDuration(started: startedMs, finished: finishedMs) {
-                statusLine += " · 耗时 \(humanDuration(span))"
+                statusLine += L.f("detail.elapsedSuffix", humanDuration(span))
             }
             body.append(statusLine)
             if let finishedMs {
-                body.append("完成于：\(relativeTime(finishedMs, now: nowMs))")
+                body.append(L.f("detail.finishedAt", relativeTime(finishedMs, now: nowMs)))
             }
             if let kids = item.children, !kids.isEmpty {
                 let done = kids.filter { ($0.taskStatus ?? "").contains("已完成") }.count
-                body.append("团队进度：\(done)/\(kids.count) 已完成")
+                body.append(L.f("detail.teamProgress", done, kids.count))
             }
-            body.append("点下方「跳到会话」回到这段对话。")
+            body.append(L.s("detail.jumpHintDone"))
         }
         detailLastSeq = 0
         let sessionId = item.id ?? ""
-        boardDetail(title: item.title ?? "会话",
+        boardDetail(title: item.title ?? L.s("kind.session"),
                     agent: item.agent ?? "dsh",
-                    meta: running ? "运行中的会话" : "已完成的会话",
+                    meta: running ? L.s("detail.runningSessions") : L.s("detail.doneSessions"),
                     body: body.joined(separator: "\n"),
                     sessionId: sessionId,
                     live: running)
@@ -6908,8 +7239,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             openSessionCard(item)
             return
         }
-        var detail = RadarDetail(title: item.title ?? "会话", agent: item.agent ?? "dsh",
-                                 meta: "\(kids.count) 个子会话", body: "")
+        var detail = RadarDetail(title: item.title ?? L.s("kind.session"), agent: item.agent ?? "dsh",
+                                 meta: L.f("detail.childCount", kids.count), body: "")
         detail.parentId = item.id ?? ""
         detail.children = kids
         detail.isSession = true
@@ -6932,9 +7263,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func openChildDetail(_ id: String) {
         let parent = detail
         let child = parent?.children.first { $0.id == id }
-        var next = RadarDetail(title: child?.displayTitle ?? "子会话",
+        var next = RadarDetail(title: child?.displayTitle ?? L.s("detail.childSessions"),
                                agent: child?.agent ?? "dsh",
-                               meta: child.map { $0.isRunning ? "进行中" : "已结束" } ?? "",
+                               meta: child.map { $0.isRunning ? L.s("status.running") : L.s("run.finished") } ?? "",
                                body: "")
         next.isSession = true
         next.jumpSessionId = id
@@ -6952,8 +7283,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     private func openChildren(_ item: RadarItem) {
         let kids = item.children ?? []
-        var detail = RadarDetail(title: item.title ?? "会话", agent: item.agent ?? "dsh",
-                                 meta: "\(kids.count) 个子会话", body: "")
+        var detail = RadarDetail(title: item.title ?? L.s("kind.session"), agent: item.agent ?? "dsh",
+                                 meta: L.f("detail.childCount", kids.count), body: "")
         detail.parentId = item.id ?? ""
         detail.children = kids
         self.detail = detail
@@ -6975,9 +7306,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         log("session menu open id=\(shortId(sessionId)) title=\(item.title ?? "-")")
         detailOpenedAt = Date()
         detailLastSeq = 0
-        detail = RadarDetail(title: item.title ?? "（无标题）",
+        detail = RadarDetail(title: item.title ?? L.s("common.untitled"),
                              agent: item.agent ?? "dsh",
-                             meta: "会话 \(shortId(sessionId))",
+                             meta: L.f("detail.sessionMeta", shortId(sessionId)),
                              body: "",
                              runId: sessionId)
         panelContent?.detail = detail
@@ -6993,9 +7324,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         detailForcedMode = mode
         detailOpenedAt = Date()
         detailLastSeq = 0
-        detail = RadarDetail(title: item.title ?? "（无标题）",
+        detail = RadarDetail(title: item.title ?? L.s("common.untitled"),
                              agent: item.agent ?? "unknown",
-                             meta: "加载中…",
+                             meta: L.s("panel.loading"),
                              body: item.finalAnswer ?? "",
                              runId: id,
                              live: item.isRunningSession || item.isRunningRun)
@@ -7016,14 +7347,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         } else {
             detailForcedMode = nil
         }
-        fetchRunDetail(id: id, title: item.title ?? "（无标题）", agent: item.agent ?? "unknown")
+        fetchRunDetail(id: id, title: item.title ?? L.s("common.untitled"), agent: item.agent ?? "unknown")
     }
 
     /// 失败页「重试」：让插件用同一 prompt/agent/cwd 重发，再刷新列表。
     private func retryRun() {
         guard let detail, !detail.runId.isEmpty else { return }
         guard let components = feedBaseComponents() else {
-            showBanner(title: "重试没成功", body: "拿不到雷达地址")
+            showBanner(title: L.s("toast.retryFailed"), body: L.s("toast.noRadarUrl"))
             return
         }
         var target = components
@@ -7042,10 +7373,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     log("retry ok run=\(self.shortId(self.detail?.runId ?? "-")) body=\(text.prefix(120))")
                     self.closeDetail()
                     self.fetchNow(reason: "retry")
-                    self.showBanner(title: "已重试", body: "新任务已排队，稍后看列表")
+                    self.showBanner(title: L.s("toast.retried"), body: L.s("toast.retryQueued"))
                 } else {
                     log("retry failed status=\(status) body=\(text.prefix(160))")
-                    self.showBanner(title: "重试没成功", body: text.isEmpty ? "服务返回 \(status)" : String(text.prefix(60)))
+                    self.showBanner(title: L.s("toast.retryFailed"), body: text.isEmpty ? L.f("toast.serverSaid", status) : String(text.prefix(60)))
                 }
             }
         }.resume()
@@ -7056,14 +7387,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         guard let detail else { return }
         let text = detail.body.isEmpty ? (state.items.first { $0.id == detail.runId }?.error ?? "") : detail.body
         guard !text.isEmpty else {
-            showBanner(title: "没有可复制的错误", body: "这条任务没有留下错误文本")
+            showBanner(title: L.s("toast.noError"), body: L.s("toast.noErrorBody"))
             return
         }
         let board = NSPasteboard.general
         board.clearContents()
         board.setString(text, forType: .string)
         log("copy error run=\(shortId(detail.runId)) chars=\(text.count)")
-        showBanner(title: "错误已复制", body: "粘贴到 DSH 里就能追问")
+        showBanner(title: L.s("toast.copied"), body: L.s("toast.copiedHint"))
     }
 
     /// 失败页「清掉这条」：标已读并从列表移除，磁盘上的 run 记录不动。
@@ -7079,7 +7410,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func hideCurrentSession() {
         guard let detail, !detail.runId.isEmpty else { return }
         guard let components = feedBaseComponents() else {
-            showBanner(title: "移除没成功", body: "拿不到雷达地址")
+            showBanner(title: L.s("toast.removeFailed"), body: L.s("toast.noRadarUrl"))
             return
         }
         var target = components
@@ -7098,10 +7429,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     log("hide session ok id=\(self.shortId(self.detail?.runId ?? "-"))")
                     self.closeDetail()
                     self.fetchNow(reason: "hide-session")
-                    self.showBanner(title: "已从雷达移除", body: "DSH 里的会话数据没动")
+                    self.showBanner(title: L.s("toast.removed"), body: L.s("toast.removedHint"))
                 } else {
                     log("hide session failed status=\(status) body=\(text.prefix(160))")
-                    self.showBanner(title: "移除没成功", body: text.isEmpty ? "服务返回 \(status)" : String(text.prefix(60)))
+                    self.showBanner(title: L.s("toast.removeFailed"), body: text.isEmpty ? L.f("toast.serverSaid", status) : String(text.prefix(60)))
                 }
             }
         }.resume()
@@ -7198,9 +7529,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             let verdict = (obj["verdict"] as? String) ?? "unknown"
             let missing = (obj["missing"] as? [String]) ?? []
             let fixes = (obj["required_fixes"] as? [String]) ?? []
-            var lines: [String] = ["验收结论：\(verdict)"]
-            if !missing.isEmpty { lines.append("缺：" + missing.prefix(2).joined(separator: "；")) }
-            if !fixes.isEmpty { lines.append("要改：" + fixes.prefix(2).joined(separator: "；")) }
+            var lines: [String] = [L.f("detail.verdictHead", verdict)]
+            if !missing.isEmpty { lines.append(L.s("common.missing") + missing.prefix(2).joined(separator: "；")) }
+            if !fixes.isEmpty { lines.append(L.s("pill.reworkPrefix") + fixes.prefix(2).joined(separator: "；")) }
             let text = lines.joined(separator: "\n")
             DispatchQueue.main.async {
                 guard var current = self.detail, current.runId == runId else { return }
@@ -7247,8 +7578,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     }
                     current.live = false
                     current.runStatus = "missing"
-                    current.meta = "详情不可用 · 宿主已回收这条记录（\(message)）；已停止刷新"
-                    if current.body.isEmpty { current.body = "（这条任务的结果已不在宿主内存里）" }
+                    current.meta = L.f("detail.unavailable", message)
+                    if current.body.isEmpty { current.body = L.s("detail.resultGone") }
                     self.detail = current
                     self.panelContent?.detail = current
                     self.refreshExpandedGeometry(animated: false)
@@ -7299,7 +7630,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 current.runId = id
                 // 失败页不能是空白：没有事件/正文时给一句明确解释，动作按钮照常可用。
                 if self.detailMode == .failure, current.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    current.body = "没有可展示的事件（可能是历史 run）；可以从下面重试、复制错误或清掉这条。"
+                    current.body = L.s("detail.noEvents")
                 }
                 self.detail = current
                 self.panelContent?.detail = current
@@ -7369,27 +7700,27 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         case "text":
             brief = (event["text"] as? String) ?? ""
         case "reasoning":
-            brief = (event["text"] as? String) ?? "思考"
+            brief = (event["text"] as? String) ?? L.s("event.thinking")
         case "item.start", "item.end":
             brief = (event["title"] as? String) ?? (event["itemType"] as? String) ?? ""
         case "turn.start":
-            brief = "回合开始"
+            brief = L.s("event.turnStart")
         case "turn.end":
-            brief = (event["status"] as? String) ?? "结束"
+            brief = (event["status"] as? String) ?? L.s("event.end")
         case "usage":
             if let usage = event["usage"] as? [String: Any],
                let total = usage["total"] as? [String: Any],
                let tokens = total["totalTokens"] as? Int {
                 brief = "\(tokens) tokens"
             } else {
-                brief = "token 用量"
+                brief = L.s("detail.tokens")
             }
         case "run.created":
-            brief = (event["prompt"] as? String) ?? "创建运行"
+            brief = (event["prompt"] as? String) ?? L.s("detail.createRun")
         case "approval.request":
-            brief = "请求批准"
+            brief = L.s("approval.requested")
         case "approval.decision":
-            brief = (event["decision"] as? String) ?? "批准结果"
+            brief = (event["decision"] as? String) ?? L.s("detail.approvalResult")
         case "status":
             brief = (event["status"] as? String) ?? (event["notification"] as? String) ?? ""
         default:
@@ -7434,14 +7765,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         var startedMs = startedAt
         if startedMs > 0, startedMs < 4_000_000_000 { startedMs *= 1000 }
         let liveStatus = (status == "running" || status == "starting" || status == "queued")
-        parts.append(liveStatus ? "进行中" : (status == "failed" ? "失败" : "已完成"))
+        parts.append(liveStatus ? L.s("status.running") : (status == "failed" ? L.s("status.failed") : L.s("status.done")))
         if !liveStatus, finishedAt > 0 {
-            parts.append("完成于 \(relativeTime(finishedAt, now: now))")
+            parts.append(L.f("detail.finishedPlain", relativeTime(finishedAt, now: now)))
         }
         if let span = plausibleDuration(started: startedMs, finished: finishedAt) {
-            parts.append("耗时 \(humanDuration(span))")
+            parts.append(L.f("detail.elapsedPlain", humanDuration(span)))
         } else if let duration = run["durationMs"] as? Int, duration > 0, duration <= 6 * 60 * 60 * 1000 {
-            parts.append(String(format: "耗时 %.1fs", Double(duration) / 1000))
+            parts.append(L.f("detail.elapsedSeconds", Double(duration) / 1000))
         }
         if let usage = run["usage"] as? [String: Any],
            let total = usage["total"] as? [String: Any],
@@ -7449,15 +7780,15 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             parts.append("\(tokens) tokens")
         }
         if let count = run["eventCount"] as? Int {
-            parts.append("\(count) 事件")
+            parts.append(L.f("detail.eventCount", count))
         }
         if status == "running", (run["pidAlive"] as? Bool) == false {
-            parts.append("进程已退出")
+            parts.append(L.s("run.processExited"))
         }
         // 失败详情给全量错误（feed 只给 200 字首句）。
         if status == "failed", let error = run["error"] as? String,
            !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.insert("失败：\(String(error.prefix(160)))", at: 0)
+            parts.insert(L.f("detail.failedPrefix", String(error.prefix(160))), at: 0)
         }
         return parts.joined(separator: " · ")
     }
@@ -7571,11 +7902,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     log("markSeen ok id=\(valid.prefix(3).joined(separator: ",")) n=\(valid.count)")
                 } else if let error {
                     log("markSeen failed id=\(valid.prefix(3).joined(separator: ",")) error=\(error.localizedDescription)")
-                    self.showBanner(title: "标记已读没生效", body: "服务端没确认；这条还会留在列表里", onClick: nil)
+                    self.showBanner(title: L.s("toast.markSeenFailed"), body: L.s("toast.decidePending"), onClick: nil)
                 } else {
                     let http = (response as? HTTPURLResponse)?.statusCode ?? -1
                     log("markSeen failed id=\(valid.prefix(3).joined(separator: ",")) status=\(http) missing=\(missing.prefix(3).joined(separator: ",")) body=\(text.prefix(120))")
-                    self.showBanner(title: "标记已读没生效", body: "服务端没确认；这条还会留在列表里", onClick: nil)
+                    self.showBanner(title: L.s("toast.markSeenFailed"), body: L.s("toast.decidePending"), onClick: nil)
                 }
                 then?()
                 self.fetchNow(reason: "after-mark-seen")
@@ -7602,20 +7933,20 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let menu = NSMenu()
         menu.delegate = self
 
-        let refresh = NSMenuItem(title: "刷新", action: #selector(menuRefresh), keyEquivalent: "")
+        let refresh = NSMenuItem(title: L.s("menu.refresh"), action: #selector(menuRefresh), keyEquivalent: "")
         refresh.target = self
         menu.addItem(refresh)
 
-        let top = NSMenuItem(title: "置顶开/关", action: #selector(menuToggleTop), keyEquivalent: "")
+        let top = NSMenuItem(title: L.s("menu.topmost"), action: #selector(menuToggleTop), keyEquivalent: "")
         top.target = self
         top.state = isTopmost ? .on : .off
         menu.addItem(top)
 
-        let hide = NSMenuItem(title: "隐藏 5 分钟", action: #selector(menuHide), keyEquivalent: "")
+        let hide = NSMenuItem(title: L.s("menu.snooze"), action: #selector(menuHide), keyEquivalent: "")
         hide.target = self
         menu.addItem(hide)
 
-        let seen = NSMenuItem(title: "完成未看全部置为已读",
+        let seen = NSMenuItem(title: L.s("menu.markAllSeen"),
                               action: #selector(menuMarkAllSeen), keyEquivalent: "")
         seen.target = self
         seen.isEnabled = true
@@ -7623,14 +7954,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "退出", action: #selector(menuQuit), keyEquivalent: "")
+        let quit = NSMenuItem(title: L.s("menu.quit"), action: #selector(menuQuit), keyEquivalent: "")
         quit.target = self
         menu.addItem(quit)
         return menu
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.item(withTitle: "置顶开/关")?.state = isTopmost ? .on : .off
+        menu.item(withTitle: L.s("menu.topmost"))?.state = isTopmost ? .on : .off
     }
 
     @objc private func menuRefresh() {
@@ -7694,6 +8025,14 @@ setvbuf(stdout, nil, _IONBF, 0)
 
 private let (options, exitCode) = Options.parse(CommandLine.arguments)
 if let exitCode { exit(exitCode) }
+
+// U-34：语言在启动时确定一次（`--lang` 覆盖，否则跟随系统首选语言）；运行期不再变化。
+private let resolvedLanguage = L.resolve(flag: options.lang)
+if options.dumpStrings {
+    // 只打印字符串表：`plugins/dsh-task-radar/locale/*.json` 的 `hud` 段由它生成，避免两边漂移。
+    print(L.dumpJSON())
+    exit(0)
+}
 
 let application = NSApplication.shared
 _ = application.setActivationPolicy(.accessory)
