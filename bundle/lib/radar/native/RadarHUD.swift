@@ -80,6 +80,17 @@ private enum HUD {
     static let pillFontSize: CGFloat = 12.5
     static let pillChromeWidth: CGFloat = pillPadding + pillDot + pillGap + pillGap + pillIcon + pillPadding
 
+    /// U-16：§3.2 胶囊式芯片——高 32、宽 clamp(实测+24,72,128)、同一行最多 3 个、间距 12。
+    static let chipHeight: CGFloat = 32
+    static let chipGap: CGFloat = 12
+    static let chipPerRow = 3
+    static let chipMinWidth: CGFloat = 72
+    static let chipMaxWidth: CGFloat = 128
+    /// §3.6-b：可点目标命中区 ≥44×44（视觉 32，垂直外扩 6 补齐）。
+    static let chipHitPad: CGFloat = 6
+    /// §3.1-b：面板正文最多显示 4 行，超出滚动（禁止用省略号代替正文）。
+    static let approvalBodyVisibleLines = 4
+
     /// 九态状态色（t4 §2.2）。只允许出现在点 / 环 / 描边(40%) / 右图标上，不得整条填充。
     static let questionColor = NSColor(calibratedRed: 1.0, green: 0.839, blue: 0.039, alpha: 1)      // #FFD60A
     static let approvalColor = NSColor(calibratedRed: 1.0, green: 0.478, blue: 0.102, alpha: 1)      // #FF7A1A
@@ -831,6 +842,10 @@ private enum DetailAction {
     case sessionHide
     case sessionJump
     case sessionCancel
+    /// §3.7 提问超时：只留「知道了」，点了收起详情（不再提交）。
+    case dismiss
+    /// U-37：正文超过 4 行时展开/收起全文（index 指向 questionBlocks）。
+    case expandText(Int)
 }
 
 // MARK: - 启动参数
@@ -1143,8 +1158,9 @@ private final class DotView: PassthroughView {
             }
             let anim = CABasicAnimation(keyPath: "opacity")
             anim.fromValue = 1.0
-            anim.toValue = 0.35
-            anim.duration = 0.6 // 单程 0.6s → 一个完整呼吸周期 1.2s
+            // U-29：规格要求呼吸周期 1.4s（§6）、不透明度下限 0.45；旧版 0.6s×2=1.2s 偏快、0.35 偏暗。
+            anim.toValue = 0.45
+            anim.duration = HUD.pulsePeriod / 2 // 单程 0.7s → 一个完整呼吸周期 1.4s
             anim.autoreverses = true
             anim.repeatCount = .infinity
             anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -1386,7 +1402,8 @@ private final class CircleBadgeView: PassthroughView {
     override func draw(_ dirtyRect: NSRect) {
         let circle = bounds.insetBy(dx: 0.5, dy: 0.5)
         let path = NSBezierPath(ovalIn: circle)
-        NSColor(calibratedWhite: 0.06, alpha: 0.42).setFill()
+        // U-01：对齐 §5.1 —— surface `#1C1C1E` @0.92（合成 #2E2E30）；旧值 white 0.06@0.42 偏透明。
+        NSColor(calibratedRed: 0.110, green: 0.110, blue: 0.118, alpha: 0.92).setFill()
         path.fill()
 
         // 状态在静态像素里就必须能分开，而且不能只靠颜色（色盲）+ 不能出现单字缩写（用户看不懂）：
@@ -1605,6 +1622,135 @@ private final class PanelContentView: PassthroughView {
     var submittedNotice: String?
     /// 与 questionBlocks 一一对应：这个块有没有可点的自由回答入口（用来算 action 索引）。
     var questionFreeHits: [(rect: NSRect, block: Int)] = []
+    /// §3.7 提交失败态：kind = retry（可重试、已选保留）/ forbidden（403）/ expired（提问已超时）。
+    private var answerFailure: (kind: String, reason: String)?
+    /// 审批完成后的原地反馈（§3.5-b）：非 nil 时按钮位置只画「已批准」/「已拒绝」。
+    private(set) var decisionNotice: String?
+    /// U-37：哪些问题块的正文被展开（默认收起到 4 行）。
+    private(set) var questionExpanded: Set<String> = []
+
+    func toggleQuestionExpanded(_ blockId: String) {
+        if questionExpanded.contains(blockId) { questionExpanded.remove(blockId) } else { questionExpanded.insert(blockId) }
+        needsDisplay = true
+    }
+
+    /// 正文行数（与 drawQuestionPage 同一算法，15pt/行）。
+    func questionTextLines(_ text: String, width: CGFloat) -> Int {
+        let font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byWordWrapping
+        para.lineSpacing = 1.5
+        let rect = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin],
+            attributes: [.font: font, .paragraphStyle: para])
+        return max(1, Int(ceil(rect.height / 15)))
+    }
+
+    /// §3.1-b 正文滚动：审批正文超过 4 行时按行滚动，禁止省略号截断。
+    private(set) var approvalBodyScroll = 0
+    private(set) var approvalBodyLines = 0
+
+    var failureKind: String? { answerFailure?.kind }
+    var failureReason: String? { answerFailure?.reason }
+
+    func setAnswerFailure(kind: String, reason: String) {
+        answerFailure = (kind: kind, reason: reason)
+        needsDisplay = true
+    }
+
+    func clearAnswerFailure() {
+        guard answerFailure != nil else { return }
+        answerFailure = nil
+        needsDisplay = true
+    }
+
+    func setDecisionNotice(_ text: String?) {
+        decisionNotice = text
+        needsDisplay = true
+    }
+
+    /// 审批正文滚动（§3.1-b）：只在非提问页的审批正文超过 4 行时生效。
+    func scrollApprovalBody(by deltaY: CGFloat) {
+        guard !isQuestionDetail, approvalBodyLines > HUD.approvalBodyVisibleLines else { return }
+        let maxScroll = approvalBodyLines - HUD.approvalBodyVisibleLines
+        let step = deltaY > 0 ? -1 : (deltaY < 0 ? 1 : 0)
+        guard step != 0 else { return }
+        let next = min(max(0, approvalBodyScroll + step), max(0, maxScroll))
+        guard next != approvalBodyScroll else { return }
+        approvalBodyScroll = next
+        needsDisplay = true
+    }
+
+    /// 芯片宽 = clamp(实测标签宽 + 24, 72, 128)，且不超过内容宽。
+    func chipWidth(for label: String, font: NSFont) -> CGFloat {
+        let text = (label as NSString).size(withAttributes: [.font: font]).width
+        let width = min(HUD.chipMaxWidth, max(HUD.chipMinWidth, text + 24))
+        return min(width, bounds.width - 2 * HUD.contentPadding)
+    }
+
+    /// 与绘制共用：一组选项在 3 列网格里要占几行。
+    func chipRowCount(_ options: [String], font: NSFont) -> Int {
+        guard !options.isEmpty else { return 0 }
+        let contentWidth = bounds.width - 2 * HUD.contentPadding
+        var rows = 1
+        var used: CGFloat = 0
+        var inRow = 0
+        for option in options {
+            let width = chipWidth(for: option, font: font)
+            if inRow == HUD.chipPerRow || used + width > contentWidth + 0.5 {
+                rows += 1
+                used = 0
+                inRow = 0
+            }
+            used += width + HUD.chipGap
+            inRow += 1
+        }
+        return rows
+    }
+
+    /// 提问页总高：与 drawQuestionPage 的推进保持一致（U-16 网格后必须同一套算法）。
+    /// U-16 证据：布局签名变化时打一次芯片几何（行/列/间距/矩形），便于零 TCC 取证。
+    private var lastChipLayoutSignature = ""
+
+    func logChipLayoutIfChanged() {
+        let signature = questionBlocks.map { $0.options.count }.map(String.init).joined(separator: ",")
+            + "|" + String(Int(bounds.width)) + "|" + String(Int(HUD.chipHeight))
+        guard signature != lastChipLayoutSignature else { return }
+        lastChipLayoutSignature = signature
+        let rects = detailActionHits.compactMap { hit -> String? in
+            if case .answer = hit.action {
+                return "(\(Int(hit.rect.minX)),\(Int(hit.rect.minY)),\(Int(hit.rect.width)),\(Int(hit.rect.height)))"
+            }
+            return nil
+        }
+        log("chips layout h=\(Int(HUD.chipHeight)) gap=\(Int(HUD.chipGap)) perRow=\(HUD.chipPerRow) " +
+            "hitPad=\(Int(HUD.chipHitPad)) rects=[\(rects.joined(separator: " "))]")
+    }
+
+    func measuredQuestionPageHeight() -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        var h: CGFloat = 6
+        if answerFailure?.kind == "retry" { h += 22 }
+        if answerFailure != nil, answerFailure?.kind != "retry" { h += 40 }
+        for block in questionBlocks {
+            let head = questionBlocks.count > 1 ? "\(questionBlocks.firstIndex(where: { $0.id == block.id }).map { $0 + 1 } ?? 1)) \(block.text)" : block.text
+            let lines = questionTextLines(head.isEmpty ? "（这一题没有正文）" : head, width: 320 - 2 * HUD.contentPadding)
+            let visible = questionExpanded.contains(block.id) ? lines : min(lines, HUD.approvalBodyVisibleLines)
+            h += CGFloat(visible) * 15 + 4
+            if lines > HUD.approvalBodyVisibleLines { h += 20 }
+            if block.degraded {
+                h += 20 + 26
+            } else if !block.options.isEmpty {
+                h += CGFloat(chipRowCount(block.options, font: font)) * (HUD.chipHeight + HUD.chipGap) - HUD.chipGap
+            }
+            if block.free { h += HUD.chipHeight + HUD.chipGap }
+            h += 6
+        }
+        if showsSubmitRow || failureKind == "retry" { h += 26 }
+        h += 26 + 52
+        return h
+    }
 
     func detailActionHit(at point: NSPoint) -> DetailAction? {
         for hit in detailActionHits where hit.rect.contains(point) {
@@ -2151,7 +2297,53 @@ private final class PanelContentView: PassthroughView {
                 withAttributes: attrs)
         }
 
+        // §3.7 失败三态：403 → 唯一出路「打开会话」；超时 → 芯片禁用 + 「知道了」；网络失败 → 红条 + 「重试」。
         var y = headerY - 4
+        if let failure = answerFailure {
+            let barAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.97),
+            ]
+            switch failure.kind {
+            case "forbidden":
+                detailActionHits = []
+                questionFreeHits = []
+                let para = NSMutableParagraphStyle()
+                para.alignment = .center
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                    .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.96),
+                    .paragraphStyle: para,
+                ]
+                ("没有权限处理此问题" as NSString).draw(
+                    in: NSRect(x: padding, y: bounds.midY + 4, width: bounds.width - 2 * padding, height: 20),
+                    withAttributes: attrs)
+                drawFooterButton(text: "→ 打开会话", align: .right, action: .jumpSession,
+                                 color: NSColor.white.withAlphaComponent(0.98),
+                                 background: NSColor.systemBlue.withAlphaComponent(0.72))
+                return
+            case "expired":
+                let para = NSMutableParagraphStyle()
+                para.alignment = .center
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
+                    .foregroundColor: NSColor.systemOrange.withAlphaComponent(0.96),
+                    .paragraphStyle: para,
+                ]
+                ("问题已超时（agent 已按拒绝处理）" as NSString).draw(
+                    in: NSRect(x: padding, y: headerY - 2, width: bounds.width - 2 * padding, height: 16),
+                    withAttributes: attrs)
+                y -= 20
+            default:
+                let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 18)
+                NSColor.systemRed.withAlphaComponent(0.82).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+                ("提交失败：\(failure.reason)" as NSString).draw(
+                    in: NSRect(x: rect.minX + 8, y: rect.minY + 3, width: rect.width - 16, height: 13),
+                    withAttributes: barAttrs)
+                y -= 22
+            }
+        }
         questionFreeHits = []
         var chipIndex = 0
         let blockAttrs: [NSAttributedString.Key: Any] = [
@@ -2175,15 +2367,36 @@ private final class PanelContentView: PassthroughView {
             if y < HUD.contentPadding + 52 { break }
             let text = block.text.isEmpty ? "（这一题没有正文）" : block.text
             let head = multi ? "\(bi + 1)) \(text)" : text
+            // §3.1-b / U-37：正文必须完整可读——按实测行数排版，最多先给 4 行，
+            // 超出时给「展开全文」，绝不用省略号把问题本身糊掉。
+            let textWidth = bounds.width - 2 * padding
             let para = NSMutableParagraphStyle()
-            para.lineBreakMode = .byTruncatingTail
+            para.lineBreakMode = .byWordWrapping
             para.lineSpacing = 1.5
             var attrs = blockAttrs
             attrs[.paragraphStyle] = para
+            let bodyLines = questionTextLines(head, width: textWidth)
+            let expandedBody = questionExpanded.contains(block.id)
+            let visibleLines = expandedBody ? bodyLines : min(bodyLines, HUD.approvalBodyVisibleLines)
+            let bodyHeight = CGFloat(visibleLines) * 15
             (head as NSString).draw(
-                with: NSRect(x: padding, y: y - 30, width: bounds.width - 2 * padding, height: 32),
+                with: NSRect(x: padding, y: y - bodyHeight, width: textWidth, height: bodyHeight),
                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
-            y -= 34
+            y -= bodyHeight + 4
+            if bodyLines > HUD.approvalBodyVisibleLines {
+                let label = expandedBody ? "收起正文" : "展开全文（共 \(bodyLines) 行）"
+                let expandRect = NSRect(x: padding, y: y - 16, width: min(textWidth, 156), height: 16)
+                let expandAttrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                    .foregroundColor: HUD.questionColor.withAlphaComponent(0.95),
+                ]
+                (label as NSString).draw(
+                    in: NSRect(x: expandRect.minX, y: expandRect.minY + 2, width: expandRect.width, height: 13),
+                    withAttributes: expandAttrs)
+                detailActionHits.append((rect: expandRect.insetBy(dx: 0, dy: -HUD.chipHitPad), action: .expandText(bi)))
+                log("question body overflow qid=\(block.id) lines=\(bodyLines) expanded=\(expandedBody)")
+                y -= 20
+            }
 
             // U-40：没有 options 的提问不能就地作答（自由输入属 K3）。
             // 旧实现在这里给「自由回答」芯片，用户点开只看到一个输入框，等于谎报能力。
@@ -2206,38 +2419,72 @@ private final class PanelContentView: PassthroughView {
             }
 
             let picked = questionPicked[block.id] ?? []
-            for option in block.options {
-                if y < HUD.contentPadding + 52 { break }
-                let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 20)
-                let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
-                let chosen = picked.contains(option)
-                (chosen ? HUD.questionColor.withAlphaComponent(0.34) : NSColor.systemBlue.withAlphaComponent(0.30)).setFill()
-                path.fill()
-                let mark = chosen ? "● " : "· "
-                ((mark + option) as NSString).draw(
-                    in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
-                    withAttributes: chipAttrs)
-                if questionChoices.indices.contains(chipIndex) {
-                    detailActionHits.append((rect: rect, action: .answer(chipIndex)))
+            let chipFont = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+            let contentWidth = bounds.width - 2 * padding
+            let disabled = answerFailure?.kind == "expired"
+            var chipX = padding
+            var rowTop = y
+            var inRow = 0
+            if !block.options.isEmpty {
+                for option in block.options {
+                    if rowTop - HUD.chipHeight < HUD.contentPadding + 52 { break }
+                    let width = chipWidth(for: option, font: chipFont)
+                    if inRow == HUD.chipPerRow || chipX + width > bounds.width - padding + 0.5 {
+                        rowTop -= HUD.chipHeight + HUD.chipGap
+                        chipX = padding
+                        inRow = 0
+                        if rowTop - HUD.chipHeight < HUD.contentPadding + 52 { break }
+                    }
+                    let rect = NSRect(x: chipX, y: rowTop - HUD.chipHeight, width: width, height: HUD.chipHeight)
+                    let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+                    let chosen = picked.contains(option)
+                    var fill = chosen ? HUD.questionColor.withAlphaComponent(0.34)
+                        : NSColor.systemBlue.withAlphaComponent(0.30)
+                    if disabled { fill = fill.withAlphaComponent(0.40) }
+                    fill.setFill()
+                    path.fill()
+                    if chosen {
+                        HUD.questionColor.setStroke()
+                        path.lineWidth = 2
+                        path.stroke()
+                    }
+                    let para = NSMutableParagraphStyle()
+                    para.lineBreakMode = .byTruncatingTail
+                    var attrs = chipAttrs
+                    attrs[.paragraphStyle] = para
+                    if disabled { attrs[.foregroundColor] = NSColor.white.withAlphaComponent(0.40) }
+                    let mark = chosen ? "● " : "· "
+                    ((mark + option) as NSString).draw(
+                        in: NSRect(x: rect.minX + 10, y: rect.minY + 9, width: rect.width - 20, height: 14),
+                        withAttributes: attrs)
+                    if !disabled, questionChoices.indices.contains(chipIndex) {
+                        // §3.6-b：命中区外扩到 44 高（行距 44，外扩区不重叠）。
+                        let hit = rect.insetBy(dx: 0, dy: -HUD.chipHitPad)
+                        detailActionHits.append((rect: hit, action: .answer(chipIndex)))
+                    }
+                    chipX += width + HUD.chipGap
+                    inRow += 1
+                    chipIndex += 1
                 }
-                chipIndex += 1
-                y -= 24
+                y = rowTop - HUD.chipHeight
             }
-            if block.free, y >= HUD.contentPadding + 52 {
-                let rect = NSRect(x: padding, y: y - 18, width: bounds.width - 2 * padding, height: 20)
-                let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            if block.free, y >= HUD.contentPadding + 52, !disabled {
+                let rect = NSRect(x: padding, y: y - HUD.chipHeight, width: contentWidth, height: HUD.chipHeight)
+                let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
                 NSColor.systemYellow.withAlphaComponent(0.22).setFill()
                 path.fill()
                 ("✎ 自由回答…" as NSString).draw(
-                    in: NSRect(x: rect.minX + 8, y: rect.minY + 4, width: rect.width - 16, height: 14),
+                    in: NSRect(x: rect.minX + 10, y: rect.minY + 9, width: rect.width - 20, height: 14),
                     withAttributes: freeAttrs)
-                detailActionHits.append((rect: rect, action: .freeAnswer(bi)))
-                y -= 24
+                detailActionHits.append((rect: rect.insetBy(dx: 0, dy: -HUD.chipHitPad), action: .freeAnswer(bi)))
+                y -= HUD.chipHeight + HUD.chipGap
             }
             y -= 6
         }
         // U-18：多问/多选时一次性提交全部答案（回执数组长度 == 问题数）。
-        if showsSubmitRow, y >= HUD.contentPadding + 30 {
+        let expiredNow = answerFailure?.kind == "expired"
+        let retryNow = answerFailure?.kind == "retry"
+        if showsSubmitRow || retryNow, !expiredNow, y >= HUD.contentPadding + 30 {
             let rect = NSRect(x: padding, y: y - 20, width: bounds.width - 2 * padding, height: 22)
             let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
             NSColor.systemGreen.withAlphaComponent(0.72).setFill()
@@ -2249,7 +2496,8 @@ private final class PanelContentView: PassthroughView {
                 .foregroundColor: NSColor.white.withAlphaComponent(0.98),
                 .paragraphStyle: para,
             ]
-            (HUDController.multiSubmitLabel as NSString).draw(
+            let submitLabel = answerFailure?.kind == "retry" ? "↻ 重试" : HUDController.multiSubmitLabel
+            (submitLabel as NSString).draw(
                 in: NSRect(x: rect.minX + 8, y: rect.minY + 5, width: rect.width - 16, height: 14),
                 withAttributes: attrs)
             if !questionChoices.isEmpty {
@@ -2257,9 +2505,18 @@ private final class PanelContentView: PassthroughView {
             }
             y -= 26
         }
+        if expiredNow {
+            // 已让渡：唯一动作是收起（不再提交，也不假装还能答）。
+            drawFooterButton(text: "知道了", align: .right, action: .dismiss,
+                             color: NSColor.white.withAlphaComponent(0.98),
+                             background: NSColor.systemBlue.withAlphaComponent(0.72))
+            logChipLayoutIfChanged()
+            return
+        }
         drawFooterButton(text: "✕ 取消", align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
                          background: NSColor.systemRed.withAlphaComponent(0.72))
+        logChipLayoutIfChanged()
     }
 
     /// 审批视图：一句话说明 agent 想干什么，底部直接批准/拒绝。
@@ -2314,17 +2571,43 @@ private final class PanelContentView: PassthroughView {
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.80),
             .paragraphStyle: bodyPara,
         ]
-        let bodyHeight = CGFloat(max(1, detail.bodyLines)) * 15
-        let bodyRect = NSRect(x: padding, y: y - bodyHeight, width: bounds.width - 2 * padding,
-                              height: bodyHeight)
-        ((detail.body.isEmpty ? "（没有可展示的命令）" : detail.body) as NSString)
-            .draw(with: bodyRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
-                  attributes: bodyAttrs)
+        // §3.1-b / U-37：正文最多显示 4 行，超出靠滚动读全文；绝不省略号截断。
+        let bodyWidth = bounds.width - 2 * padding
+        let bodyString = (detail.body.isEmpty ? "（没有可展示的命令）" : detail.body) as NSString
+        let measured = bodyString.boundingRect(
+            with: NSSize(width: bodyWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin], attributes: bodyAttrs)
+        let measuredLines = max(1, Int(ceil(measured.height / 15)))
+        approvalBodyLines = measuredLines
+        let visibleLines = min(measuredLines, HUD.approvalBodyVisibleLines)
+        let bodyHeight = CGFloat(visibleLines) * 15
+        let maxScroll = max(0, measuredLines - HUD.approvalBodyVisibleLines)
+        if approvalBodyScroll > maxScroll { approvalBodyScroll = maxScroll }
+        let viewRect = NSRect(x: padding, y: y - bodyHeight, width: bodyWidth, height: bodyHeight)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: viewRect).addClip()
+        let drawRect = NSRect(x: padding,
+                              y: y - CGFloat(measuredLines) * 15 + CGFloat(approvalBodyScroll) * 15,
+                              width: bodyWidth, height: CGFloat(measuredLines) * 15 + 2)
+        bodyString.draw(with: drawRect, options: [.usesLineFragmentOrigin], attributes: bodyAttrs)
+        NSGraphicsContext.restoreGraphicsState()
+        var bodyBottom = y - bodyHeight
+        if maxScroll > 0 {
+            let hintAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.55),
+            ]
+            let last = min(measuredLines, approvalBodyScroll + visibleLines)
+            ("滚动查看（第 \(approvalBodyScroll + 1)–\(last) / \(measuredLines) 行）" as NSString).draw(
+                in: NSRect(x: padding, y: bodyBottom - 13, width: bodyWidth, height: 12),
+                withAttributes: hintAttrs)
+            bodyBottom -= 14
+        }
 
         // 提问：把每个选项画成一行可点按钮（2.20）。点中即把
         // {questionId: label} 回给 agent，而不是 allow/deny。
         if !questionChoices.isEmpty {
-            var optionY = y - bodyHeight - 10
+            var optionY = bodyBottom - 10
             let optionAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
                 .foregroundColor: NSColor.white.withAlphaComponent(0.96),
@@ -2358,10 +2641,24 @@ private final class PanelContentView: PassthroughView {
                              background: NSColor.systemBlue.withAlphaComponent(0.72))
             return
         }
+        // U-21/U-53：原地完成 + 1.5s 内变「已批准 / 已拒绝」，并且审批不可撤销要说清。
+        if let notice = decisionNotice {
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.96),
+                .paragraphStyle: para,
+            ]
+            (notice as NSString).draw(
+                in: NSRect(x: padding, y: HUD.contentPadding + 26, width: bounds.width - 2 * padding, height: 20),
+                withAttributes: attrs)
+            return
+        }
         drawFooterButton(text: "✕ 拒绝", align: .left, action: .reject,
                          color: NSColor.white.withAlphaComponent(0.95),
                          background: NSColor.systemRed.withAlphaComponent(0.72))
-        drawFooterButton(text: "✓ 批准", align: .right, action: .approve,
+        drawFooterButton(text: "✓ 批准（不可撤销）", align: .right, action: .approve,
                          color: NSColor.white.withAlphaComponent(0.98),
                          background: NSColor.systemGreen.withAlphaComponent(0.72))
     }
@@ -3539,7 +3836,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             log("saved origin \(NSStringFromPoint(point)) 不在任何可见屏幕内，使用默认位置")
             return nil
         }
-        return point
+        // U-09：恢复时必须夹进 visibleFrame 并留 ≥12pt 边距（预置 {0,0} 时曾被贴到屏幕最角）。
+        let clamped = clampedOriginWithMargin(point)
+        if clamped != point {
+            log("saved origin \(NSStringFromPoint(point)) -> \(NSStringFromPoint(clamped)) margin=\(Int(HUD.edgeMargin))")
+        }
+        return clamped
     }
 
     private func defaultCircleOrigin() -> NSPoint {
@@ -3552,6 +3854,16 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // 默认右下角，避免与 DSH 窗口右上角重叠；展开时向左/向上生长。
         return NSPoint(x: visible.maxX - HUD.circleSize - 24,
                        y: visible.minY + 24)
+    }
+
+    /// U-09：恢复位置专用夹取——在 visibleFrame 基础上再内缩 `edgeMargin`（拖动路径仍用不内缩的版本，
+    /// 否则用户拖到屏幕边缘时会感到「拖不上去」）。
+    private func clampedOriginWithMargin(_ point: NSPoint) -> NSPoint {
+        let rect = NSRect(origin: point, size: NSSize(width: HUD.circleSize, height: HUD.circleSize))
+        guard let screen = screen(containing: rect) ?? NSScreen.screens.first else { return defaultCircleOrigin() }
+        let visible = screen.visibleFrame.insetBy(dx: HUD.edgeMargin, dy: HUD.edgeMargin)
+        return NSPoint(x: min(max(point.x, visible.minX), visible.maxX - HUD.circleSize),
+                       y: min(max(point.y, visible.minY), visible.maxY - HUD.circleSize))
     }
 
     private func clampedCircleOrigin(_ point: NSPoint) -> NSPoint {
@@ -4253,21 +4565,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 提问页正文高度：与 drawQuestionPage 的逐行推进保持一致，多一问就多一段，
     /// 底部预留 52（圆盘带）与「取消」行，保证任何一题的芯片与提交行都在可视区内。
     private func questionPageContentHeight() -> CGFloat {
-        let blocks = panelContent?.questionBlocks ?? []
-        var h: CGFloat = 6
-        for block in blocks {
-            h += 34
-            if block.degraded {
-                h += 20 + 26            // 「只能到会话里回答」+「打开会话」按钮
-            } else {
-                h += CGFloat(block.options.count) * 24
-            }
-            if block.free { h += 24 }
-            h += 6
-        }
-        if panelContent?.showsSubmitRow == true { h += 24 }
-        h += 26 + 52                    // 底部「取消」行 + 圆盘带安全区
-        return h
+        // U-16 起芯片是 32pt / 3 列网格，高度必须由视图用同一套排布算，否则芯片会被底部裁掉（U-18 老问题）。
+        panelContent?.measuredQuestionPageHeight() ?? 200
     }
 
     private func panelHeight() -> CGFloat {
@@ -4295,8 +4594,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         questionPageContentHeight()
                 }
                 // band(圆) + 上下 padding + 头部 + 标题/元信息/分隔 + 命令正文 + 底部按钮
+                let lines = min(max(1, detail.bodyLines), HUD.approvalBodyVisibleLines)
+                let scrollHint: CGFloat = detail.bodyLines > HUD.approvalBodyVisibleLines ? 14 : 0
                 return HUD.bandHeight + HUD.contentPadding * 2 + HUD.headerHeight + 60 +
-                    CGFloat(max(1, detail.bodyLines)) * 15 + 14
+                    CGFloat(lines) * 15 + scrollHint + 14
             }
             // band(圆) + 上下 padding + 头部 + 标题/元信息/分隔 + 正文 + 底部按钮
             return HUD.bandHeight + HUD.contentPadding * 2 + HUD.headerHeight + 64 +
@@ -5362,7 +5663,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             panelContent?.scrollList(by: event.scrollingDeltaY)
             let after = panelContent?.listScrollRow ?? 0
             if before != after { log("list scroll row=\(after) src=scrollWheel") }
-        case .approval, .children:
+        case .approval:
+            if abs(event.scrollingDeltaY) > 0.1 {
+                noteInteraction()
+                panelContent?.scrollApprovalBody(by: event.scrollingDeltaY)
+            }
+        case .children:
             break
         }
     }
@@ -5399,6 +5705,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 let local = panelContent.convert(event.locationInWindow, from: nil)
                 if panelContent.bounds.contains(local) {
                     switch panelContent.detailActionHit(at: local) {
+                    case .expandText(let bi):
+                        if panelContent.questionBlocks.indices.contains(bi) {
+                            let qid = panelContent.questionBlocks[bi].id
+                            panelContent.toggleQuestionExpanded(qid)
+                            log("question body toggle qid=\(qid) expanded=\(panelContent.questionExpanded.contains(qid))")
+                            refreshExpandedGeometry(animated: false)
+                        }
                     case .backToList:
                         closeDetail()
                     case .showEvents:
@@ -5431,6 +5744,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         jumpFromSessionMenu()
                     case .sessionCancel:
                         log("session menu cancel")
+                        closeDetail()
+                    case .dismiss:
+                        log("detail dismiss (expired)")
                         closeDetail()
                     case .jumpSession:
                         log("jump session click target=\(detail?.jumpSessionId ?? "-") run=\(detail?.runId ?? "-")")
@@ -5643,7 +5959,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if width < HUD.pillTextMin, first.isEmpty {
             text = prefix
         }
-        return (truncatePillText(text, limit: pillTextBoxWidth(text)), accent, glyph)
+        // U-03：这里**不能**截断——胶囊宽度必须由完整首句测量（先截断再测量会把 W 自限在 226）。
+        return (text, accent, glyph)
     }
 
     /// 状态前缀之后那句人话：按句末标点切第一段，最多 80 字（t4 §1.3-a）。
@@ -5735,7 +6052,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private func syncPill() {
         guard let pillView else { return }
         if let pill = pillContent() {
-            pillView.text = pill.text
+            // U-03：宽度按完整首句测量，显示时再按盒宽做字素二分截断。
+            pillView.text = truncatePillText(pill.text, limit: pillTextBoxWidth(pill.text))
             pillView.accent = pill.accent
             pillView.glyph = pill.glyph
             pillView.state = state
@@ -5890,7 +6208,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         // 多问或多选都需要一个显式的提交行（单问单选保持「点选即提交」）。
         let needsSubmitRow = question && pendingAnswerRequest != nil &&
-            (answerOrder.count > 1 || answerMulti.values.contains(true))
+            (answerOrder.count > 1 || answerMulti.values.contains(true) || panelContent?.failureKind == "retry")
         if needsSubmitRow {
             choices.append((questionId: answerOrder.first ?? "", label: Self.multiSubmitLabel))
         }
@@ -6085,7 +6403,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         for qid in answerOrder {
             for label in (answerOptions[qid] ?? []) { choices.append((questionId: qid, label: label)) }
         }
+        // U-25：提交失败后这一行原地变「↻ 重试」，所以失败态也必须存在该行。
         let needsSubmit = answerOrder.count > 1 || answerMulti.values.contains(true)
+            || panelContent.failureKind == "retry"
         if needsSubmit { choices.append((questionId: answerOrder.first ?? "", label: Self.multiSubmitLabel)) }
         panelContent.questionChoices = choices
         panelContent.questionPicked = answerSelections
@@ -6137,9 +6457,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // R-06 U-24：转换点必须能证明「走的是插件 waterfall 通道、发的是数组形状」。
         log("[answer] submit request=\(request.prefix(8)) shape=array via=plugin-waterfall " +
             "n=\(entries.count) ids=\(entries.map(\.id).joined(separator: ","))")
+        panelContent?.clearAnswerFailure()
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         req.httpMethod = "GET"
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
             guard let self else { return }
             var ok = false
             if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -6166,18 +6487,25 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         self.closeDetail()
                     }
                 } else {
-                    log("[answer] submit failed error=\(error?.localizedDescription ?? "-") body=\(text.prefix(160))")
-                    // 条目已经不在服务端（20s 让渡/已在别处答过）时同样本地收页，别把用户锁在输入页。
-                    if text.contains("not pending") || text.contains("bad token") {
-                        log("close local reason=answer-not-pending status=\(String(text.prefix(80)))")
-                        self.pendingAnswerRequest = nil
-                        self.pendingAnswerToken = nil
-                        self.closeDetail()
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    log("[answer] submit failed status=\(status) error=\(error?.localizedDescription ?? "-") " +
+                        "body=\(text.prefix(160))")
+                    // §3.7：三种失败各有「下一步」，且**不清掉已选**（U-25/26/27）。
+                    if status == 403 || text.contains("forbidden") || text.contains("cross_origin") {
+                        self.panelContent?.setAnswerFailure(kind: "forbidden", reason: "403")
+                        log("[answer] failure kind=forbidden status=\(status)")
+                    } else if text.contains("not pending") || text.contains("bad token") || status == 410 {
+                        self.panelContent?.setAnswerFailure(kind: "expired", reason: "\(status)")
+                        log("[answer] failure kind=expired status=\(status) body=\(text.prefix(80))")
+                    } else {
+                        let reason = text.isEmpty
+                            ? (error?.localizedDescription ?? "网络错误")
+                            : String(text.prefix(60))
+                        self.panelContent?.setAnswerFailure(kind: "retry", reason: reason)
+                        log("[answer] failure kind=retry status=\(status) reason=\(reason)")
                     }
-                    let note = text.contains("not pending")
-                        ? "这条提问已经交回桌面卡（20s 超时或已答过），去 DSH 里答"
-                        : text.contains("bad token") ? "回执凭据失效，回 DSH 里答" : "提交没成功，去 DSH 里答"
-                    _ = self.showBanner(title: "没提交成功", body: note, onClick: nil)
+                    // 失败态也要把「↻ 重试」行加进 choices，否则它的 action 索引会落到最后一个真实选项上。
+                    self.refreshQuestionChoices()
                 }
             }
         }.resume()
@@ -6240,11 +6568,19 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     self.fetchNow(reason: "after-approval-failed")
                     return
                 }
+                // U-21/U-53：先原地显示「已批准 / 已拒绝」，1.5s 后再收起（不可撤销要说清）。
+                let notice = answers?.isEmpty == false ? Self.submittedLabel
+                    : (approve ? "已批准" : "已拒绝")
+                log("approval notice \(notice) decision=\(decision)")
+                self.panelContent?.setDecisionNotice(notice)
                 self.pendingApprovalId = nil
                 self.pendingApprovalToken = nil
                 self.pendingQuestions = []
-                self.closeDetail()
                 self.fetchNow(reason: "after-approval")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self.panelContent?.setDecisionNotice(nil)
+                    self.closeDetail()
+                }
             }
         }.resume()
     }
