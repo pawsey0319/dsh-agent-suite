@@ -1596,7 +1596,7 @@ const ADAPTER_ORDER = ['dsh', 'codex', 'claude']
  *   probe(ctx)       → { installed, running, completeness, note }      必须能答「装没装/在不在跑」
  *   poll(ctx, now)   → 原始事件数组                                      可选（推送型 adapter 不实现）
  *   answer(id, body) → 就地处置（只有拿到真实回执通道的家才实现）          可选
- *   capabilities     → { observe, answer, toastOnly }                    声明「能做什么」
+ *   capabilities     → { observe, answer, toastOnly, done }              声明「能做什么」
  *
  * 关键：**新增一家 agent 不需要改这里的代码**——把同样的对象挂在
  * `~/.dsh/agent-bridge/adapters.d/*.json` 里（声明式），启动时与每次 `GET /x-radar/adapters`
@@ -1614,6 +1614,9 @@ function registerAdapter(descriptor) {
     // answer 只认「真的实现了 answer()」的家，避免底条/详情承诺一个做不到的动作。
     answer: declared.answer === true && typeof descriptor.answer === 'function',
     toastOnly: declared.toastOnly === true || descriptor.toastOnly === true,
+    // t54：done 也要显式声明。只有能拿到「这一轮结束」的家才算；没有会话生命周期事件的
+    // 通道（workbuddy 的 audit-log）必须报 false，否则界面会暗示「它会给你完成提醒」。
+    done: declared.done ?? (descriptor.completeness === 'full' || descriptor.completeness === 'partial'),
   }
   const entry = {
     channel: 'none',
@@ -1935,11 +1938,16 @@ function adapterSettleStaleRunning(descriptor, now) {
   for (const [key, event] of [...store.entries()]) {
     if (event.kind !== 'running') continue
     const seenAt = Number(event.ts ?? 0)
-    if (!Number.isFinite(seenAt) || now - seenAt < ADAPTER_STALE_RUNNING_MS) continue
     const alive = typeof descriptor.processAlive === 'function' ? descriptor.processAlive() : null
     const progressAt = Math.max(adapterProgressAt.get(descriptor.id) ?? 0, seenAt)
     const idleMs = now - progressAt
-    if (alive !== false && idleMs < ADAPTER_STALE_RUNNING_MS) continue
+    // t55：**没有进程持有就一定不是 running**——这条判定不需要等 10 分钟窗口。
+    // 旧实现把「age < 窗口」放在最前面 continue，于是 CLI 已经退出、日志也不再写的行
+    // 还要再挂 10 分钟才变 failed（用户口径：「明明没在跑却显示运行中」）。
+    if (alive !== false) {
+      if (!Number.isFinite(seenAt) || now - seenAt < ADAPTER_STALE_RUNNING_MS) continue
+      if (idleMs < ADAPTER_STALE_RUNNING_MS) continue
+    }
     const reason = alive === false ? 'process-exited' : 'stale-no-progress'
     // 窗口文案按实际窗口给单位（用例会把窗口压到几百毫秒，写「0 分钟」就成了误导）。
     const windowText = ADAPTER_STALE_RUNNING_MS >= 60000
@@ -2007,7 +2015,7 @@ registerAdapter({
   channel: 'host',
   note: '会话内提问与桥内审批走宿主通道（既有实现）',
   // 能力声明（t39 P0-3）：DSH 是唯一「确实能就地作答」的一家——被接管的提问有一次性 token。
-  capabilities: { observe: true, answer: true, toastOnly: false },
+  capabilities: { observe: true, answer: true, toastOnly: false, done: true },
   probe() {
     return { installed: true, running: null }
   },
@@ -2564,11 +2572,65 @@ registerAdapter({
 const WORKBUDDY_DIR = join(homedir(), '.workbuddy')
 const WORKBUDDY_AUDIT = join(WORKBUDDY_DIR, 'audit-log')
 const WORKBUDDY_SESSIONS = join(WORKBUDDY_DIR, 'sessions')
+// t54：审计日志路径可用 DSH_TASK_RADAR_WORKBUDDY_AUDIT 指到夹具目录（用例不改用户真实日志）。
+const WORKBUDDY_AUDIT_OVERRIDE = process.env.DSH_TASK_RADAR_WORKBUDDY_AUDIT
 const workbuddySeen = new Set()
+const workbuddyStats = { lines: 0, emitted: 0, ignored: 0, unknown: 0, approvals: 0 }
+const workbuddyUnknownTypes = new Set()
+
+/** 安全决策里「需要人处理」的 decision 取值（真机观测到 allowed/info/approved，
+ *  denied/needs-approval/blocked 来自 WorkBuddy 的拒绝/待批/拦截分支）。 */
+const WORKBUDDY_PENDING_DECISIONS = new Set(['denied', 'needs-approval', 'blocked', 'ask-matched'])
+/** 已经落定的 decision：纯审计流水，绝不能当待办（否则每次 allow 都冒一条）。 */
+const WORKBUDDY_SETTLED_DECISIONS = new Set(['allowed', 'approved', 'info'])
+
+/** 从一条 audit-log 记录判定它是不是「等人处理」的安全决策（t54）。
+ *
+ * 真机字段是 `eventType` / `category` / `decision` / `commandPreview`，
+ * 旧实现只认字面量 `file-safety.needs-approval`，于是 99% 的记录都落成 `?`、产出恒 0 条。
+ * 这里的判据是「安全类别 + decision 未落定」，eventType 只作为二次线索。
+ */
+function workbuddyVerdict(record) {
+  const eventType = String(record?.eventType ?? '')
+  const category = String(record?.category ?? (eventType.includes('.') ? eventType.split('.')[0] : ''))
+  const decision = String(record?.decision ?? '').toLowerCase()
+  const safety = category === 'command-safety' || category === 'file-safety'
+    || eventType.startsWith('command-safety.') || eventType.startsWith('file-safety.')
+  if (!safety) return { pending: false, reason: 'unknown-type' }
+  if (WORKBUDDY_SETTLED_DECISIONS.has(decision)) return { pending: false, reason: 'settled' }
+  if (WORKBUDDY_PENDING_DECISIONS.has(decision)) return { pending: true, reason: decision }
+  // decision 缺失时，eventType 的尾段仍能表达「待批/被拒/被拦」。
+  if (/\.(needs-approval|denied|blocked)$/.test(eventType)) return { pending: true, reason: eventType.split('.').pop() }
+  return { pending: false, reason: 'no-decision' }
+}
+
+/** 运行时说明：把「未识别事件类型」的真实取值暴露出来，便于发现 WorkBuddy 又加了新事件。
+ *
+ * 必须同时给 `probe().note` 用——`adapterSnapshot` 取的是「最近一次观测的 note」，
+ * 只在 noteNow() 里写会被 probe 的「日志 Ns 前更新」盖掉（t54 实测）。
+ */
+function workbuddyNote() {
+  if (workbuddyUnknownTypes.size === 0) {
+    return '只读 audit-log：只有安全决策事件，没有会话生命周期事件，因此不提供完成态'
+  }
+  return `只读 audit-log：只有安全决策事件，不提供完成态；未识别事件类型 ${[...workbuddyUnknownTypes].slice(0, 3).join('、')}（不出条目）`
+}
+
+/** 一句话说明这条待办问的是什么：命令/路径预览优先，其次规则命中说明。 */
+function workbuddyPreview(record) {
+  const preview = String(record?.commandPreview ?? '').trim()
+  if (preview !== '') return uslice(redactSecrets(preview), 300)
+  const paths = record?.messageParams?.paths ?? record?.messageParams?.path ?? ''
+  const text = Array.isArray(paths) ? paths.join(', ') : String(paths)
+  if (text !== '') return uslice(redactSecrets(text), 300)
+  const rule = String(record?.messageParams?.matchedRule ?? '')
+  return rule === '' ? '' : uslice(redactSecrets(rule), 300)
+}
 
 function workbuddyAuditFile(now = new Date()) {
   const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-  return join(WORKBUDDY_AUDIT, `${day}.jsonl`)
+  const base = WORKBUDDY_AUDIT_OVERRIDE !== undefined && WORKBUDDY_AUDIT_OVERRIDE !== '' ? WORKBUDDY_AUDIT_OVERRIDE : WORKBUDDY_AUDIT
+  return join(base, `${day}.jsonl`)
 }
 
 registerAdapter({
@@ -2576,7 +2638,13 @@ registerAdapter({
   label: 'WB',
   completeness: 'partial',
   channel: 'audit-log',
-  note: '只读 audit-log；就地处置需要 --remote-debugging-port=9333 重启（本分支不做）',
+  // t54：能力边界要写死并说明原因——audit-log 只有安全决策事件（command/file-safety），
+  // 没有会话生命周期事件，所以**不可能**给出完成态。这里报 done=false，绝不伪造 done。
+  capabilities: { observe: true, answer: false, toastOnly: false, done: false },
+  note: '只读 audit-log：只有安全决策事件，没有会话生命周期事件，因此不提供完成态',
+  stats() { return { ...workbuddyStats } },
+  // 运行时说明：把「未识别事件类型」的真实取值暴露出来，便于发现 WorkBuddy 又加了新事件。
+  noteNow() { return workbuddyNote() },
   // t53：WorkBuddy 的命令行/守护进程还在才算 running（心跳文件也可能停在旧时间）。
   processAlive() {
     return cliProcessAlive(/WorkBuddy|workbuddy/i)
@@ -2595,7 +2663,7 @@ registerAdapter({
         }
       }
     } catch {}
-    return { installed, running, completeness: installed ? 'partial' : 'unsupported' }
+    return { installed, running, completeness: installed ? 'partial' : 'unsupported', note: workbuddyNote() }
   },
   poll() {
     const path = workbuddyAuditFile()
@@ -2611,21 +2679,39 @@ registerAdapter({
       } catch {
         continue
       }
-      const eventType = String(record.eventType ?? '')
-      // 只认「需要你批准」这一类；ask-matched / allow-listed 是审计流水，不是待办。
-      if (eventType !== 'file-safety.needs-approval') continue
-      const key = `workbuddy:${record.id ?? record.requestId ?? record.timestamp}`
+      workbuddyStats.lines += 1
+      const verdict = workbuddyVerdict(record)
+      if (!verdict.pending) {
+        // 落定的允许/已批记录是审计流水：不出条目（否则每次 allow 都冒一条噪声）。
+        workbuddyStats.ignored += 1
+        if (verdict.reason === 'unknown-type') {
+          workbuddyStats.unknown += 1
+          const eventType = String(record.eventType ?? '(无 eventType)')
+          if (workbuddyUnknownTypes.size < 12) workbuddyUnknownTypes.add(eventType)
+          log(`workbuddy note unknown eventType=${eventType}（不出条目）`)
+        }
+        continue
+      }
+      const key = `workbuddy:${record.id ?? record.requestId ?? record.timestamp ?? `${record.sessionId}:${record.sequence ?? ''}`}`
       if (workbuddySeen.has(key)) continue
       workbuddySeen.add(key)
-      const paths = String(record.messageParams?.paths ?? '')
+      const preview = workbuddyPreview(record)
+      const category = String(record.category ?? '')
+      const title = category === 'file-safety' || String(record.eventType ?? '').startsWith('file-safety.')
+        ? 'WorkBuddy 需要确认文件操作'
+        : 'WorkBuddy 需要确认命令执行'
+      workbuddyStats.emitted += 1
+      workbuddyStats.approvals += 1
+      log(`workbuddy pending decision=${String(record.decision ?? '')} eventType=${String(record.eventType ?? '')} reason=${verdict.reason}`)
       events.push({
         kind: 'needs-approval',
-        title: 'WorkBuddy 需要确认文件操作',
-        detail: uslice(paths, 300),
+        title: preview === '' ? title : `${title}：${uslice(preview, 60)}`,
+        detail: preview,
         sessionRef: String(record.sessionId ?? ''),
         ts: Number.isFinite(record.timestamp) ? Number(record.timestamp) : Date.now(),
         dedupeKey: key,
         completeness: 'partial',
+        reason: `workbuddy-${verdict.reason}`,
       })
     }
     return events
@@ -2687,6 +2773,34 @@ function codexTurnState(path) {
   let failed = null
   // t53：把「这是哪种终止」带出去，日志与行文案据此区分 task-complete / aborted / task-failed。
   let failedKind = ''
+  // t55：行的身份 = 这一次提问，而不是 cwd 目录名。
+  // 旧实现拿 `basename(cwd)` 当标题，同一目录下的十几个 rollout 全叫「yun-x」，
+  // 用户看到的是「Codex 没有完成：yun-x」——跨 rollout 串味、且看不出让它干什么。
+  // 现在取该 rollout 里第一条**真人** user 输入（跳过 environment_context / skills_instructions
+  // 这类注入），截 40 字；取不到才回落到目录名的短形式。
+  let prompt = ''
+  for (const line of lines) {
+    let record
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (String(record.type ?? '') !== 'response_item') continue
+    const item = record.payload ?? {}
+    if (String(item.type ?? '') !== 'message' || String(item.role ?? '') !== 'user') continue
+    const parts = Array.isArray(item.content) ? item.content : []
+    const body = parts
+      .filter((part) => part !== null && typeof part === 'object' && typeof part.text === 'string')
+      .map((part) => String(part.text))
+      .join('\n')
+      .trim()
+    if (body === '') continue
+    // 注入块：`<environment_context>` / `<skills_instructions>` 之类，不是用户的问题。
+    if (body.startsWith('<') && body.indexOf('>') > 0) continue
+    prompt = uslice(body.replace(/\s+/g, ' ').trim(), 40)
+    break
+  }
   for (const line of tail) {
     let record
     try {
@@ -2700,15 +2814,23 @@ function codexTurnState(path) {
     // t53：codex 的终止事件不止 task_complete。真机里还见过 `turn_aborted`（用户 Esc）
     // 与 `task_failed`（工具/网络失败），以及裸 `error` 记录。旧实现只认 task_complete →
     // 「一轮已经结束」的 rollout 永远停在 running（用户看到的「codex 一直显示运行中」）。
+    // t55：再把 `turn_canceled` / `turn_cancelled` / `interrupted` 纳入终态——
+    // 删掉一轮不等于没结束，停在 running 才是最糟的谎。
     if (type === 'error') failed = String(payload.message ?? record.message ?? 'codex error')
-    if (type === 'turn_aborted') failed = String(payload.reason ?? payload.message ?? 'turn aborted')
-    if (type === 'task_failed') failed = String(payload.error ?? payload.message ?? 'task failed')
+    if (type === 'turn_aborted' || type === 'turn_canceled' || type === 'turn_cancelled' || type === 'interrupted') {
+      failed = String(payload.reason ?? payload.message ?? type)
+      failedKind = type
+    }
+    if (type === 'task_failed') {
+      failed = String(payload.error ?? payload.message ?? 'task failed')
+      failedKind = 'task_failed'
+    }
     if (type === 'event_msg') {
       const inner = String(payload.type ?? '')
       if (inner === 'task_started') started = { ts: eventTimeMs(payload.started_at_ms, payload.started_at, Date.now()), turn: String(payload.turn_id ?? '') }
-      if (inner === 'task_failed' || inner === 'turn_aborted') {
+      if (inner === 'task_failed' || inner === 'turn_aborted' || inner === 'turn_canceled' || inner === 'interrupted') {
         // 失败/中断同样带 turn_id 与时间：用它的 ts 判定，而不是拿 mtime 当发生时间。
-        failed = String(payload.error ?? payload.message ?? payload.reason ?? (inner === 'turn_aborted' ? 'turn aborted' : 'task failed'))
+        failed = String(payload.error ?? payload.message ?? payload.reason ?? (inner === 'turn_aborted' ? 'turn aborted' : inner))
         failedKind = inner
       }
       if (inner === 'task_complete') {
@@ -2721,7 +2843,7 @@ function codexTurnState(path) {
       }
     }
   }
-  return { cwd, started, completed, failed, failedKind }
+  return { cwd, started, completed, failed, failedKind, prompt }
 }
 
 registerAdapter({
@@ -2775,7 +2897,8 @@ registerAdapter({
         codexOffsets.set(path, { size: info.size, mtimeMs: info.mtimeMs })
         const state = codexTurnState(path)
         const thread = name.replace(/^rollout-/, '').replace(/\.jsonl$/, '')
-        const label = state.cwd !== '' ? basename(state.cwd) : uslice(thread, 8)
+        // t55：一行一轮 = 一条 rollout；标题给「这次让它干什么」，而不是 cwd 目录名。
+        const label = state.prompt !== '' ? state.prompt : (state.cwd !== '' ? basename(state.cwd) : uslice(thread, 8))
         if (state.failed !== null) {
           const key = `codex:${thread}:failed`
           retract.add(`codex:${thread}:running`)
@@ -3238,8 +3361,13 @@ function adapterSnapshot() {
     // 首帧（观测还没跑）会退回到声明值，于是出现「hooks 已装却写未安装」。
     // 所以声明层提供 noteNow() 时优先用它——claude 用它现读 settings.json。
     const runtimeNote = typeof descriptor.noteNow === 'function' ? descriptor.noteNow() : null
-    const baseNote = last?.note ?? runtimeNote
-      ?? (health.error === null || health.error === undefined ? descriptor.note ?? null : health.error)
+    // t54：noteNow() 是「现算」的说明（例如 workbuddy 的未识别事件类型、claude 的 hooks 是否已装），
+    // 比上一轮观测留下的快照更新。只有在**熔断/探测失败**时才让观测文案优先——
+    // 那两种情况必须如实说「探测失败/已熔断」，不能被静态说明盖掉（t47 R4-L2 的契约）。
+    const healthBroken = (health.breakerUntil ?? 0) > now || (health.error !== null && health.error !== undefined)
+    const baseNote = healthBroken
+      ? (last?.note ?? health.error ?? runtimeNote ?? descriptor.note ?? null)
+      : (runtimeNote ?? last?.note ?? descriptor.note ?? null)
     const effective = effectiveCompleteness(descriptor.id, baseCompleteness, baseNote)
     const breakerUntil = health.breakerUntil ?? 0
     const lastOkAt = health.lastOkAt ?? 0
@@ -3339,6 +3467,7 @@ async function buildRadar(ctx) {
   // 于是「从雷达移除」对 adapter 行完全无效——下一轮 poll 又把它放回来。
   // 这里对 adapter 条目按三条键任一命中即隐藏：item.id / dedupKey / sessionRef。
   const hiddenKeys = readHiddenSessions()
+  const hiddenRunsAdapter = readHiddenRuns()
   const seenForAdapter = readSeen()
   for (const item of agentFeed.items) {
     // t51 / CD-1：adapter 的完成行以前完全不看 seen —— clear-done 写进 seen.json 的
@@ -3348,9 +3477,14 @@ async function buildRadar(ctx) {
       const finishedAt = Number(item.finishedAt ?? item.updatedAt ?? 0)
       if (finishedAt > 0 && seenAtOf(seenForAdapter, String(item.id ?? '')) >= finishedAt) continue
     }
-    const hit = hiddenKeys[String(item.id ?? '')] !== undefined
+    const hitId = String(item.id ?? '')
+    const hit = hiddenKeys[hitId] !== undefined
       || (item.dedupKey !== undefined && hiddenKeys[String(item.dedupKey)] !== undefined)
       || (item.sessionRef !== undefined && hiddenKeys[String(item.sessionRef)] !== undefined)
+      // t55：adapter 行也要能走 hidden-runs 账本（失败页「清掉这条」用它，
+      // 与 seen 的「置读」分开：清掉是永不再出现，置读只是把未读计数清掉）。
+      || hiddenRunsAdapter[hitId] !== undefined
+      || (item.dedupKey !== undefined && hiddenRunsAdapter[String(item.dedupKey)] !== undefined)
     if (hit) {
       log(`adapter hidden id=${uslice(String(item.id ?? ''), 32)} key=${uslice(String(item.dedupKey ?? ''), 32)}`)
       continue
@@ -4375,6 +4509,36 @@ function radarRoute(ctx) {
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         })
       }
+    }
+    if (tail === 'hide-run') {
+      // t55：外部 agent 行的「清掉这条」。adapter 行没有 DSH run，也没有 session 生命周期，
+      // 只能按行 id / dedupKey 记账；写 hidden-runs.json（永久过滤）+ hidden-sessions.json
+      // （adapter 行的通用账本，t43/M2）+ seen（把未读一起清掉），磁盘上的原始日志一个字节都不动。
+      const runIdParam = (url.searchParams.get('id') ?? '').trim()
+      const runKeyParam = (url.searchParams.get('key') ?? '').trim()
+      const target = runIdParam !== '' ? runIdParam : runKeyParam
+      if (target === '') {
+        return new Response(JSON.stringify({ ok: false, error: 'id is required' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      hideRun(target)
+      if (runKeyParam !== '' && runKeyParam !== target) hideRun(runKeyParam)
+      hideSession(target)
+      if (runKeyParam !== '' && runKeyParam !== target) hideSession(runKeyParam)
+      const seenRuns = readSeen()
+      seenRuns[target] = Date.now()
+      if (runKeyParam !== '' && runKeyParam !== target) seenRuns[runKeyParam] = Date.now()
+      try {
+        saveSeen(seenRuns)
+      } catch {}
+      invalidateSnapshot(ctx)
+      log(`run hidden id=${uslice(target, 40)} key=${uslice(runKeyParam, 40)} by=${runIdParam !== '' ? 'id' : 'key'}`)
+      return new Response(JSON.stringify({ ok: true, hidden: target, snapshotRev }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
     }
     if (tail === 'hide-session') {
       // 双击会话行选「仅从雷达移除」：写 hidden-sessions.json（永久过滤）+ seen。

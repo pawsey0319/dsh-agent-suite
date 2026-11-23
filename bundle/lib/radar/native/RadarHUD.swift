@@ -359,6 +359,12 @@ private enum L {
         "event.turnStart": ["zh": "回合开始", "en": "turn start"],
         "failure.clear": ["zh": "✕ 清掉这条", "en": "✕ Dismiss"],
         "failure.copy": ["zh": "⧉ 复制错误", "en": "⧉ Copy error"],
+        // t55：外部 agent 行没有 DSH run，桥的 /retry 对它无效——置灰并说清去哪儿重跑。
+        "failure.retryExternal": ["zh": "↻ 重试（不支持）", "en": "↻ Retry (unsupported)"],
+        "failure.retryExternalHint": ["zh": "没有可重放的任务描述；请到对应 App 重跑", "en": "No replayable prompt; rerun it in the source app"],
+        "toast.hiddenRun": ["zh": "已从雷达移除", "en": "Removed from radar"],
+        "toast.hiddenRunBody": ["zh": "这条不会再出现在列表里（原始日志未改动）", "en": "It stays out of the list (source log untouched)"],
+        "toast.hideFailed": ["zh": "移除没成功", "en": "Remove failed"],
         "failure.noText": ["zh": "（这次失败没有留下错误文本）", "en": "(this failure left no error text)"],
         "failure.title": ["zh": "任务失败", "en": "Task failed"],
         "footer.backToEvents": ["zh": "‹ 返回事件流", "en": "‹ Back"],
@@ -1932,6 +1938,9 @@ private final class PanelContentView: PassthroughView {
 
     /// 数据源条是否展开（t42）：默认折叠成「前 4 家 + N」，点 +N 在面板内展开全部，再点收起。
     private(set) var sourceExpanded = false
+    /// t55：外部 agent 的失败页——没有 DSH run 可重放，也没有宿主内存里的结果，
+    /// 所以重试要置灰、正文只来自条目自身字段（绝不显示「结果已不在宿主内存里」这种桥文案）。
+    var externalFailure = false
     /// `+N` / 「收起」药丸的命中区（视图坐标），每次绘制时重建。
     private var sourceToggleRect: NSRect?
     /// 上一次记录过的 dropped 数：只在变化时打日志，别每 2s 刷一行。
@@ -3176,9 +3185,24 @@ private final class PanelContentView: PassthroughView {
                                 attributes: bodyAttrs)
 
         // 两行按钮，避免 320pt 宽挤成一条。
-        drawFooterButton(text: L.s("action.retry"), align: .left, action: .retryRun,
-                         color: NSColor.white.withAlphaComponent(0.98),
-                         background: NSColor.systemGreen.withAlphaComponent(0.66))
+        if externalFailure {
+            // t55：外部 agent 行没有可重放的 prompt（桥里没有这条 run），
+            // 置灰 + 一行说明，而不是点了之后弹「重试没成功」。
+            let noteAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.46),
+            ]
+            (L.s("failure.retryExternalHint") as NSString).draw(
+                in: NSRect(x: padding, y: HUD.contentPadding + 16, width: bounds.width - 2 * padding, height: 12),
+                withAttributes: noteAttrs)
+            drawFooterButton(text: L.s("failure.retryExternal"), align: .left, action: .retryRun,
+                             color: NSColor(calibratedWhite: 1.0, alpha: 0.34),
+                             background: NSColor(calibratedWhite: 1.0, alpha: 0.07))
+        } else {
+            drawFooterButton(text: L.s("action.retry"), align: .left, action: .retryRun,
+                             color: NSColor.white.withAlphaComponent(0.98),
+                             background: NSColor.systemGreen.withAlphaComponent(0.66))
+        }
         drawFooterButton(text: L.s("failure.copy"), align: .right, action: .copyError,
                          color: NSColor.white.withAlphaComponent(0.92),
                          background: NSColor.systemBlue.withAlphaComponent(0.55))
@@ -7784,6 +7808,31 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         // openApproval 早已有 foldedItems 兜底，openDetail 漏了——于是桶里点非待办成员
         // （session/run 类）时 guard 直接 return，用户看不到任何变化。
         guard let item = state.items.first(where: { $0.id == id }) ?? foldedItems[id] else { return }
+        // t55：外部 agent 行（id 形如 `codex#rollout-…:failed` / `dumate#…`）根本不在桥里，
+        // 走 fetchRunDetail 只会拿到 404，然后把「结果已不在宿主内存里」写进正文——那是桥的
+        // 内部措辞，对用户毫无意义。这里直接用条目自身字段拼失败页，一次网络都不发。
+        if mode == .failure, id.contains("#") {
+            let body = (item.error ?? item.note ?? item.finalAnswer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            var card = RadarDetail(title: item.title ?? L.s("common.untitled"),
+                                   agent: (item.agent ?? "agent").uppercased(),
+                                   meta: L.f("detail.sessionMeta", shortId(item.sessionRef ?? "")),
+                                   body: body,
+                                   runId: id,
+                                   live: false)
+            card.runStatus = item.status ?? "failed"
+            detailForcedMode = .failure
+            detailOpenedAt = Date()
+            detailLastSeq = 0
+            detail = card
+            panelContent?.externalFailure = true
+            panelContent?.detail = card
+            if !isExpanded { setExpanded(true, animated: true) }
+            refreshExpandedGeometry(animated: false)
+            detailMode = .failure
+            panelContent?.detailMode = .failure
+            log("failure detail external id=\(id) agent=\(item.agent ?? "-") bodyChars=\(body.count)")
+            return
+        }
         log("open detail \(id) mode=\(mode)")
         detailForcedMode = mode
         detailOpenedAt = Date()
@@ -7794,6 +7843,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                              body: item.finalAnswer ?? "",
                              runId: id,
                              live: item.isRunningSession || item.isRunningRun)
+        panelContent?.externalFailure = false
         panelContent?.detail = detail
         // N-06：打开详情必须真的把面板放出来。旧实现只设 detailMode/detail，
         // 点横幅后窗口仍是 56x56 收起态，用户只看到横幅消失。
@@ -7817,6 +7867,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 失败页「重试」：让插件用同一 prompt/agent/cwd 重发，再刷新列表。
     private func retryRun() {
         guard let detail, !detail.runId.isEmpty else { return }
+        // t55：外部 agent 行没有可重放的 prompt（桥里没有那条 run）——点它只会得到 404。
+        // 置灰按钮仍可能被点到（命中区在），所以这里也要挡一次并给可见反馈。
+        if detail.runId.contains("#") {
+            log("retry skipped reason=external-agent id=\(detail.runId)")
+            showBanner(title: L.s("failure.retryExternal"), body: L.s("failure.retryExternalHint"))
+            return
+        }
         guard let components = feedBaseComponents() else {
             showBanner(title: L.s("toast.retryFailed"), body: L.s("toast.noRadarUrl"))
             return
@@ -7864,7 +7921,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     private func copyErrorToPasteboard() {
         guard let detail else { return }
-        let text = detail.body.isEmpty ? (state.items.first { $0.id == detail.runId }?.error ?? "") : detail.body
+        // t55：外部 agent 行正文可能为空（只有标题），这时复制该行可见的 error /
+        // detail 原文，而不是弹「没有可复制的错误」——用户点「复制错误」就是要把那串贴给别人。
+        var text = detail.body.isEmpty ? (state.items.first { $0.id == detail.runId }?.error ?? "") : detail.body
+        if text.isEmpty, detail.runId.contains("#") {
+            let row = state.items.first { $0.id == detail.runId } ?? foldedItems[detail.runId]
+            text = (row?.error ?? row?.note ?? row?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        log("copy error resolved chars=\(text.count) external=\(detail.runId.contains("#"))")
         guard !text.isEmpty else {
             showBanner(title: L.s("toast.noError"), body: L.s("toast.noErrorBody"))
             return
@@ -7879,6 +7943,38 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 失败页「清掉这条」：标已读并从列表移除，磁盘上的 run 记录不动。
     private func clearCurrentRun() {
         guard let detail, !detail.runId.isEmpty else { return }
+        // t55：外部 agent 行走 adapter hide（hidden-runs + hidden-sessions）：清掉之后
+        // 刷新也不该再出现。DSH 自己的 run 仍只做置读（磁盘记录不动）。
+        if detail.runId.contains("#") {
+            guard let components = feedBaseComponents() else {
+                showBanner(title: L.s("toast.hideFailed"), body: L.s("toast.noRadarUrl"))
+                return
+            }
+            var target = components
+            target.path += "/hide-run"
+            target.percentEncodedQueryItems = encodedQueryItems([URLQueryItem(name: "id", value: detail.runId)])
+            guard let url = target.url else { return }
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+            request.httpMethod = "GET"
+            log("hide run request id=\(detail.runId)")
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    let ok = error == nil && (200...299).contains(status) && text.contains("\"ok\":true")
+                    log("hide run id=\(detail.runId) ok=\(ok) status=\(status) body=\(text.prefix(120))")
+                    if ok {
+                        self.closeDetail()
+                        self.fetchNow(reason: "hide-run")
+                        self.showBanner(title: L.s("toast.hiddenRun"), body: L.s("toast.hiddenRunBody"))
+                    } else {
+                        self.showBanner(title: L.s("toast.hideFailed"), body: text.isEmpty ? L.f("toast.serverSaid", status) : String(text.prefix(60)))
+                    }
+                }
+            }.resume()
+            return
+        }
         log("clear run \(shortId(detail.runId))")
         markSeen([detail.runId])
         closeDetail()
