@@ -25,7 +25,7 @@ function zhTask(status) {
 }
 
 import { fileURLToPath } from 'node:url'
-import { chmodSync, appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
@@ -44,7 +44,11 @@ export const name = 'dsh-task-radar'
 export const inject = ['webServer']
 
 const LOG_DIR = '/tmp/dsh-task-radar'
-const BRIDGE_DIR = join(homedir(), '.dsh', 'agent-bridge')
+// DSH_AGENT_BRIDGE_DIR 只给测试/自检用：默认仍是 ~/.dsh/agent-bridge。
+// 有了它，声明式 adapter 的自检才能把 bridge 目录挪到 /tmp，不碰真实用户目录。
+const BRIDGE_DIR = process.env.DSH_AGENT_BRIDGE_DIR !== undefined && process.env.DSH_AGENT_BRIDGE_DIR !== ''
+  ? process.env.DSH_AGENT_BRIDGE_DIR
+  : join(homedir(), '.dsh', 'agent-bridge')
 const ARTIFACT_KEEP_MS = 6 * 60 * 60 * 1000
 // 会话内提问（'user-questions/request'）的「只看不动」旁听记录。
 // 桌面提问卡由 api-remotes 的转发 listener 负责显示；雷达只旁听一份文本，
@@ -685,7 +689,7 @@ function sameOriginReason(request) {
 /** 会改宿主状态的雷达路由：只允许 GET + 同源（t22 / X-01）。 */
 const MUTATING_TAILS = new Set([
   'seen', 'clear-done', 'hide-session', 'hide-run', 'retry', 'question-answer',
-  'approval-decide', 'jump', 'jump-pending', 'jump-ack', 'purge-tests',
+  'approval-decide', 'jump', 'jump-pending', 'jump-ack', 'purge-tests', 'adapter-inject', 'adapter-answer',
 ])
 
 function json(response, status, body) {
@@ -1450,6 +1454,1441 @@ function dshQuestionItems(ctx, sessions) {
 /** feed 截断上限：面板一屏 6 行 + 滚动，40 条足够覆盖一屏之外的真实任务。 */
 const MAX_ITEMS = 40
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 多 agent adapter 层（分支 feat/multi-agent-notify）
+//
+// 目的：把「DSH 之外的 agent 也在等你看一眼」这件事塞进同一只胶囊。
+// 结构：每家 agent 一个 descriptor，注册进统一 bus；feed 只消费**规范化事件**。
+// 规则（三条硬约束，来自 docs/specs/multi-agent-notify-spec.md）：
+//   1. 只读观察。除 DSH 已有的回执通道外，不代点、不发送任何对外消息、不改别人的配置。
+//   2. 降级必须诚实。拿不到的状态标 unsupported/partial，绝不伪造「等回答」。
+//   3. 故障隔离。任何一家抛错/超时只影响它自己：其余事件照常，计数不清零。
+// ═══════════════════════════════════════════════════════════════════════════
+const ADAPTER_POLL_TIMEOUT_MS = 400
+const ADAPTER_EVENT_TTL_MS = 2 * 60 * 60 * 1000
+// R3-M1：终态（done/failed）不受 2h TTL 约束。真实 rollout 的 completed_at 可能就是几小时前，
+// 按 TTL 过滤会把「这条跑完了」整条吃掉（复审实测 now−3h 被丢）。入库、出库都走这一个判断。
+const adapterEventFresh = (event, now) => event?.kind === 'done' || event?.kind === 'failed'
+  || now - Number(event?.ts ?? 0) <= ADAPTER_EVENT_TTL_MS
+const ADAPTER_MAX_EVENTS = 200
+/** 心跳（t39 P1）：超过这么久没有一次成功探测，就标 stale 而不是继续冒充 full/partial。 */
+const ADAPTER_STALE_MS = 90 * 1000
+/** 熔断（t39 P1）：连续 3 次失败后 60s 内不再探测，避免每 2s 打一次挂掉的家。 */
+const ADAPTER_BREAKER_THRESHOLD = 3
+const ADAPTER_BREAKER_COOLDOWN_MS = 60 * 1000
+// ── 事件词表（t39 / P0-2）────────────────────────────────────────────────
+// 规格 §1.2：提醒态只有四类 needs-input | needs-approval | done | failed，另外允许
+// running 作为**非提醒态**（只表达「在跑」，不进红/黄呼吸、不算未读）。
+// 旧词 question / approval 仍被接受，但会映射到新词并**记一条弃用日志**（不再静默拒绝）。
+const ADAPTER_CANON_KINDS = new Set(['needs-input', 'needs-approval', 'done', 'failed', 'running'])
+const ADAPTER_LEGACY_KINDS = new Map([['question', 'needs-input'], ['approval', 'needs-approval']])
+/** 已见过哪些家还在用旧词：只记一次日志，避免每 2s 刷屏。 */
+const adapterLegacySeen = new Set()
+/** 被规范化层拒掉的事件：reason -> 次数（排障能看出「为什么没进来」，累计值）。 */
+const adapterRejectReasons = new Map()
+/** 本轮 feed 拒掉的条数（counts.rejected 用它，避免拿累计值冒充「这一轮有几条被拒」）。 */
+let adapterPassRejects = 0
+/** id -> 最近一轮观察结果（t39 F7：`feed.adapters` 与 `GET /adapters` 必须是**同一套投影**，
+ *  否则两处 note/完整性能各说各话——比如 hooks 已装、/adapters 还写「未安装」）。 */
+const adapterLastStatus = new Map()
+/** 遇到过未知 kind 的原始值：只记前 10 种，避免脏数据把日志灌满。 */
+const adapterUnknownKinds = new Set()
+
+/** 出站脱敏（t39 / P0-5）：凭据形状一律遮蔽。宁可少显示，也不把 token 印在屏幕上。 */
+const ADAPTER_REDACT_RULES = [
+  [/sk-[A-Za-z0-9_-]{8,}/g, '<redacted>'],
+  [/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer <redacted>'],
+  [/gh[pousr]_[A-Za-z0-9]{8,}/g, '<redacted>'],
+  [/xox[baprs]-[A-Za-z0-9-]{8,}/g, '<redacted>'],
+  // 长 base64/hex 串（>=32）：常见于把整个 token/证书塞进 title 的日志
+  [/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, '<redacted>'],
+  [/\b[a-f0-9]{40,}\b/gi, '<redacted>'],
+]
+
+function redactSecrets(text) {
+  if (typeof text !== 'string' || text === '') return text
+  let out = text
+  for (const [pattern, replacement] of ADAPTER_REDACT_RULES) out = out.replace(pattern, replacement)
+  return out
+}
+
+/** 契约校验失败时统一记账（t39 / P0-4）：reason 进计数，日志只留一条短行。 */
+function noteAdapterReject(descriptor, reason, raw) {
+  const key = reason
+  adapterRejectReasons.set(key, (adapterRejectReasons.get(key) ?? 0) + 1)
+  adapterPassRejects += 1
+  const agent = descriptor === null || descriptor === undefined ? '-' : descriptor.id
+  log(`adapter event rejected agent=${agent} reason=${reason} raw=${uslice(String(raw === undefined ? '' : JSON.stringify(raw) ?? ''), 80)}`)
+}
+/** id -> descriptor（注册顺序即数据源条的展示顺序基准，实际顺序由 adapterOrder 固定） */
+const adapterRegistry = new Map()
+/** id -> Map(dedupeKey -> event)：同一条事件被重复上报时只留一份（spec §1.4-b） */
+const adapterStore = new Map()
+/** id -> { ok, error, at, probeMs, pollMs, rejected }：数据源条与排障用 */
+const adapterHealth = new Map()
+/** 故障隔离自测注入：id -> 'throw' | 'timeout'（只由 /x-radar/adapter-inject 写入） */
+const adapterFault = new Map()
+/** 文件类 adapter 的读取偏移：path -> { offset, ino }，避免每 2s 重读整个日志 */
+const adapterOffsets = new Map()
+/** 数据源条的固定顺序（spec §3.2-b：dsh → codex → claude → 其它按字母序，不按健康度跳） */
+const ADAPTER_ORDER = ['dsh', 'codex', 'claude']
+
+/**
+ * 注册一家 adapter（t39 / P0-3 生命周期面）。
+ *
+ * 一家 adapter = 一个对象，实现四个可选方法：
+ *   probe(ctx)       → { installed, running, completeness, note }      必须能答「装没装/在不在跑」
+ *   poll(ctx, now)   → 原始事件数组                                      可选（推送型 adapter 不实现）
+ *   answer(id, body) → 就地处置（只有拿到真实回执通道的家才实现）          可选
+ *   capabilities     → { observe, answer, toastOnly }                    声明「能做什么」
+ *
+ * 关键：**新增一家 agent 不需要改这里的代码**——把同样的对象挂在
+ * `~/.dsh/agent-bridge/adapters.d/*.json` 里（声明式），启动时与每次 `GET /x-radar/adapters`
+ * 都会被扫进来（见 loadDeclaredAdapters）。
+ */
+function registerAdapter(descriptor) {
+  const id = String(descriptor.id ?? '')
+  if (id === '') {
+    log('adapter register rejected reason=id-missing')
+    return null
+  }
+  const declared = descriptor.capabilities ?? {}
+  const capabilities = {
+    observe: declared.observe !== false,
+    // answer 只认「真的实现了 answer()」的家，避免底条/详情承诺一个做不到的动作。
+    answer: declared.answer === true && typeof descriptor.answer === 'function',
+    toastOnly: declared.toastOnly === true || descriptor.toastOnly === true,
+  }
+  const entry = {
+    channel: 'none',
+    completeness: 'unsupported',
+    ...descriptor,
+    id,
+    capabilities,
+    probe: typeof descriptor.probe === 'function' ? descriptor.probe : undefined,
+    poll: typeof descriptor.poll === 'function' ? descriptor.poll : undefined,
+    answer: typeof descriptor.answer === 'function' ? descriptor.answer : undefined,
+  }
+  adapterRegistry.set(id, entry)
+  if (!adapterStore.has(id)) adapterStore.set(id, new Map())
+  // completeness 先记 unknown：第一次探测前不能冒充 full/partial（spec §3.1 fail-closed）。
+  if (!adapterHealth.has(id)) {
+    adapterHealth.set(id, {
+      ok: true, error: null, at: 0, probeMs: 0, pollMs: 0, rejected: 0,
+      completeness: 'unknown',
+      // 心跳/熔断（t39 P1）：连续 3 次失败 → 60s 内不再探测，避免每 2s 打一次挂掉的家。
+      consecutiveFailures: 0,
+      breakerUntil: 0,
+      lastOkAt: 0,
+    })
+  }
+  return entry
+}
+
+// ── 声明式 adapter（t39 / P0-3）：不改进程内代码也能加一家 ──────────────────
+/** 目录：`~/.dsh/agent-bridge/adapters.d/*.json`（用户级，端口变了也不丢） */
+const ADAPTER_DECL_DIR = join(BRIDGE_DIR, 'adapters.d')
+
+/** 按 `a.b.c` 取字段；取不到返回 undefined。 */
+function pickPath(record, path) {
+  if (typeof path !== 'string' || path === '') return undefined
+  let cursor = record
+  for (const part of path.split('.')) {
+    if (cursor === null || cursor === undefined || typeof cursor !== 'object') return undefined
+    cursor = cursor[part]
+  }
+  return cursor
+}
+
+/** 一份声明式 adapter 的清单 → descriptor。故意只支持「文件追加 + 字段映射」这一种形态：
+ *  能覆盖 Claude/Codex/DuMate 这类 JSONL 日志，又不需要在宿主里执行任意代码（安全边界）。 */
+function declaredDescriptor(manifest, path) {
+  const id = String(manifest.id ?? '')
+  if (id === '' || manifest.source === undefined) return null
+  const source = manifest.source
+  const file = typeof source.path === 'string' ? source.path.replace(/^~/, homedir()) : ''
+  if (file === '') return null
+  const kind = String(source.kind ?? manifest.kind ?? 'needs-input')
+  const mapping = source.map ?? {}
+  return {
+    id,
+    label: String(manifest.label ?? id.toUpperCase()),
+    channel: 'declared',
+    completeness: manifest.completeness === 'partial' ? 'partial' : 'partial',
+    note: manifest.note ?? `声明式 adapter（${path}）`,
+    capabilities: { observe: true, answer: false, toastOnly: manifest.toastOnly === true },
+    probe() {
+      const exists = existsSync(file)
+      return {
+        installed: exists,
+        running: null,
+        completeness: exists ? 'partial' : 'unsupported',
+        note: exists ? `读 ${file}` : `未找到 ${file}`,
+      }
+    },
+    poll() {
+      const text = readAppendedText(file)
+      if (text === '') return []
+      const events = []
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim()
+        if (trimmed === '' || trimmed.startsWith('#')) continue
+        let record
+        try {
+          record = JSON.parse(trimmed)
+        } catch {
+          continue
+        }
+        const sessionRef = pickPath(record, mapping.sessionRef ?? 'sessionId') ?? pickPath(record, 'session') ?? pickPath(record, 'sid')
+        const title = pickPath(record, mapping.title ?? 'title') ?? pickPath(record, 'message') ?? pickPath(record, 'name')
+        const detail = pickPath(record, mapping.detail ?? 'detail') ?? pickPath(record, 'message')
+        const rawTs = pickPath(record, mapping.ts ?? 'timestamp') ?? pickPath(record, 'ts')
+        const tsValue = typeof rawTs === 'number' ? rawTs : Date.parse(String(rawTs ?? ''))
+        const eventKind = mapping.kind === undefined ? kind : String(pickPath(record, mapping.kind) ?? kind)
+        const receipt = {
+          answerRequest: pickPath(record, mapping.answerRequest ?? 'answerRequest'),
+          answerToken: pickPath(record, mapping.answerToken ?? 'answerToken'),
+          approvalId: pickPath(record, mapping.approvalId ?? 'approvalId'),
+        }
+        events.push({
+          kind: eventKind,
+          title: typeof title === 'string' ? title : '',
+          detail: typeof detail === 'string' ? detail : '',
+          sessionRef: typeof sessionRef === 'string' ? sessionRef : String(sessionRef ?? ''),
+          ts: Number.isFinite(tsValue) ? tsValue : Date.now(),
+          completeness: 'partial',
+          ...(typeof receipt.answerRequest === 'string' ? { answerRequest: receipt.answerRequest } : {}),
+          ...(typeof receipt.answerToken === 'string' ? { answerToken: receipt.answerToken } : {}),
+          ...(typeof receipt.approvalId === 'string' ? { approvalId: receipt.approvalId } : {}),
+        })
+      }
+      return events
+    },
+  }
+}
+
+/** 扫 `adapters.d/*.json`：已注册的跳过（幂等），坏的只打日志不抛。 */
+function loadDeclaredAdapters() {
+  let names
+  try {
+    names = readdirSync(ADAPTER_DECL_DIR).filter((name) => name.endsWith('.json')).sort()
+  } catch {
+    return { loaded: 0, skipped: 0, failed: 0 }
+  }
+  let loaded = 0
+  let skipped = 0
+  let failed = 0
+  for (const name of names) {
+    const path = join(ADAPTER_DECL_DIR, name)
+    try {
+      const manifest = JSON.parse(readFileSync(path, 'utf8'))
+      const id = String(manifest.id ?? '')
+      if (id !== '' && adapterRegistry.has(id)) {
+        skipped += 1
+        continue
+      }
+      const descriptor = declaredDescriptor(manifest, path)
+      if (descriptor === null) {
+        failed += 1
+        log(`adapter declare invalid file=${name} reason=missing-id-or-source`)
+        continue
+      }
+      registerAdapter(descriptor)
+      loaded += 1
+      log(`adapter declared id=${descriptor.id} file=${name}`)
+    } catch (error) {
+      failed += 1
+      log(`adapter declare failed file=${name} err=${uslice(String(error && error.message ? error.message : error), 120)}`)
+    }
+  }
+  return { loaded, skipped, failed }
+}
+
+function adapterList() {
+  const list = [...adapterRegistry.values()]
+  const rank = (id) => {
+    const index = ADAPTER_ORDER.indexOf(id)
+    return index === -1 ? ADAPTER_ORDER.length : index
+  }
+  return list.sort((a, b) => rank(a.id) - rank(b.id) || a.id.localeCompare(b.id))
+}
+
+/** 单家 adapter 的「保护壳」：注入故障、超时、异常都在这里掐断，绝不外溢到别的家。 */
+async function guardedAdapterCall(id, label, run) {
+  const injected = adapterFault.get(id)
+  if (injected === 'throw') throw new Error(`injected ${label} failure`)
+  const work = Promise.resolve().then(run)
+  if (injected === 'timeout') {
+    // 关键：不能 race 真实 run()——同步 probe 会在微任务里先返回，注入就白做了。
+    // 这里直接换成一个永不 resolve 的 promise，让外层超时分支真的触发。
+    return Promise.race([new Promise(() => {}), new Promise((resolve) => setTimeout(() => resolve(ADAPTER_TIMEOUT_MARK), ADAPTER_POLL_TIMEOUT_MS))])
+      .then((value) => {
+        if (value === ADAPTER_TIMEOUT_MARK) throw new Error(`injected ${label} timeout ${ADAPTER_POLL_TIMEOUT_MS}ms`)
+        return value
+      })
+  }
+  let timer
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(ADAPTER_TIMEOUT_MARK), ADAPTER_POLL_TIMEOUT_MS)
+    timer.unref?.()
+  })
+  try {
+    const value = await Promise.race([work, timeout])
+    if (value === ADAPTER_TIMEOUT_MARK) throw new Error(`${label} timeout ${ADAPTER_POLL_TIMEOUT_MS}ms`)
+    return value
+  } finally {
+    clearTimeout(timer)
+  }
+}
+const ADAPTER_TIMEOUT_MARK = Symbol('adapter-timeout')
+
+/** 规范化：任何一家交上来的原始事件都收敛成同一形状；不合格的直接拒（spec §1.3 / t39 P0-2/P0-4/P0-5）。
+ *
+ * 拒收理由（都会进 counts.rejected 与日志，绝不静默吞掉）：
+ *   kind-unknown     词表外（且不是可映射的旧词）
+ *   title-missing    没有可显示的一行标题
+ *   session-missing  sessionRef 为空——拿不到会话就进不了队列（spec §1.5 分水岭）
+ *   completeness-missing  既没自报也没声明，无法诚实标注降级
+ *   not-object       压根不是对象
+ */
+function normalizeAdapterEvent(descriptor, raw, options) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    noteAdapterReject(descriptor, 'not-object', raw)
+    return null
+  }
+  const rawKind = String(raw.kind ?? '')
+  let kind = rawKind
+  if (ADAPTER_LEGACY_KINDS.has(rawKind)) {
+    kind = ADAPTER_LEGACY_KINDS.get(rawKind)
+    const legacyKey = `${descriptor === null || descriptor === undefined ? '-' : descriptor.id}:${rawKind}`
+    if (!adapterLegacySeen.has(legacyKey)) {
+      adapterLegacySeen.add(legacyKey)
+      log(`adapter kind deprecated agent=${descriptor === null || descriptor === undefined ? '-' : descriptor.id} from=${rawKind} to=${kind}`)
+    }
+  }
+  if (!ADAPTER_CANON_KINDS.has(kind)) {
+    if (!adapterUnknownKinds.has(rawKind) && adapterUnknownKinds.size < 10) {
+      adapterUnknownKinds.add(rawKind)
+      log(`adapter kind unknown value=${uslice(rawKind, 32)}`)
+    }
+    noteAdapterReject(descriptor, 'kind-unknown', raw)
+    return null
+  }
+  const rawTitle = typeof raw.title === 'string' ? raw.title.trim() : ''
+  if (rawTitle === '') {
+    noteAdapterReject(descriptor, 'title-missing', raw)
+    return null
+  }
+  const sessionRef = typeof raw.sessionRef === 'string' ? raw.sessionRef.trim() : ''
+  if (sessionRef === '') {
+    noteAdapterReject(descriptor, 'session-missing', raw)
+    return null
+  }
+  // t43 / M1：hook 入口与 poll 入口共用这一个校验函数，但**契约要求不同**：
+  // poll 是适配器自己的观测，允许回落到声明值；hook 是外部进程递进来的事实，
+  // 必须自带 completeness，否则就是幽灵行（宿主里根本没有这条待办）。
+  const declaredCompleteness = descriptor === null || descriptor === undefined ? undefined : descriptor.completeness
+  const explicitCompleteness = raw.completeness === 'partial' || raw.completeness === 'full' ? raw.completeness : null
+  const requireExplicit = options !== null && options !== undefined && options.requireExplicitCompleteness === true
+  const completeness = explicitCompleteness !== null
+    ? explicitCompleteness
+    : (requireExplicit ? null : (declaredCompleteness === 'partial' || declaredCompleteness === 'full' ? declaredCompleteness : null))
+  if (completeness === null) {
+    noteAdapterReject(descriptor, 'completeness-missing', raw)
+    return null
+  }
+  const agent = descriptor === null || descriptor === undefined ? String(raw.agent ?? 'unknown') : descriptor.id
+  const ts = Number.isFinite(raw.ts) ? Number(raw.ts) : Date.now()
+  // dedupeKey 缺省不再带 agent 前缀：item.id 已经是 `<agent>#<dedupeKey>`，
+  // 再拼一次会得到 `claude:claude:…` 这种重复前缀（t39 P0-1）。
+  const agentPrefix = `${agent}:`
+  let dedupeKey = typeof raw.dedupeKey === 'string' && raw.dedupeKey !== ''
+    ? uslice(redactSecrets(raw.dedupeKey), 160)
+    : `${kind}:${sessionRef}:${Math.round(ts / 1000)}`
+  // 生产者常把 agent 名拼进 dedupeKey；item.id 是 `<agent>#<dedupeKey>`，再留一次就成
+  // `codex#codex:…` 的重复前缀（t39 P0-1 明确点名这条）。这里削掉一次。
+  if (dedupeKey.startsWith(agentPrefix)) dedupeKey = dedupeKey.slice(agentPrefix.length)
+  const detail = typeof raw.detail === 'string' && raw.detail.trim() !== ''
+    ? uslice(redactSecrets(raw.detail), 600)
+    : null
+  return {
+    agent,
+    kind,
+    eventKind: kind,
+    title: uslice(redactSecrets(rawTitle), 160),
+    // detail 可选；没有就保持 null，让 HUD 不画空占位（t39 P0-4）。
+    detail,
+    sessionRef: uslice(sessionRef, 120),
+    ts,
+    dedupeKey,
+    options: Array.isArray(raw.options) ? raw.options.slice(0, 8).map((option) => redactSecrets(String(option))) : undefined,
+    // R3-H1：声明式 adapter 若自己带回了回执通道（answerRequest/answerToken/approvalId），
+    // 必须原样带到 item 上——否则折叠成一个桶后，桶里那些待办就再也点不动了。
+    answerRequest: typeof raw.answerRequest === 'string' && raw.answerRequest !== '' ? uslice(raw.answerRequest, 80) : undefined,
+    answerToken: typeof raw.answerToken === 'string' && raw.answerToken !== '' ? uslice(raw.answerToken, 80) : undefined,
+    approvalId: typeof raw.approvalId === 'string' && raw.approvalId !== '' ? uslice(raw.approvalId, 120) : undefined,
+    completeness,
+    toastOnly: raw.toastOnly === true,
+  }
+}
+
+function pushAdapterEvent(descriptor, event) {
+  const store = adapterStore.get(descriptor.id) ?? new Map()
+  store.set(event.dedupeKey, event)
+  const now = Date.now()
+  // R3-M1：终态事件（done/failed）不按 TTL 删。用户要的是「这条跑完了」，而真实 rollout 的
+  // completed_at 可能就是几小时前——按事件自身 ts 过滤会把「完成」整条吃掉（复审实测 now−3h 被丢）。
+  // 终态只受 ADAPTER_MAX_EVENTS 上限约束，且淘汰时优先淘汰非终态的最旧条目。
+  const isTerminal = (event) => event?.kind === 'done' || event?.kind === 'failed'
+  for (const [key, value] of store) {
+    if (isTerminal(value)) continue
+    if (now - value.ts > ADAPTER_EVENT_TTL_MS) store.delete(key)
+  }
+  if (store.size > ADAPTER_MAX_EVENTS) {
+    const ordered = [...store.entries()].sort((a, b) => {
+      const terminalDelta = Number(isTerminal(a[1])) - Number(isTerminal(b[1]))
+      if (terminalDelta !== 0) return terminalDelta
+      return a[1].ts - b[1].ts
+    })
+    for (const [key] of ordered.slice(0, store.size - ADAPTER_MAX_EVENTS)) store.delete(key)
+  }
+  adapterStore.set(descriptor.id, store)
+}
+
+/** 从偏移处读新增内容（只读、不写、不改 mtime）。文件被轮转（变小/inode 变）时从头读。 */
+function readAppendedText(path, maxBytes = 512 * 1024) {
+  let info
+  try {
+    info = statSync(path)
+  } catch {
+    return ''
+  }
+  const previous = adapterOffsets.get(path)
+  let offset = previous !== undefined && previous.ino === info.ino && previous.offset <= info.size ? previous.offset : 0
+  if (info.size - offset > maxBytes) offset = info.size - maxBytes
+  let text = ''
+  try {
+    const fd = openSync(path, 'r')
+    try {
+      const length = Math.min(info.size - offset, maxBytes)
+      if (length > 0) {
+        const buffer = Buffer.alloc(length)
+        readSync(fd, buffer, 0, length, offset)
+        text = buffer.toString('utf8')
+      }
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+  adapterOffsets.set(path, { offset: info.size, ino: info.ino })
+  return text
+}
+
+// ── DSH（沿用现有通道，full）────────────────────────────────────────────────
+registerAdapter({
+  id: 'dsh',
+  label: 'DSH',
+  completeness: 'full',
+  channel: 'host',
+  note: '会话内提问与桥内审批走宿主通道（既有实现）',
+  // 能力声明（t39 P0-3）：DSH 是唯一「确实能就地作答」的一家——被接管的提问有一次性 token。
+  capabilities: { observe: true, answer: true, toastOnly: false },
+  probe() {
+    return { installed: true, running: null }
+  },
+  /**
+   * 就地作答（唯一真正能写回的一家）：payload = { request, token, answers:[{id,selected,custom?}] }。
+   * 与 `/x-radar/question-answer` 共用 `questionHold` 的一次性 token，避免出现第二条语义。
+   */
+  answer(payload) {
+    const requestId = String(payload?.request ?? '')
+    const token = String(payload?.token ?? '')
+    const held = questionHold.get(requestId)
+    if (held === undefined) return { ok: false, status: 410, error: 'request not pending' }
+    if (token === '' || token !== held.token) return { ok: false, status: 403, error: 'bad token' }
+    const answers = normalizeDshAnswers(payload?.answers, held.questions)
+    if (answers === null) return { ok: false, status: 400, error: 'answers must be [{id, selected:[label], custom?}]' }
+    held.settle('answered', answers)
+    // 这里没有 ctx（adapterAnswer 是纯函数），靠 1s TTL 的下一次请求重建。
+    invalidateSnapshot()
+    return { ok: true, answered: answers.length }
+  },
+})
+
+// ── Claude Code（hooks 推送，四态齐全；未装 hooks 则明确 unsupported）────────
+const CLAUDE_DIR = join(homedir(), '.claude')
+const CLAUDE_SETTINGS = join(CLAUDE_DIR, 'settings.json')
+/** sid -> { kind, title, detail, ts, dedupeKey }：hook 是推送，这里只做「当前态」的落地 */
+const claudeLive = new Map()
+/**
+ * 事件指纹（t39 F3）：同一会话的两条不同批准必须共存。
+ *
+ * 只用 `sid + kind` 做键时，「Bash: make build」会被后到的「git push --force」顶掉，
+ * 而且 counts/rejected 都不动——用户永远看不到第一条（t37 已实测复现）。
+ * 这里把「工具名 + 命令/问题摘要」折成 32 位 hash 塞进键里（djb2，不引依赖）。
+ */
+function eventFingerprint(parts) {
+  const text = parts.map((part) => String(part ?? '')).join('\u0001')
+  let hash = 5381
+  for (let i = 0; i < text.length; i += 1) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0
+  return hash.toString(36)
+}
+/** 从 hook 的 stdin JSON 里抽字段（Claude 只保证 stdin，query 变量是猜的，t39 F5）。 */
+function parseHookPayload(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  let data
+  try {
+    data = JSON.parse(uslice(raw, 20000))
+  } catch {
+    return null
+  }
+  if (data === null || typeof data !== 'object') return null
+  const toolInput = data.tool_input ?? data.toolInput ?? null
+  const command = typeof toolInput === 'string'
+    ? toolInput
+    : toolInput !== null && typeof toolInput === 'object'
+      ? (toolInput.command ?? toolInput.description ?? toolInput.question ?? toolInput.prompt ?? JSON.stringify(toolInput))
+      : ''
+  // R5-M3：真实 StopFailure payload 把原因放在**顶层**（`error` / `error.message` /
+  // `stop_reason` / `reason`），并没有 tool_input。旧代码只认 tool_input，于是
+  // 「优先取 error.message」这条路径在真机上永远走不到。候选顺序写在 spec §5-d。
+  const topLevelDetail = data.error?.message ?? data.error ?? data.stop_reason ?? data.reason
+  return {
+    event: uslice(String(data.hook_event_name ?? data.event ?? ''), 40),
+    sessionId: uslice(String(data.session_id ?? data.sessionId ?? ''), 80),
+    toolName: uslice(String(data.tool_name ?? data.toolName ?? ''), 80),
+    detail: uslice(String(topLevelDetail ?? command ?? ''), 240),
+    cwd: uslice(String(data.cwd ?? ''), 200),
+  }
+}
+
+function claudeSettings() {
+  try {
+    const parsed = JSON.parse(readFileSync(CLAUDE_SETTINGS, 'utf8'))
+    return { exists: true, settings: parsed, hooks: parsed?.hooks }
+  } catch {
+    return { exists: false, settings: null, hooks: null }
+  }
+}
+
+function claudeHooksInstalled() {
+  const { hooks } = claudeSettings()
+  return hooks !== null && typeof hooks === 'object' && Object.keys(hooks).length > 0
+}
+
+// 规范词表（t39 P0-2）：内置生产者直接产出 needs-input / needs-approval / done / failed / running。
+// 旧词 question / approval 仍被 normalizeAdapterEvent 接受（给外部/声明式 adapter 的弃用映射）。
+const CLAUDE_EVENT_KIND = {
+  PermissionRequest: 'needs-approval',
+  Elicitation: 'needs-input',
+  Stop: 'done',
+  StopFailure: 'failed',
+  Notification: 'done',
+}
+
+registerAdapter({
+  id: 'claude',
+  label: 'CLAUDE',
+  completeness: 'full',
+  channel: 'hooks',
+  note: 'hooks 未安装：用 /x-radar/claude-hook-config 取引导（本分支不代写用户配置）',
+  // t43 / M4：snapshot 首帧（本轮观测还没跑）也必须是运行时事实，不能照抄声明文案。
+  noteNow() {
+    const installed = existsSync(CLAUDE_DIR)
+    if (!installed) return '未检测到 ~/.claude'
+    return claudeHooksInstalled() ? 'hooks 已装（PermissionRequest/Elicitation/Stop/StopFailure）' : '~/.claude 存在但 settings.json 无 hooks 键'
+  },
+  probe() {
+    const installed = existsSync(CLAUDE_DIR)
+    const hooks = claudeHooksInstalled()
+    return {
+      installed: installed && hooks,
+      running: claudeLive.size > 0,
+      // 装上 hooks 才是 full；没装就诚实标 unsupported（spec §3.1 fail-closed）。
+      completeness: installed && hooks ? 'full' : 'unsupported',
+      note: !installed ? '未检测到 ~/.claude' : hooks ? 'hooks 已装（PermissionRequest/Elicitation/Stop/StopFailure）' : '~/.claude 存在但 settings.json 无 hooks 键',
+    }
+  },
+  poll() {
+    const now = Date.now()
+    const events = []
+    for (const [liveKey, live] of claudeLive) {
+      if (now - live.ts > ADAPTER_EVENT_TTL_MS) {
+        claudeLive.delete(liveKey)
+        continue
+      }
+      // t43 / M6：对外只暴露纯 sessionRef（存进 live 的那份），指纹只留在 dedupeKey 里。
+      const sessionRef = live.sessionRef ?? liveKey.split('|')[0]
+      events.push({ kind: live.kind, title: live.title, detail: live.detail, sessionRef, ts: live.ts, dedupeKey: live.dedupeKey, completeness: 'partial' })
+    }
+    return events
+  },
+})
+
+/** Claude hook 落点：`GET /x-radar/claude-hook?ev=PermissionRequest&sid=…&title=…`。
+ *  为什么是 GET：宿主 webserver 只放行 GET/HEAD（POST 会 405），所以 hooks 配 `type: command`
+ *  跑一条 curl 最稳；命令由 /x-radar/claude-hook-config 生成，用户自己粘贴。 */
+function claudeHook(url) {
+  // F5：优先吃 hooks 从 stdin 递进来的整包 JSON（session_id/tool_name/hook_event_name/tool_input），
+  // query 只作兼容旧引导的回落——`$CLAUDE_SESSION_ID`/`$CLAUDE_TOOL_NAME` 并不是 Claude 的契约变量。
+  const payload = parseHookPayload(url.searchParams.get('raw') ?? '')
+  const ev = payload?.event || url.searchParams.get('ev') || ''
+  // t43 / M1：**不要**在缺 session_id 时回落成 'claude'——那会造出「有行、但宿主没有这条待办」的
+  // 幽灵行，且永远触发不了 session-missing。缺就留空，交给 normalizeAdapterEvent 拒收并计数。
+  const sid = uslice(
+    payload !== null && payload !== undefined
+      ? String(payload.sessionId ?? '')
+      : String(url.searchParams.get('sid') ?? url.searchParams.get('session') ?? ''),
+    80,
+  )
+  const kind = CLAUDE_EVENT_KIND[ev]
+  if (kind === undefined) {
+    log(`claude hook ignored ev=${uslice(ev, 24)}`)
+    return { ok: false, error: 'unknown event', accepted: false }
+  }
+  const toolName = payload?.toolName || url.searchParams.get('title') || url.searchParams.get('tool') || ''
+  const payloadDetail = payload?.detail || url.searchParams.get('detail') || ''
+  // t43 / M6b：待办行的标题必须是**问题正文首句**（截 60 字），工具名挪到副行。
+  // Elicitation 的正文来自 tool_input.question/prompt（parseHookPayload 已挑出来放在 detail 里）。
+  const isPending = kind === 'needs-input' || kind === 'needs-approval'
+  const rawTitle = isPending && payloadDetail !== '' ? uslice(payloadDetail, 60) : toolName
+  const detail = isPending && toolName !== '' && toolName !== rawTitle
+    ? uslice([toolName, payloadDetail].filter((part) => part !== '').join(' · '), 240)
+    : payloadDetail
+  const noOptions = kind === 'needs-input' || kind === 'needs-approval'
+  // F3：指纹进键（工具名 + 命令/问题摘要），让同会话的两条不同批准各自成行。
+  const fingerprint = eventFingerprint([kind, rawTitle, detail])
+  const liveKey = `${sid}|${fingerprint}`
+  if (kind === 'done' || kind === 'failed') {
+    // 终态清掉该会话全部「进行中」，并把终态推给 bus（dedupeKey 带时间戳防重复上报）。
+    for (const key of [...claudeLive.keys()]) {
+      if (key === sid || key.startsWith(`${sid}|`)) claudeLive.delete(key)
+    }
+    const ts = Date.now()
+    // R3-H2：终态行不能拿事件名（StopFailure）当标题、也不能把整包 JSON 当正文。
+    // 失败给人话「Claude 会话失败：<摘要>」，摘要优先取 error.message；没有就退回固定说法。
+    const readable = humanText(payloadDetail) ?? humanText(detail)
+    const fixedFailure = ev === 'StopFailure' ? '会话被中断' : '会话失败'
+    const failureText = readable ?? fixedFailure
+    // t47：摘要**等于**固定说法时不再加括号后缀（否则会写出「会话被中断（会话被中断）」）。
+    const failureTitle = failureText === fixedFailure
+      ? `Claude 会话失败：${fixedFailure}`
+      : (ev === 'StopFailure' ? `Claude 会话失败：会话被中断（${failureText}）` : `Claude 会话失败：${failureText}`)
+    const title = kind === 'done'
+      ? (readable === undefined ? 'Claude 任务完成' : uslice(`Claude 任务完成：${readable}`, 80))
+      : uslice(failureTitle, 80)
+    // t43 / M1：事件自带 completeness（hooks 只能观察、不能代答 ⇒ partial），
+    // 这样 hook 入口走的是「必须显式 completeness」的严格分支。
+    return { ok: true, accepted: true, event: { kind, title, detail: kind === 'failed' ? failureText : (readable ?? detail), sessionRef: sid, ts, completeness: 'partial', dedupeKey: `claude:${sid}:${kind}:${ts}` } }
+  }
+  const ts = Date.now()
+  const title = rawTitle || (kind === 'needs-approval' ? 'Claude 在等批准' : 'Claude 在等你回答')
+  const dedupeKey = `claude:${sid}:${kind}:${fingerprint}`
+  // t43 / M6：claudeLive 的 key 是 `${sid}|${fingerprint}`（内部复合键），
+  // 所以 sessionRef 必须单独存一份——否则 poll 会把 `sess-x|kid` 直接暴露到 feed 里。
+  claudeLive.set(liveKey, { kind, title, detail, ts, dedupeKey, sessionRef: sid })
+  if (noOptions) {
+    // 只观察：返回 ask 让 Claude 自己的界面继续弹卡，用户仍然在那边处理（不接管）。
+  }
+  return { ok: true, accepted: true, event: { kind, title, detail, sessionRef: sid, ts, completeness: 'partial', dedupeKey } }
+}
+
+/** 一键写入 hooks 的「引导」：只输出片段 + 现状检测，绝不代写（禁止项）。 */
+function claudeHookConfig(ctx) {
+  let port
+  try {
+    port = ctx.get('webServer')?.port
+  } catch {}
+  const base = Number.isFinite(port) ? `http://127.0.0.1:${port}/x-radar/claude-hook` : 'http://127.0.0.1:<port>/x-radar/claude-hook'
+  // F5：只依赖 claude 的契约——hooks 把整包 JSON 从 stdin 递进来。整包转成 raw 参数发走，
+  // 插件侧 parseHookPayload 解析（session_id/tool_name/hook_event_name/tool_input）。
+  // `-G --data-urlencode` 负责把空格/中文/`+`/`&` 编好；`-m 2 || true` 不阻塞 claude。
+  const hook = (ev) => ({
+    matcher: '',
+    hooks: [
+      {
+        type: 'command',
+        command: `payload=$(cat); curl -sS -m 2 -G "${base}?ev=${ev}" --data-urlencode "raw=$payload" >/dev/null 2>&1 || true`,
+      },
+    ],
+  })
+  const settings = claudeSettings()
+  return {
+    ok: true,
+    hooksInstalled: claudeHooksInstalled(),
+    settingsPath: CLAUDE_SETTINGS,
+    settingsExists: settings.exists,
+    snippet: {
+      hooks: {
+        PermissionRequest: [hook('PermissionRequest')],
+        Elicitation: [hook('Elicitation')],
+        Stop: [hook('Stop')],
+        StopFailure: [hook('StopFailure')],
+      },
+    },
+    applyHint: `把 snippet.hooks 合并进 ${CLAUDE_SETTINGS} 的 "hooks" 键（本分支不代写；合并后重启 Claude Code 生效）`,
+  }
+}
+
+/**
+ * Claude hook 落点（GET）：`GET /x-radar/claude-hook?ev=PermissionRequest&sid=…&title=…`。
+ * 只登记事件、不代答：Claude 自己的界面继续弹卡，用户在那边处理；胶囊只负责「让你看见」。
+ */
+function claudeAccept(url) {
+  const descriptor = adapterRegistry.get('claude')
+  const result = claudeHook(url)
+  if (descriptor !== undefined && result !== null && typeof result === 'object' && result.event !== undefined) {
+    // t43 / M1：hook 入口用严格模式（必须显式 completeness + 非空 sessionRef）。
+    const event = normalizeAdapterEvent(descriptor, result.event, { requireExplicitCompleteness: true })
+    if (event !== null) {
+      pushAdapterEvent(descriptor, event)
+      log(`claude hook accepted kind=${event.kind} sid=${uslice(String(event.sessionRef ?? ''), 16)}`)
+      return result
+    }
+    // t43 / M1：契约校验没过就不是「已接收」。原来无论如何都回 accepted=true，
+    // 于是 hook 以为送达、用户在雷达里却看不到（幽灵行的另一半原因）。
+    log(`claude hook rejected ev=${uslice(String(result?.event?.kind ?? '-'), 24)}`)
+    return { ok: false, accepted: false, error: 'rejected by contract validation' }
+  }
+  return result
+}
+
+// ── DuMate / 百度搭子（内嵌 opencode 的 SSE 日志镜像，只读，partial）──────────
+const DUMATE_EVENT_LOG = join(homedir(), 'Library', 'Application Support', 'qianfan-desktop-app', 'log', 'desktop-main', 'AgtEvent.log')
+const DUMATE_DIR = join(homedir(), 'Library', 'Application Support', 'qianfan-desktop-app')
+/** sessionId -> { kind, title, ts, dedupeKey } */
+const dumateLive = new Map()
+const dumateSeen = new Set()
+
+/** 日志行形如：`2026-11-23T11:01:18.820\tDEBUG\t\t[AgtEvent]\t-\t \tevent: {json}` */
+function parseDumateLine(line) {
+  const index = line.indexOf('event: ')
+  if (index === -1) return null
+  let parsed
+  try {
+    parsed = JSON.parse(line.slice(index + 7))
+  } catch {
+    return null
+  }
+  // 时间戳取行首的时间（本地时区），而不是读取时刻：否则「昨天跑完的一批 turn」
+  // 会在第一次读日志时被当成刚完成，全挤进未读里。
+  let ts = Date.now()
+  const head = line.slice(0, 23)
+  const stamp = Date.parse(head)
+  if (Number.isFinite(stamp)) ts = stamp
+  return { event: parsed, ts }
+}
+
+registerAdapter({
+  id: 'dumate',
+  label: 'DUMATE',
+  completeness: 'partial',
+  channel: 'log-sse',
+  note: 'opencode 私有事件日志；只有 turn 级状态，无「等回答」语义担保',
+  probe() {
+    const installed = existsSync(DUMATE_DIR)
+    let running = false
+    try {
+      running = statSync(DUMATE_EVENT_LOG).mtimeMs > Date.now() - 5 * 60 * 1000
+    } catch {}
+    return { installed, running, completeness: installed ? 'partial' : 'unsupported', note: installed ? undefined : '未检测到 qianfan-desktop-app' }
+  },
+  poll() {
+    const text = readAppendedText(DUMATE_EVENT_LOG, 256 * 1024)
+    if (text === '') return []
+    const events = []
+    for (const line of text.split('\n')) {
+      const wrapped = parseDumateLine(line)
+      if (wrapped === null) continue
+      const parsed = wrapped.event
+      const ts = wrapped.ts
+      const type = String(parsed.type ?? '')
+      const props = parsed.properties ?? {}
+      const sid = String(props.sessionID ?? props.sessionId ?? '')
+      if (sid === '') continue
+      if (type === 'session.permission.asked' || type === 'session.permission.updated') {
+        // 有权限询问就一定能处置吗？不确定 → 标 partial、给「去 DuMate 处理」。
+        const key = `dumate:${sid}:approval:${props.permissionID ?? props.id ?? ''}`
+        if (dumateSeen.has(key)) continue
+        dumateSeen.add(key)
+        events.push({ kind: 'needs-approval', title: 'DuMate 在等批准', detail: uslice(String(props.title ?? props.permission ?? ''), 200), sessionRef: sid, ts, dedupeKey: key, completeness: 'partial' })
+      } else if (type === 'session.turn.completed') {
+        const key = `dumate:${sid}:done:${props.turnID ?? props.turnId ?? ''}`
+        if (dumateSeen.has(key)) continue
+        dumateSeen.add(key)
+        events.push({ kind: 'done', title: 'DuMate 任务完成', detail: uslice(String(props.title ?? ''), 200), sessionRef: sid, ts, dedupeKey: key + ':' + ts, completeness: 'partial' })
+      } else if (type === 'session.status') {
+        const status = String(props.status ?? '')
+        if (status === 'busy' || status === 'running') {
+          dumateLive.set(sid, { kind: 'running', ts, title: 'DuMate 正在运行', dedupeKey: `dumate:${sid}:running` })
+        } else if (status === 'idle') {
+          dumateLive.delete(sid)
+        }
+      }
+    }
+    for (const [sid, live] of dumateLive) {
+      events.push({ kind: 'running', title: live.title, sessionRef: sid, ts: live.ts, dedupeKey: live.dedupeKey, completeness: 'partial' })
+    }
+    return events
+  },
+})
+
+// ── WorkBuddy（audit-log 只读 + 心跳注册表，partial）─────────────────────────
+const WORKBUDDY_DIR = join(homedir(), '.workbuddy')
+const WORKBUDDY_AUDIT = join(WORKBUDDY_DIR, 'audit-log')
+const WORKBUDDY_SESSIONS = join(WORKBUDDY_DIR, 'sessions')
+const workbuddySeen = new Set()
+
+function workbuddyAuditFile(now = new Date()) {
+  const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  return join(WORKBUDDY_AUDIT, `${day}.jsonl`)
+}
+
+registerAdapter({
+  id: 'workbuddy',
+  label: 'WB',
+  completeness: 'partial',
+  channel: 'audit-log',
+  note: '只读 audit-log；就地处置需要 --remote-debugging-port=9333 重启（本分支不做）',
+  probe() {
+    const installed = existsSync(WORKBUDDY_DIR)
+    let running = false
+    try {
+      if (existsSync(WORKBUDDY_SESSIONS)) {
+        for (const name of readdirSync(WORKBUDDY_SESSIONS)) {
+          if (!name.endsWith('.json')) continue
+          try {
+            const beat = JSON.parse(readFileSync(join(WORKBUDDY_SESSIONS, name), 'utf8'))
+            if (Number.isFinite(beat?.lastHeartbeat) && Date.now() - beat.lastHeartbeat < 60 * 1000) running = true
+          } catch {}
+        }
+      }
+    } catch {}
+    return { installed, running, completeness: installed ? 'partial' : 'unsupported' }
+  },
+  poll() {
+    const path = workbuddyAuditFile()
+    const text = readAppendedText(path, 512 * 1024)
+    if (text === '') return []
+    const events = []
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '' || !trimmed.startsWith('{')) continue
+      let record
+      try {
+        record = JSON.parse(trimmed)
+      } catch {
+        continue
+      }
+      const eventType = String(record.eventType ?? '')
+      // 只认「需要你批准」这一类；ask-matched / allow-listed 是审计流水，不是待办。
+      if (eventType !== 'file-safety.needs-approval') continue
+      const key = `workbuddy:${record.id ?? record.requestId ?? record.timestamp}`
+      if (workbuddySeen.has(key)) continue
+      workbuddySeen.add(key)
+      const paths = String(record.messageParams?.paths ?? '')
+      events.push({
+        kind: 'needs-approval',
+        title: 'WorkBuddy 需要确认文件操作',
+        detail: uslice(paths, 300),
+        sessionRef: String(record.sessionId ?? ''),
+        ts: Number.isFinite(record.timestamp) ? Number(record.timestamp) : Date.now(),
+        dedupeKey: key,
+        completeness: 'partial',
+      })
+    }
+    return events
+  },
+})
+
+// ── Codex（rollout 只读扫描；本机 approval_policy=never，不产生「等批准」）──────
+// t43：允许用环境变量指向别的 sessions 根目录（自测用；也顺手支持自定义 CODEX_HOME）。
+const CODEX_SESSIONS = process.env.DSH_TASK_RADAR_CODEX_DIR !== undefined && process.env.DSH_TASK_RADAR_CODEX_DIR !== ''
+  ? process.env.DSH_TASK_RADAR_CODEX_DIR
+  : join(homedir(), '.codex', 'sessions')
+const codexSeen = new Set()
+// t43 / M3：两个账本。
+// `codexSeen` 记「已处理过的 turn」（key 含 thread + 终态 ts），落盘到 STATE_DIR/codex-seen.json，
+// 这样宿主重启后**不会重复上报**同一个完成事件，也不会因为「超过 10 分钟窗口」把它静静丢掉。
+// `codexOffsets` 记每个 rollout 文件的 size/mtime，文件没变就一轮跳过（成本可控）。
+const codexOffsets = new Map()
+let codexSeenLoaded = false
+function codexSeenFile() {
+  return join(STATE_DIR, 'codex-seen.json')
+}
+function loadCodexSeen() {
+  if (codexSeenLoaded) return
+  codexSeenLoaded = true
+  try {
+    const raw = readFileSync(codexSeenFile(), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) for (const key of parsed) if (typeof key === 'string') codexSeen.add(key)
+  } catch {}
+}
+function rememberCodexSeen(key) {
+  codexSeen.add(key)
+  // 账本只留最近 400 条，避免无限增长（rollout 是按天分目录的，旧 key 没有价值）。
+  const keys = [...codexSeen].slice(-400)
+  codexSeen.clear()
+  for (const item of keys) codexSeen.add(item)
+  try {
+    writeFileSync(codexSeenFile(), JSON.stringify(keys))
+  } catch {}
+}
+
+function codexDayDirs(now = new Date()) {
+  const dirs = []
+  for (const shift of [0, -1]) {
+    const day = new Date(now.getTime() + shift * 24 * 60 * 60 * 1000)
+    dirs.push(join(CODEX_SESSIONS, String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0')))
+  }
+  return dirs
+}
+
+/** 读 rollout 尾部若干行，判断这次 turn 走到哪了。只读、只取最后 40 行。 */
+function codexTurnState(path) {
+  const text = readFileSync(path, 'utf8')
+  const lines = text.split('\n').filter((line) => line.trim() !== '')
+  const tail = lines.slice(-40)
+  let cwd = ''
+  let started = null
+  let completed = null
+  let failed = null
+  for (const line of tail) {
+    let record
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const type = String(record.type ?? '')
+    const payload = record.payload ?? {}
+    if (type === 'turn_context' && typeof payload.cwd === 'string') cwd = payload.cwd
+    if (type === 'error') failed = String(payload.message ?? record.message ?? 'codex error')
+    if (type === 'event_msg') {
+      const inner = String(payload.type ?? '')
+      if (inner === 'task_started') started = { ts: eventTimeMs(payload.started_at_ms, payload.started_at, Date.now()), turn: String(payload.turn_id ?? '') }
+      if (inner === 'task_complete') {
+        completed = {
+          // R3-M1：`*_ms` 优先；秒级 `completed_at` 也要认（否则会退化成「现在」，把历史完成伪装成刚完成）。
+          ts: eventTimeMs(payload.completed_at_ms, payload.completed_at, Date.now()),
+          turn: String(payload.turn_id ?? ''),
+          text: typeof payload.last_agent_message === 'string' ? payload.last_agent_message : '',
+        }
+      }
+    }
+  }
+  return { cwd, started, completed, failed }
+}
+
+registerAdapter({
+  id: 'codex',
+  label: 'CODEX',
+  completeness: 'partial',
+  channel: 'rollout-jsonl',
+  note: 'approval_policy=never（本机采样 32/32）→ 不会出现「等批准」，不伪造该态',
+  probe() {
+    const installed = existsSync(join(homedir(), '.codex'))
+    let running = false
+    try {
+      for (const dir of codexDayDirs()) {
+        if (!existsSync(dir)) continue
+        for (const name of readdirSync(dir)) {
+          if (!name.endsWith('.jsonl')) continue
+          if (statSync(join(dir, name)).mtimeMs > Date.now() - 5 * 60 * 1000) running = true
+        }
+      }
+    } catch {}
+    return { installed, running, completeness: installed ? 'partial' : 'unsupported' }
+  },
+  poll() {
+    const events = []
+    for (const dir of codexDayDirs()) {
+      if (!existsSync(dir)) continue
+      let names = []
+      try {
+        names = readdirSync(dir)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (!name.endsWith('.jsonl')) continue
+        const path = join(dir, name)
+        let info
+        try {
+          info = statSync(path)
+        } catch {
+          continue
+        }
+        // t43 / M3：**删掉 10 分钟 mtime 窗口**。原来超窗的 rollout 直接 continue，
+        // 于是「完成」既不出行也不进 doneUnread，用户什么都看不到。
+        // 现在只按 size+mtime 判「这一轮有没有新字节」，有就读（终态由 codexSeen 去重）。
+        loadCodexSeen()
+        const seenAt = codexOffsets.get(path)
+        if (seenAt !== undefined && seenAt.size === info.size && seenAt.mtimeMs === info.mtimeMs) continue
+        codexOffsets.set(path, { size: info.size, mtimeMs: info.mtimeMs })
+        const state = codexTurnState(path)
+        const thread = name.replace(/^rollout-/, '').replace(/\.jsonl$/, '')
+        const label = state.cwd !== '' ? basename(state.cwd) : uslice(thread, 8)
+        if (state.failed !== null) {
+          const key = `codex:${thread}:failed`
+          if (!codexSeen.has(key)) {
+            rememberCodexSeen(key)
+            events.push({ kind: 'failed', title: `Codex 失败：${label}`, detail: uslice(state.failed, 400), sessionRef: thread, ts: info.mtimeMs, dedupeKey: key, completeness: 'partial' })
+          }
+          continue
+        }
+        if (state.completed !== null) {
+          const key = `codex:${thread}:done:${state.completed.ts}`
+          if (!codexSeen.has(key)) {
+            rememberCodexSeen(key)
+            events.push({ kind: 'done', title: `Codex 完成：${label}`, detail: uslice(state.completed.text, 300), sessionRef: thread, ts: state.completed.ts || info.mtimeMs, dedupeKey: key, completeness: 'partial' })
+          }
+          continue
+        }
+        if (state.started !== null) {
+          events.push({ kind: 'running', title: `Codex 正在运行：${label}`, sessionRef: thread, ts: state.started.ts || info.mtimeMs, dedupeKey: `codex:${thread}:running`, completeness: 'partial' })
+        }
+      }
+    }
+    return events
+  },
+})
+
+// ── 豆包办公（无结构化通道：只允许一次性 toast，绝不进队列/计数）──────────────
+registerAdapter({
+  id: 'doubao',
+  label: 'DOUBAO',
+  completeness: 'partial',
+  channel: 'none',
+  toastOnly: true,
+  note: '无 CDP/日志通道、任务在云端、拿不到 sessionRef → 只做一次性 toast，不进队列',
+  probe() {
+    return { installed: existsSync('/Applications/Doubao.app'), running: null, completeness: 'unsupported', note: '无可用通道（spec §3.1 fail-closed）' }
+  },
+})
+
+// ── Comate 等「装了但没接口」的：显式 unsupported，不留白 ────────────────────
+registerAdapter({
+  id: 'comate',
+  label: 'COMATE',
+  completeness: 'unsupported',
+  channel: 'none',
+  note: 'ctrl-servers.json 指向死 pid（t33 实测），且无公开事件通道',
+  probe() {
+    return { installed: existsSync('/Applications/Comate.app'), running: false, completeness: 'unsupported' }
+  },
+})
+
+/** 单条规范化事件 → feed item。id 前缀用 agent，避免和 DSH 的 session/approval id 撞车。 */
+// R3-H2：adapter 的 detail 经常是整包 JSON（`{"error":"session aborted while waiting"}`），
+// 直接塞进列表就是「不可读的机器串」。这里统一抽人话：JSON 优先取 error.message/error/message，
+// 否则取首行；再按 200 字截断（截断走 uslice，避免切开代理对）。
+function humanText(raw) {
+  if (raw === undefined || raw === null) return undefined
+  const text = typeof raw === 'string' ? raw : String(raw)
+  const trimmed = text.trim()
+  if (trimmed === '') return undefined
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      const candidate = parsed?.error?.message ?? parsed?.error ?? parsed?.message ?? parsed?.detail ?? parsed?.reason
+      if (typeof candidate === 'string' && candidate.trim() !== '') return uslice(candidate.trim(), 200)
+    } catch {}
+  }
+  return uslice(trimmed.split('\n')[0], 200)
+}
+
+// R3-M1：codex rollout 里 `*_ms` 是毫秒，老格式/别处偶有秒级字段；两个都认，秒级 ×1000 兜底。
+function eventTimeMs(ms, seconds, fallback) {
+  const millis = Number(ms)
+  if (Number.isFinite(millis) && millis > 0) return millis
+  const secs = Number(seconds)
+  if (Number.isFinite(secs) && secs > 0) return secs * 1000
+  return fallback
+}
+
+function adapterItem(event) {
+  // item.id 用 `#` 连接：规范事件里 dedupeKey 已不含 agent 前缀，这里再拼 agent 才是全局唯一，
+  // 也不会出现 `agent:agent:` 的重复前缀（t39 P0-1）。
+  const id = `${event.agent}#${event.dedupeKey}`
+  const base = {
+    id,
+    agent: event.agent,
+    source: event.agent,
+    // 规范词表随行下发（HUD 仍用 kind/status 的展示口径，两者不冲突）。
+    eventKind: event.eventKind,
+    completeness: event.completeness,
+    // 别家的会话不能按 DSH 的 sessionId 跳转：HUD 据此把「跳到会话」换成「看详情」。
+    jumpable: false,
+    sessionRef: event.sessionRef,
+    updatedAt: event.ts,
+  }
+  if (event.kind === 'needs-input') {
+    return {
+      ...base,
+      kind: 'question',
+      status: 'needs-answer',
+      title: event.title,
+      detail: event.detail,
+      // 有回执通道才「就地可答」；没有就只能是「回原工具里答」。
+      answerRequest: event.answerRequest,
+      answerToken: event.answerToken,
+      dedupKey: `${id}#needs-input`,
+      questions: event.options === undefined
+        ? undefined
+        : [{ id: event.dedupeKey, question: event.title, options: event.options }],
+    }
+  }
+  if (event.kind === 'needs-approval') {
+    return {
+      ...base,
+      kind: 'approval',
+      status: 'needs-approval',
+      title: event.title,
+      detail: event.detail,
+      answerRequest: event.answerRequest,
+      answerToken: event.answerToken,
+      approvalId: event.approvalId,
+      dedupKey: `${id}#needs-approval`,
+    }
+  }
+  if (event.kind === 'failed') {
+    // F9：字段统一。adapter 事件只有 `detail`；feed 里失败行历史上用 `error`（HUD 的失败页读它），
+    // 所以这里同时给两份：`detail` 是规范字段，`error` 是给 HUD 的兼容别名，不是第二套语义。
+    // F9 + R3-H2：detail 是规范字段、error 是给 HUD 的兼容别名；两者都必须是**人话**。
+    const readable = humanText(event.detail)
+    return { ...base, kind: 'run', status: 'failed', title: event.title, detail: readable, error: readable, reason: 'adapter-failed', dedupKey: `${id}#failed` }
+  }
+  if (event.kind === 'done') {
+    // done 的 dedupKey 必须与 HUD 的 doneKey 同形：`<id>#<finishedAt 毫秒>`（HUD 用它判「这条提醒过没」）。
+    return { ...base, kind: 'session', status: 'done', title: event.title, detail: event.detail, finishedAt: event.ts, dedupKey: `${id}#${Math.round(event.ts)}` }
+  }
+  return { ...base, kind: 'session', status: 'running', title: event.title, dedupKey: `${id}#running` }
+}
+
+/**
+ * 取一轮多 agent 事件：探针 → 可选 poll → 规范化入库 → 产出 items 与数据源条。
+ * 任何一家失败只写 adapterHealth，不影响别家、不清零计数（I-1…I-7）。
+ */
+/**
+ * 单家 adapter 的一轮观察（探测 → 可选 poll → 入库）。
+ * 独立成函数是为了能**并发**跑：串行累加 4 家 ×400ms 会让 feed 变成 1.6s（t37 实测 1.245s/3 家）。
+ */
+async function observeAdapter(descriptor, ctx, now) {
+  const startedAt = Date.now()
+  const health = adapterHealth.get(descriptor.id)
+  const store = adapterStore.get(descriptor.id) ?? new Map()
+  const live = []
+  const pushLive = () => {
+    for (const event of store.values()) {
+      if (adapterEventFresh(event, now)) live.push(adapterItem(event))
+    }
+  }
+  // 熔断中：跳过探测，也不清空已有事件（隔离要求：计数不清零），只把状态说清楚。
+  if (health.breakerUntil > now) {
+    const brokenFor = Math.max(0, Math.round((health.breakerUntil - now) / 1000))
+    pushLive()
+    const broken = {
+      id: descriptor.id,
+        label: descriptor.label,
+        channel: descriptor.channel,
+        // stale = 曾经探测成功、现在拿不到新数据；unknown = 从来没成功过（spec §3.3）。
+        completeness: (health.lastOkAt ?? 0) > 0 ? 'stale' : 'unknown',
+        supported: false,
+        installed: false,
+        running: null,
+        note: `连续失败已熔断，${brokenFor}s 后重试`,
+        error: health.error ?? null,
+        breakerUntil: health.breakerUntil,
+        consecutiveFailures: health.consecutiveFailures ?? 0,
+        polled: 0,
+      probeMs: health.probeMs ?? 0,
+      pollMs: health.pollMs ?? 0,
+    }
+    adapterLastStatus.set(descriptor.id, broken)
+    return { status: broken, items: live, staleForMs: 0 }
+  }
+  let probe = { installed: false, running: null }
+  let polled = 0
+  let error = null
+  try {
+    probe = (await guardedAdapterCall(descriptor.id, 'probe', () => descriptor.probe?.(ctx))) ?? {}
+    health.probeMs = Date.now() - startedAt
+    // 推送型 adapter（Claude hooks）在 probe 判「未装」时也可能已经有事件进来了：
+    // 只要 bus 里有东西就照常 poll 出来，否则用户明明收到了钩子却看不到行。
+    const storeHasEvents = store.size > 0
+    if (descriptor.poll !== undefined && (probe.installed === true || storeHasEvents)) {
+      const pollStartedAt = Date.now()
+      const raw = (await guardedAdapterCall(descriptor.id, 'poll', () => descriptor.poll(ctx, now))) ?? []
+      for (const candidate of raw) {
+        const event = normalizeAdapterEvent(descriptor, candidate)
+        if (event === null) continue
+        pushAdapterEvent(descriptor, event)
+        polled += 1
+      }
+      health.pollMs = Date.now() - pollStartedAt
+    }
+    health.ok = true
+    health.error = null
+    health.consecutiveFailures = 0
+    health.breakerUntil = 0
+    health.lastOkAt = Date.now()
+  } catch (failure) {
+    error = String(failure && failure.message ? failure.message : failure)
+    health.ok = false
+    health.error = error
+    health.consecutiveFailures = (health.consecutiveFailures ?? 0) + 1
+    if (health.consecutiveFailures >= ADAPTER_BREAKER_THRESHOLD) {
+      health.breakerUntil = Date.now() + ADAPTER_BREAKER_COOLDOWN_MS
+      log(`adapter breaker open id=${descriptor.id} failures=${health.consecutiveFailures} cooldown=${ADAPTER_BREAKER_COOLDOWN_MS}ms`)
+    }
+    // 单家挂了：把日志写清，但不 throw、不忽略其它家（MA-11/MA-12）。
+    log(`adapter error id=${descriptor.id} err=${uslice(error, 160)}`)
+  }
+  health.at = now
+  // 心跳：成功探测过但太久没再成功（文件被删、进程卡死）→ stale，不冒充 full/partial。
+  const staleSince = (health.lastOkAt ?? 0) > 0 && now - health.lastOkAt > ADAPTER_STALE_MS ? now - health.lastOkAt : 0
+  const completeness = error !== null
+    ? 'unknown'
+    : (staleSince > 0 ? 'stale' : (probe.completeness ?? descriptor.completeness))
+  health.completeness = completeness
+  pushLive()
+  const observed = {
+    id: descriptor.id,
+    label: descriptor.label,
+    channel: descriptor.channel,
+    completeness,
+    supported: descriptor.channel !== 'none' && (probe.installed ?? false),
+    installed: probe.installed === true,
+    running: probe.running ?? null,
+    // t47 / R4-L2：探测失败时 note 必须是**运行时事实**（错误本身），不能退回声明文案——
+    // 否则熔断/失败的适配器在 /adapters 里还写着「未安装，去取引导」，等于骗人。
+    note: error !== null
+      ? `探测失败：${uslice(error, 80)}`
+      : (staleSince > 0 ? `心跳超时 ${Math.round(staleSince / 1000)}s 未更新` : (probe.note ?? descriptor.note ?? null)),
+    error,
+    polled,
+    probeMs: health.probeMs ?? 0,
+    pollMs: health.pollMs ?? 0,
+    breakerUntil: health.breakerUntil ?? 0,
+    consecutiveFailures: health.consecutiveFailures ?? 0,
+  }
+  adapterLastStatus.set(descriptor.id, observed)
+  return { status: observed, items: live, staleForMs: staleSince }
+}
+
+/**
+ * 取一轮多 agent 事件（t39 F1-①：**并发** + 总预算）。
+ *
+ * 旧实现串行累加：每家 400ms 上限 × 7 家最坏 2.8s，而 HUD 每 2s 拉一次 ⇒ 一旦几家卡住，
+ * 胶囊刷新直接被拖垮。现在 `Promise.allSettled` 并发跑，整体再套一层 800ms 硬预算：
+ * 超预算的家按「本轮探测超时」返回，不影响别家、不清零计数。
+ */
+const ADAPTER_FEED_BUDGET_MS = 800
+
+async function adapterFeed(ctx) {
+  const now = Date.now()
+  adapterPassRejects = 0
+  const descriptors = adapterList()
+  const tasks = descriptors.map((descriptor) => observeAdapter(descriptor, ctx, now).catch((failure) => ({
+    status: {
+      id: descriptor.id,
+      label: descriptor.label,
+      channel: descriptor.channel,
+      completeness: 'unknown',
+      supported: false,
+      installed: false,
+      running: null,
+      note: `本轮观察失败：${uslice(String(failure && failure.message ? failure.message : failure), 80)}`,
+      error: String(failure && failure.message ? failure.message : failure),
+      polled: 0,
+      probeMs: 0,
+      pollMs: 0,
+    },
+    items: [],
+    staleForMs: 0,
+  })))
+  let settled
+  let budgetHit = false
+  const budget = new Promise((resolve) => {
+    const timer = setTimeout(() => { budgetHit = true; resolve(null) }, ADAPTER_FEED_BUDGET_MS)
+    timer.unref?.()
+  })
+  const all = Promise.allSettled(tasks)
+  const raced = await Promise.race([all, budget])
+  if (raced === null) {
+    // 预算用尽：已完成的照常出，没完成的先按超时占位（不 await，避免把请求继续拖住）。
+    settled = descriptors.map((descriptor, index) => ({ status: 'pending', descriptor, index }))
+    all.then((results) => {
+      // 迟到的结果仍然入库（下一个 2s 周期就能用上），但不阻塞本次响应。
+      for (const result of results) if (result.status === 'fulfilled') applyLateObservation(result.value)
+    }).catch(() => {})
+  } else {
+    settled = raced.map((result, index) => ({ ...result, descriptor: descriptors[index], index }))
+  }
+  const statuses = []
+  const items = []
+  for (const entry of settled) {
+    if (entry.status === 'fulfilled') {
+      statuses.push(entry.value.status)
+      for (const item of entry.value.items) items.push(item)
+      continue
+    }
+    if (entry.status === 'rejected') {
+      log(`adapter observe rejected id=${entry.descriptor.id}`)
+      continue
+    }
+    // 预算超时：给出诚实的占位状态，让数据源条显示「本轮超时」而不是空白。
+    const budgetStatus = {
+      id: entry.descriptor.id,
+      label: entry.descriptor.label,
+      channel: entry.descriptor.channel,
+      completeness: 'unknown',
+      supported: false,
+      installed: false,
+      running: null,
+      note: `本轮探测超时（总预算 ${ADAPTER_FEED_BUDGET_MS}ms）`,
+      error: 'feed budget exceeded',
+      polled: 0,
+      probeMs: 0,
+      pollMs: 0,
+    }
+    adapterLastStatus.set(entry.descriptor.id, budgetStatus)
+    statuses.push(budgetStatus)
+    const store = adapterStore.get(entry.descriptor.id) ?? new Map()
+    for (const event of store.values()) {
+      if (adapterEventFresh(event, now)) items.push(adapterItem(event))
+    }
+  }
+  if (budgetHit) log(`adapter feed budget hit ms=${ADAPTER_FEED_BUDGET_MS} adapters=${descriptors.length}`)
+  // F7：feed 里这份与 `/x-radar/adapters` 必须是同一个投影（以前 feed 用本轮 statuses、
+  // 路由用 adapterSnapshot，两边 note 会不一致：hooks 装好了 feed 还写「未安装」）。
+  return { items, adapters: adapterSnapshot(now), rejected: adapterPassRejects, partialKinds: adapterPartialKinds(now) }
+}
+
+/** 预算超时后迟到的观察结果：只把事件与健康写回，不再参与本次响应。 */
+function applyLateObservation(observation) {
+  const id = observation?.status?.id
+  if (typeof id !== 'string') return
+  const health = adapterHealth.get(id)
+  if (health !== undefined && observation.status !== undefined) {
+    health.completeness = observation.status.completeness ?? health.completeness
+    health.error = observation.status.error ?? null
+    health.ok = observation.status.error === null
+  }
+}
+
+/** 胶囊与数据源条共用的降级口径：哪些 kind 存在 partial 数据（spec §3.2）。
+ *  内部按规范词表统计，对外仍回 HUD 认识的 `question` / `approval`（展示层词表没变）。 */
+const ADAPTER_KIND_TO_HUD = { 'needs-input': 'question', 'needs-approval': 'approval' }
+function adapterPartialKinds(now = Date.now()) {
+  const kinds = new Set()
+  for (const store of adapterStore.values()) {
+    for (const event of store.values()) {
+      if (!adapterEventFresh(event, now)) continue
+      if (event.completeness !== 'partial') continue
+      const hudKind = ADAPTER_KIND_TO_HUD[event.kind]
+      if (hudKind !== undefined) kinds.add(hudKind)
+    }
+  }
+  return [...kinds].sort()
+}
+
+/** 数据源条 / 排障用：不进 feed 的 adapter 也要能一眼看到「它为什么是空的」。 */
+/**
+ * 有效完整性：探测结论与「实际收到的数据」取更可信的那个。
+ *
+ * 为什么需要：claude 的 hooks 没配时会探成 unsupported，但用户手上可能已经有
+ * 手动配置/别的入口送进来的事件。这时底条写「未装」却又能列出它的任务，自相矛盾；
+ * 有数据就至少承认 partial，并在 note 里说清「通道未配置」。
+ */
+function effectiveCompleteness(id, completeness, note) {
+  const descriptor = adapterRegistry.get(id)
+  const declared = descriptor?.completeness ?? 'unknown'
+  const store = adapterStore.get(id)
+  const hasEvents = store !== undefined && store.size > 0
+  if (hasEvents && (completeness === 'unsupported' || completeness === 'unknown')) {
+    return { completeness: 'partial', note: note ?? '通道未配置，事件来自其它入口' }
+  }
+  if (hasEvents && completeness === 'partial') return { completeness, note: note ?? null }
+  return { completeness: completeness ?? declared, note: note ?? null }
+}
+
+/** 统一作答入口（t39 P0-3 的 answer 生命周期）：没有实现 answer 的家一律 409，不伪装能答。 */
+async function adapterAnswer(id, payload) {
+  const descriptor = adapterRegistry.get(String(id))
+  if (descriptor === undefined) return { ok: false, status: 404, error: 'unknown adapter' }
+  if (typeof descriptor.answer !== 'function') {
+    return { ok: false, status: 409, error: `adapter ${descriptor.id} does not support answer` }
+  }
+  try {
+    const result = (await descriptor.answer(payload ?? {})) ?? { ok: false, status: 500, error: 'empty answer result' }
+    return result
+  } catch (error) {
+    return { ok: false, status: 502, error: uslice(String(error && error.message ? error.message : error), 160) }
+  }
+}
+
+/** 数据源条 / 排障面板的完整快照：能力声明、心跳、熔断、声明式装载统计都在这。 */
+function adapterSnapshot() {
+  const now = Date.now()
+  return adapterList().map((descriptor) => {
+    const health = adapterHealth.get(descriptor.id) ?? {}
+    const store = adapterStore.get(descriptor.id) ?? new Map()
+    // F7：单一投影。运行时观测结果（adapterLastStatus，由 observeAdapter 每轮写入）优先，
+    // 没跑过观测时才回落到健康度/声明值；note 一律取运行时那条，
+    // 否则会出现「hooks 已装却仍写未安装」这种和事实相反的文案。
+    const last = adapterLastStatus.get(descriptor.id) ?? null
+    const declared = descriptor.completeness
+    const baseCompleteness = last?.completeness ?? health.completeness ?? declared
+    // t43 / M4：note 必须是**运行时**事实。last 只在本轮观测跑过时才有值，
+    // 首帧（观测还没跑）会退回到声明值，于是出现「hooks 已装却写未安装」。
+    // 所以声明层提供 noteNow() 时优先用它——claude 用它现读 settings.json。
+    const runtimeNote = typeof descriptor.noteNow === 'function' ? descriptor.noteNow() : null
+    const baseNote = last?.note ?? runtimeNote
+      ?? (health.error === null || health.error === undefined ? descriptor.note ?? null : health.error)
+    const effective = effectiveCompleteness(descriptor.id, baseCompleteness, baseNote)
+    const breakerUntil = health.breakerUntil ?? 0
+    const lastOkAt = health.lastOkAt ?? 0
+    // 快照也要反映熔断口径：否则「熔断已打开」的条目仍显示上一次的 completeness，自相矛盾。
+    const completeness = breakerUntil > now
+      ? (lastOkAt > 0 ? 'stale' : 'unknown')
+      : effective.completeness
+    return {
+      id: descriptor.id,
+      label: descriptor.label,
+      channel: descriptor.channel,
+      completeness,
+      declared,
+      toastOnly: descriptor.capabilities?.toastOnly === true,
+      // 能力声明（P0-3）：UI 只承诺 answer:true 的家能就地处置。
+      capabilities: descriptor.capabilities ?? { observe: true, answer: false, toastOnly: false },
+      note: effective.note,
+      // 运行时事实：UI 用它决定「未装/未运行」这类提示，不要另算一遍。
+      installed: last?.installed ?? health.installed ?? null,
+      running: last?.running ?? null,
+      supported: last?.supported ?? true,
+      itemCount: store.size,
+      events: store.size,
+      ok: health.ok ?? null,
+      // t43 / M4：error 同理取运行时（本轮观测 > 历史 health）。
+      error: last?.error ?? health.error ?? null,
+      probeMs: health.probeMs ?? null,
+      pollMs: health.pollMs ?? null,
+      fault: adapterFault.get(descriptor.id) ?? null,
+      // 心跳与熔断（P1）
+      consecutiveFailures: health.consecutiveFailures ?? 0,
+      breakerUntil,
+      breakerOpen: breakerUntil > now,
+      lastOkAt: lastOkAt === 0 ? null : lastOkAt,
+      staleForMs: lastOkAt === 0 ? null : Math.max(0, now - lastOkAt),
+    }
+  })
+}
+
 async function buildRadar(ctx) {
   void diagOnce(ctx)
   // 端口要先知道：待批准队列是向桥（同一宿主进程）取的 HTTP 接口。
@@ -1498,6 +2937,25 @@ async function buildRadar(ctx) {
 
   // 会话内提问排在所有批准之前渲染（用户在等人答，这是当下唯一可动作的事）。
   for (const item of dshQuestions.items) items.push(item)
+
+  // 多 agent adapter 层（分支 feat/multi-agent-notify）：DSH 之外的四家在等你看一眼。
+  // 这一层**只读**：不代点、不发送、不改别人的配置；每家独立探测、独立超时，
+  // 一家挂了只写它自己的 health，其余照常（spec §4.6-a 的隔离要求）。
+  const agentFeed = await adapterFeed(ctx)
+  // t43 / M2：hide-session 原来只按 DSH 的 sessionId 过滤（sessionItems 里那段），
+  // 于是「从雷达移除」对 adapter 行完全无效——下一轮 poll 又把它放回来。
+  // 这里对 adapter 条目按三条键任一命中即隐藏：item.id / dedupKey / sessionRef。
+  const hiddenKeys = readHiddenSessions()
+  for (const item of agentFeed.items) {
+    const hit = hiddenKeys[String(item.id ?? '')] !== undefined
+      || (item.dedupKey !== undefined && hiddenKeys[String(item.dedupKey)] !== undefined)
+      || (item.sessionRef !== undefined && hiddenKeys[String(item.sessionRef)] !== undefined)
+    if (hit) {
+      log(`adapter hidden id=${uslice(String(item.id ?? ''), 32)} key=${uslice(String(item.dedupKey ?? ''), 32)}`)
+      continue
+    }
+    items.push(item)
+  }
 
   // 队列里没有对应审批的 run 一律不算「待批准」：桥在启动时会把这类 run 对账成 failed，
   // 但雷达也要能独立识别（旧数据/桥没来得及对账时不再显示自相矛盾的行）。
@@ -1736,6 +3194,17 @@ async function buildRadar(ctx) {
   // 会话内提问（DSH 自己的 ask_user_question）单独计数：排障时能区分「桥在等」与「会话在等」。
   counts.questionsDsh = items.filter((item) => item.kind === 'question' && item.source === SOURCE_DSH).length
   counts.pending = counts.running
+  // 多 agent：降级口径要能被 UI 读到（胶囊 `等回答(2+)`、数据源条 `部分`），
+  // rejected 暴露「有事件被规范化拒掉」，dropped 在截断后回填（见下方 return）。
+  counts.partialKinds = agentFeed.partialKinds
+  // rejected = poll 里规范化拒掉的条数 + 契约校验累计（按 reason 分类，排障能看出「为什么没进来」）。
+  const rejectReasons = {}
+  for (const [reason, times] of adapterRejectReasons) rejectReasons[reason] = times
+  // 本轮被拒条数：normalize 每次拒都会 noteAdapterReject（累计值进 rejectedReasons 做排障），
+  // 这里只报「这一轮」的条数，避免把历史累计当成当下的 rejected（t39 自检时曾出现 4 vs 2）。
+  counts.rejected = adapterPassRejects
+  counts.rejectedReasons = rejectReasons
+  counts.dropped = 0
 
   // 办公产物：最近 6 小时内生成的 docx / xlsx / pptx / pdf，最多 3 条（点一下在 Finder 定位）。
   // 代确认次数（bridge 写 ~/.dsh/agent-bridge/workbuddy-confirms.json，一行一次）
@@ -1756,6 +3225,25 @@ async function buildRadar(ctx) {
   // t14 bug 2：排序口径 = 先问「能不能动手」，再看「出没出问题」，最后才是完成。
   // question(0) > approval(1) > failed(2) > running(3) > rework/blocked(4) > verifying(5) > done(6) > artifact/其它(7)
   // 旧版把 done 和 failed 排前面、running 靠后，于是 16 条 done 一铺，running 与 failed 被截断掉。
+  // t39 / P0-1：**每一条** item 都要有 dedupKey（HUD 用它去重提醒、也用来对齐 doneKey）。
+  // done 类必须与 HUD 的 doneKey 同形：run = `<id>#run`，session = `<id>#<finishedAt 毫秒>`。
+  // t39 / P0-5：出站前再过一遍脱敏——adapter 事件已在规范化层处理，这里兜住 DSH/桥的标题与错误。
+  for (const item of items) {
+    if (typeof item.title === 'string') item.title = redactSecrets(item.title)
+    if (typeof item.detail === 'string') item.detail = redactSecrets(item.detail)
+    if (typeof item.error === 'string') item.error = redactSecrets(item.error)
+    if (typeof item.note === 'string') item.note = redactSecrets(item.note)
+    if (typeof item.dedupKey === 'string' && item.dedupKey !== '') continue
+    if (typeof item.id !== 'string' || item.id === '') continue
+    if (item.status === 'done') {
+      item.dedupKey = item.kind === 'run'
+        ? `${item.id}#run`
+        : `${item.id}#${Math.round(Number(item.finishedAt ?? item.updatedAt ?? 0))}`
+    } else {
+      item.dedupKey = `${item.id}#${item.status ?? 'unknown'}`
+    }
+  }
+
   const priorityOf = (item) => {
     if (item.kind === 'question') return 0
     if (item.kind === 'approval') return 1
@@ -1768,7 +3256,15 @@ async function buildRadar(ctx) {
     return 7
   }
   for (const item of items) item.priority = priorityOf(item)
-  items.sort((left, right) => (left.priority - right.priority) || ((right.updatedAt ?? 0) - (left.updatedAt ?? 0)))
+  // t39 / P0-6：规格口径 = 优先级 → ts **升序**（最早一条优先）→ dedupKey 字典序。
+  // 旧版按 updatedAt 倒序，于是三条提问里最后发生的那条排第一，用户按顺序答会乱。
+  items.sort((left, right) => {
+    if (left.priority !== right.priority) return left.priority - right.priority
+    const leftTs = Number(left.updatedAt ?? 0)
+    const rightTs = Number(right.updatedAt ?? 0)
+    if (leftTs !== rightTs) return leftTs - rightTs
+    return String(left.dedupKey ?? left.id ?? '').localeCompare(String(right.dedupKey ?? right.id ?? ''))
+  })
 
   // t14 bug 3 附带项：同一 agent 的连续同标题 done 折叠成一条（带 count），
   // 否则真实任务永远被自己的 smoke/测试 run 挤出列表。细节：只折叠相邻的，跨状态不折叠。
@@ -1789,8 +3285,129 @@ async function buildRadar(ctx) {
   items.length = 0
   items.push(...folded)
 
+  // t39 / P1-a + t43 / H1：会话桶折叠。折叠单位是**会话**不是 agent（spec §2.3 L2）：
+  // 同一家 agent 的同一次会话里，多条事件只占一行，行上带 `count`（HUD 显示 `×N`）。
+  // t43 / H1：待办类（needs-answer / needs-approval）**也折叠**——captain 口径：同会话 3 条
+  // Elicitation 必须是 1 行 count=3（原来 3 行，等于把会话桶规则只落实了一半）。
+  // 代表行保留它自己的回执字段，就地处置仍可用；其余条目的明细在详情页里（行上 count 指明还有几条）。
+  // R3-H1：桶成员快照。HUD 用它把 ×N 展开成逐条可点的行——没有它，「同会话 3 条待回答 + 1 条失败」
+  // 会压成 1 行、三条提问的正文与回执字段全部消失，等于把待办吞掉。
+  const foldSnapshot = (item) => ({
+    id: item.id,
+    dedupKey: item.dedupKey,
+    title: item.title,
+    detail: item.detail,
+    kind: item.kind,
+    status: item.status,
+    answerRequest: item.answerRequest,
+    answerToken: item.answerToken,
+    approvalId: item.approvalId,
+    questions: item.questions,
+    ts: Number(item.updatedAt ?? 0),
+  })
+  const bucketed = []
+  const bucketIndex = new Map()
+  const bucketRank = { failed: 5, 'needs-answer': 4, 'needs-approval': 3, running: 2, done: 1 }
+  const foldableStatus = new Set(['done', 'failed', 'running', 'needs-answer', 'needs-approval'])
+  for (const item of items) {
+    const foldable = item.source !== undefined && item.source !== SOURCE_DSH
+      && item.sessionRef !== undefined && item.sessionRef !== null && String(item.sessionRef) !== ''
+      && foldableStatus.has(item.status)
+    if (!foldable) {
+      bucketed.push(item)
+      continue
+    }
+    const key = `${item.agent ?? item.source}|${item.sessionRef}`
+    const kept = bucketIndex.get(key)
+    if (kept === undefined) {
+      bucketIndex.set(key, item)
+      bucketed.push(item)
+      continue
+    }
+    // R3-H1：每个成员各留一份明细（代表行也在内），`count === folded.length`。
+    if (kept.folded === undefined) kept.folded = [foldSnapshot(kept)]
+    kept.folded.push(foldSnapshot(item))
+    kept.count = kept.folded.length
+    // 代表行取「更重要的状态」与「更新的时间」：一个会话里既有失败又有完成时，先说失败。
+    const keptRank = bucketRank[kept.status] ?? 0
+    const itemRank = bucketRank[item.status] ?? 0
+    const keptTs = Number(kept.updatedAt ?? 0)
+    const itemTs = Number(item.updatedAt ?? 0)
+    if (itemRank > keptRank || (itemRank === keptRank && itemTs > keptTs)) {
+      // R3-H2：代表行**整体**换成这条（id/kind/status/dedupKey 来自同一条事件）。
+      // 之前只搬处置字段不搬 id，会出现 `id=…:needs-input:abc` 配 `kind=run` 的自相矛盾行。
+      const folded = kept.folded
+      const count = kept.count
+      const priority = Math.min(Number(kept.priority ?? 9), Number(item.priority ?? 9))
+      Object.assign(kept, item)
+      kept.folded = folded
+      kept.count = count
+      kept.priority = priority
+    }
+    kept.updatedAt = Math.max(keptTs, itemTs)
+  }
+  const entryCount = items.length
+  items.length = 0
+  items.push(...bucketed)
+  // R3-M3：counts 是**条目数**（折叠前），items/total 是**桶数**（折叠后）。
+  // HUD 侧等式：questions == Σ(桶内 kind=question 的成员数)。
+  counts.entries = entryCount
+  counts.buckets = items.length
+
   // t22 / B-4：未读完成 id 只从**最终渲染的列表**里取，保证 len(doneUnreadIds) == done 行数。
-  const visible = items.slice(0, MAX_ITEMS)
+  // t43 / H2：截断前按 kind 预留槽位。46 条截到 40 时，43 条批准会把 failed/done 整段顶掉，
+  // 用户于是看不到失败与已完成——这是最坏的一种截断。规格口径（t34 L2）：failed / done
+  // 各至少留 1 行在可见页里；counts 始终是全量，列表是分页。
+  const isStatus = (item, status) => item.status === status
+  const reserveStatuses = ['failed', 'done']
+  const pickVisible = () => {
+    // R3-M2：failed 永不丢弃。52 条（47 批准 + 2 failed）截 40 时，两条 failed 必须都在可见页，
+    // 而且留**较新**的；failed 自己就超过上限时，可见页改成「只放 failed」并在 overflow 里说明。
+    const failedAll = items
+      .filter((item) => isStatus(item, 'failed'))
+      .sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))
+    let kept = []
+    if (failedAll.length >= MAX_ITEMS) {
+      kept = failedAll.slice(0, MAX_ITEMS)
+      log(`feed.reserve status=failed-only total=${failedAll.length} kept=${kept.length}`)
+    } else {
+      const taken = new Set(failedAll.map((item) => String(item.dedupKey ?? item.id)))
+      kept = [...failedAll]
+      for (const item of items) {
+        if (kept.length >= MAX_ITEMS) break
+        const key = String(item.dedupKey ?? item.id)
+        if (taken.has(key)) continue
+        kept.push(item)
+        taken.add(key)
+      }
+      // done 至少留 1 行：否则「完成」整段会被一堆批准挤掉（t43/H2 的同一类问题）。
+      if (!kept.some((item) => isStatus(item, 'done'))) {
+        const donor = items.find((item) => isStatus(item, 'done'))
+        if (donor !== undefined) {
+          let victimIndex = -1
+          for (let index = kept.length - 1; index >= 0; index -= 1) {
+            const candidate = kept[index]
+            if (reserveStatuses.some((other) => isStatus(candidate, other))) continue
+            if (victimIndex === -1 || (candidate.priority ?? 9) >= (kept[victimIndex].priority ?? 9)) victimIndex = index
+          }
+          if (victimIndex !== -1) {
+            const victim = kept[victimIndex]
+            kept[victimIndex] = donor
+            log(`feed.reserve status=done swapped=${victim.id ?? victim.dedupKey} in=${donor.id ?? donor.dedupKey}`)
+          }
+        }
+      }
+    }
+    kept.sort((left, right) => {
+      if (left.priority !== right.priority) return left.priority - right.priority
+      const leftTs = Number(left.updatedAt ?? 0)
+      const rightTs = Number(right.updatedAt ?? 0)
+      if (leftTs !== rightTs) return leftTs - rightTs
+      return String(left.dedupKey ?? left.id ?? '').localeCompare(String(right.dedupKey ?? right.id ?? ''))
+    })
+    return kept
+  }
+  const visible = pickVisible()
   const doneUnreadIds = []
   const seenDone = new Set()
   for (const item of visible) {
@@ -1800,6 +3417,9 @@ async function buildRadar(ctx) {
     doneUnreadIds.push(item.id)
   }
   counts.doneUnread = doneUnreadIds.length
+  // 截断必须可观测（spec §2.6）：面板底部据此显示「还有 N 条未显示」。
+  counts.dropped = Math.max(0, items.length - visible.length)
+  if (counts.dropped > 0) log(`feed.truncated total=${items.length} kept=${visible.length} dropped=${counts.dropped}`)
 
   return {
     ok: true,
@@ -1809,7 +3429,9 @@ async function buildRadar(ctx) {
     doneUnreadIds,
     items: visible,
     total: items.length,
-    sources: { sessions: sessions.source, runs: runs.length, questions: dshQuestions.source },
+    sources: { sessions: sessions.source, runs: runs.length, questions: dshQuestions.source, agents: agentFeed.adapters.length },
+    // 数据源条：一家一行（id/label/completeness/channel/running/note/error），顺序由 ADAPTER_ORDER 固定。
+    adapters: agentFeed.adapters,
     clientHalf: clientHalfState(),
     dsh: { port: port ?? null, url: port === undefined ? null : `http://127.0.0.1:${port}` },
   }
@@ -1822,13 +3444,24 @@ const SNAPSHOT_TTL_MS = 1000
 let snapshotAt = 0
 let snapshotBody = null
 let snapshotInflight = null
+// t43 / M5：快照版本号。SWR 让「写后第一帧是旧快照」成为设计的一部分，
+// 但调用方（前端/CLI）需要能强制拿一帧新的：写路由回 `snapshotRev`，
+// 下次读带 `?cb=<rev>` 就同步重建一次。rev 单调递增，只增不减。
+let snapshotRev = 0
 
 function refreshSnapshot(ctx) {
   if (snapshotInflight) return snapshotInflight
+  const startedAt = Date.now()
   snapshotInflight = buildRadar(ctx)
     .then((body) => {
       snapshotAt = Date.now()
+      snapshotRev += 1
       snapshotBody = body
+      // 构建耗时是 F1 的核心指标（7 家全超时也必须落在预算内）：常态打一行即可，
+      // 超过 800ms 预算时单独 warn，排障时不用再猜。
+      const spent = snapshotAt - startedAt
+      log(`radar build ms=${spent} adapters=${body.adapters?.length ?? 0} items=${body.items?.length ?? 0}`)
+      if (spent > ADAPTER_FEED_BUDGET_MS) log(`radar build over budget ms=${spent} budget=${ADAPTER_FEED_BUDGET_MS}`)
       return body
     })
     .finally(() => { snapshotInflight = null })
@@ -1838,14 +3471,28 @@ function refreshSnapshot(ctx) {
 }
 
 // 让下一次 /radar 立刻重建：置已读、批/拒之后必须马上看到新状态，不能等 TTL。
-function invalidateSnapshot() {
+/**
+ * 写操作后让快照失效（t39 F1-②）。
+ *
+ * 关键：**不能**把 `snapshotBody` 清空——那会让下一次 `/x-radar/radar` 变成同步冷建
+ * （一次 buildRadar 要串行探 7 家 adapter），用户点一下「批准」就要等一秒多。
+ * 这里只把时间戳拨到 0（标记过期）并立即后台重建：下一次请求拿到的还是上一份快照，
+ * 后台在几百毫秒内把它换掉（stale-while-revalidate）。
+ */
+function invalidateSnapshot(ctx) {
   snapshotAt = 0
-  snapshotBody = null
+  if (ctx !== undefined) refreshSnapshot(ctx)
 }
 
 // stale-while-revalidate：有快照就立刻返回（p50 从「每次等 list()」降到 1ms 级），
 // 过期了在后台补一份；只有冷启动那一次要等 list()。
-async function buildRadarCached(ctx) {
+async function buildRadarCached(ctx, options) {
+  // t43 / M5：`?cb=<rev>`（或内部 force）绕过缓存，同步重建一次。
+  // 只给「刚写完、必须立刻看到」的调用方用，别放进轮询路径。
+  if (options !== undefined && options !== null && options.force === true) {
+    const body = await refreshSnapshot(ctx)
+    return { body, cached: false, ageMs: 0 }
+  }
   if (snapshotBody) {
     const ageMs = Date.now() - snapshotAt
     if (ageMs >= SNAPSHOT_TTL_MS) refreshSnapshot(ctx)
@@ -1882,8 +3529,12 @@ function radarRoute(ctx) {
       let body
       let cached = false
       try {
-        const snapshot = await buildRadarCached(ctx)
-        body = snapshot.body
+        // t43 / M5：写路由会回 `snapshotRev`；调用方带 `?cb=<rev>` 表示「我的基线是这个版本，
+        // 若要更新就重建」。带 cb 一律强制重建一次（值相同也重建——SWR 下内容是旧的，rev 才是新的）。
+        const cbParam = url.searchParams.get('cb')
+        const snapshot = await buildRadarCached(ctx, { force: cbParam !== null })
+        // t43 / M5：读也回版本号，前端拿它做下一次 ?cb= 的基线。
+        body = { ...snapshot.body, snapshotRev }
         cached = snapshot.cached
       } catch (error) {
         log(`radar error ${uslice(String(error && error.stack ? error.stack : error), 600)}`)
@@ -1992,8 +3643,8 @@ function radarRoute(ctx) {
         return fail(400, 'answers must be [{id, selected:[label], custom?}]')
       }
       held.settle('answered', answers)
-      invalidateSnapshot()
-      return new Response(JSON.stringify({ ok: true, request: requestId, answered: answers.length }), {
+      invalidateSnapshot(ctx)
+      return new Response(JSON.stringify({ ok: true, request: requestId, answered: answers.length, snapshotRev }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
@@ -2195,7 +3846,7 @@ function radarRoute(ctx) {
       const passthrough = [400, 403, 404, 409]
       const status = result.ok ? 200 : passthrough.includes(result.status) ? result.status : 502
       // 批/拒成功或失败都动过审批队列，快照一律作废，避免 HUD 立刻刷新时看到旧的 pending。
-      invalidateSnapshot()
+      invalidateSnapshot(ctx)
       return new Response(JSON.stringify(result), {
         status,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -2247,13 +3898,14 @@ function radarRoute(ctx) {
       }
       if (persisted) log(`markSeen ok ids=${ids.length} track=${trackRemoved}`)
       if (missing.length > 0) log(`markSeen failed ids=${missing.length} missing=${uslice(missing, 3).join(',')}`)
-      invalidateSnapshot()
+      invalidateSnapshot(ctx)
       return new Response(JSON.stringify({
         ok: persisted && missing.length === 0,
         marked: ids.length,
         verified: missing.length === 0,
         missing,
         track: trackRemoved,
+        snapshotRev,
       }), {
         status: persisted ? 200 : 500,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
@@ -2311,9 +3963,9 @@ function radarRoute(ctx) {
         try {
           saveSeen(seen)
         } catch {}
-        invalidateSnapshot()
+        invalidateSnapshot(ctx)
         log(`retry run=${uslice(runId, 8)} -> new=${uslice(body.runId, 8)} agent=${body.agent ?? '?'}`)
-        return new Response(JSON.stringify({ ok: true, runId: body.runId, retryOf: runId, agent: body.agent ?? null }), {
+        return new Response(JSON.stringify({ ok: true, runId: body.runId, retryOf: runId, agent: body.agent ?? null, snapshotRev }), {
           status: 200,
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         })
@@ -2328,22 +3980,27 @@ function radarRoute(ctx) {
     if (tail === 'hide-session') {
       // 双击会话行选「仅从雷达移除」：写 hidden-sessions.json（永久过滤）+ seen。
       // 只动雷达自己的视图，不碰 DSH 的会话数据（删会话只能在 DSH 里做）。
+      // t43 / M2：三个参数都收——session（DSH 会话 / adapter 的 sessionRef）、
+      // key（adapter 的 dedupKey）、id（feed 行 id）。谁的账本命中谁就消失。
       const sessionId = (url.searchParams.get('session') ?? '').trim()
-      if (sessionId === '') {
-        return new Response(JSON.stringify({ ok: false, error: 'session is required' }), {
+      const hideKey = (url.searchParams.get('key') ?? '').trim()
+      const hideId = (url.searchParams.get('id') ?? '').trim()
+      const target = sessionId !== '' ? sessionId : (hideKey !== '' ? hideKey : hideId)
+      if (target === '') {
+        return new Response(JSON.stringify({ ok: false, error: 'session or key is required' }), {
           status: 400,
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         })
       }
-      hideSession(sessionId)
+      hideSession(target)
       const seen = readSeen()
-      seen[sessionId] = Date.now()
+      seen[target] = Date.now()
       try {
         saveSeen(seen)
       } catch {}
-      invalidateSnapshot()
-      log(`session hidden id=${uslice(sessionId, 8)}`)
-      return new Response(JSON.stringify({ ok: true, hidden: sessionId }), {
+      invalidateSnapshot(ctx)
+      log(`session hidden id=${uslice(target, 24)} by=${sessionId !== '' ? 'session' : hideKey !== '' ? 'key' : 'id'}`)
+      return new Response(JSON.stringify({ ok: true, hidden: target, snapshotRev }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
@@ -2373,9 +4030,9 @@ function radarRoute(ctx) {
         hideRun(run.id)
         hit.push(run.id)
       }
-      invalidateSnapshot()
+      invalidateSnapshot(ctx)
       log(`purge-tests matched=${hit.length} patterns=${patterns.join('|')}`)
-      return new Response(JSON.stringify({ ok: true, hidden: hit.length, runs: hit }), {
+      return new Response(JSON.stringify({ ok: true, hidden: hit.length, runs: hit, snapshotRev }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
@@ -2412,14 +4069,105 @@ function radarRoute(ctx) {
           }
         } catch {}
         cleared += ids.length
-        invalidateSnapshot()
+        invalidateSnapshot(ctx)
       }
       log(`panel clear-done cleared=${cleared} track=${trackCleared} passes=${passes}`)
-      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes }), {
+      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes, snapshotRev }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
     }
+    if (tail === 'claude-hook') {
+      // Claude Code 的 hooks 落点（只读登记，不代答）。GET 是因为宿主 webserver 只放行 GET/HEAD。
+      const result = claudeAccept(url)
+      log(`claude hook ev=${uslice(url.searchParams.get('ev') ?? '-', 24)} accepted=${result?.accepted === true ? 1 : 0}`)
+      return new Response(JSON.stringify({ ok: result?.ok === true, continue: true, accepted: result?.accepted === true, error: result?.error ?? null }), {
+        status: result?.ok === true ? 200 : 400,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
+    if (tail === 'claude-hook-config') {
+      // 只给引导，不代写用户的 ~/.claude/settings.json（spec 禁止项）。
+      const config = claudeHookConfig(ctx)
+      log(`claude hook config installed=${config.hooksInstalled === true ? 1 : 0}`)
+      return new Response(JSON.stringify(config), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
+    if (tail === 'adapters') {
+      // 排障：每家 adapter 的通道、完整性、能力、心跳/熔断与最近一次探测的耗时与错误。
+      // 先重扫 adapters.d：新增一家 agent 只要丢一份 JSON 进来，下一次请求就能看到（t39 P0-3）。
+      const declared = loadDeclaredAdapters()
+      const health = adapterSnapshot()
+      log(`adapters snapshot n=${health.length} degraded=${health.filter((item) => item.completeness !== 'full').length} declared=${declared.loaded}`)
+      return new Response(JSON.stringify({
+        ok: true,
+        adapters: health,
+        partialKinds: adapterPartialKinds(),
+        declared,
+        declaredDir: ADAPTER_DECL_DIR,
+        kinds: [...ADAPTER_CANON_KINDS],
+        rejectedReasons: Object.fromEntries(adapterRejectReasons),
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
+    if (tail === 'adapter-answer') {
+      // 统一作答入口：?id=dsh&body=<JSON>（写路由，同样走同源校验）。
+      const id = String(url.searchParams.get('id') ?? '')
+      let body = {}
+      try {
+        body = JSON.parse(url.searchParams.get('body') ?? '{}')
+      } catch {
+        return new Response(JSON.stringify({ ok: false, error: 'body must be JSON' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      const result = await adapterAnswer(id, body)
+      const status = result.ok === true ? 200 : (result.status ?? 400)
+      log(`adapter answer id=${uslice(id, 24)} ok=${result.ok === true} status=${status}`)
+      return new Response(JSON.stringify(result), {
+        status,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
+    if (tail === 'adapter-inject') {
+    // F8：这是给故障隔离自检用的注入口，生产不该可达。默认 404，只有显式打开
+    // DSH_TASK_RADAR_ADAPTER_INJECT=1 的自检进程才有这个路由。
+    if (process.env.DSH_TASK_RADAR_ADAPTER_INJECT !== '1') {
+      // t43 / L1：这里原来写 json(response, …)，但 Request handler 里没有 node 风格的 response
+      // 对象，调用即 ReferenceError → 本该 404 却返回 500。改成直接构造 Response。
+      return new Response(JSON.stringify({ ok: false, error: 'not found', path: tail }), {
+        status: 404,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+      // 故障隔离自测注入（写路由，走同源校验）：?id=claude&mode=throw|timeout|clear
+      const id = String(url.searchParams.get('id') ?? '')
+      const mode = String(url.searchParams.get('mode') ?? 'clear')
+      if (!adapterRegistry.has(id)) {
+        return new Response(JSON.stringify({ ok: false, error: 'unknown adapter', id }), {
+          status: 404,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      if (mode === 'clear') adapterFault.delete(id)
+      else adapterFault.set(id, mode === 'timeout' ? 'timeout' : 'throw')
+      invalidateSnapshot(ctx)
+      log(`adapter inject id=${id} mode=${mode} fault=${adapterFault.get(id) ?? 'none'}`)
+      return new Response(JSON.stringify({ ok: true, id, mode, fault: adapterFault.get(id) ?? null, snapshotRev }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+
     return new Response(JSON.stringify({ ok: false, error: 'not found', path: tail }), {
       status: 404,
       headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -2800,6 +4548,16 @@ function attachClientHalfToSuiteHealth() {
 export function apply(ctx) {
   log('host.apply')
   attachClientHalfToSuiteHealth()
+  // 声明式 adapter（t39 P0-3）：启动时扫一次 ~/.dsh/agent-bridge/adapters.d/*.json，
+  // 之后每次 GET /x-radar/adapters 会再扫一遍，所以新增一家不必重启宿主。
+  try {
+    const declared = loadDeclaredAdapters()
+    if (declared.loaded > 0 || declared.failed > 0) {
+      log(`adapter declare boot loaded=${declared.loaded} skipped=${declared.skipped} failed=${declared.failed}`)
+    }
+  } catch (error) {
+    log(`adapter declare boot failed ${uslice(String(error && error.message ? error.message : error), 120)}`)
+  }
   // 旁听会话内提问：prepend 让自己排在 api-remotes 的转发 listener 之前（它接手后
   // 不再 next()，晚注册的 listener 永远轮不到）。这里只记文本，随即 next() 交还下游：
   // 桌面提问卡照常由 Web 端弹出，雷达不接管、不改任何人的行为。

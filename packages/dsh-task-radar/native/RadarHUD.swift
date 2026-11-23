@@ -105,6 +105,8 @@ private enum HUD {
     static let headerHeight: CGFloat = 34
     static let rowHeight: CGFloat = 42
     static let overflowHeight: CGFloat = 24
+    /// 底部两行（滚动位置 / 未显示条数）之间的行距（t42）。
+    static let footLineGap: CGFloat = 14
     static let emptyRowHeight: CGFloat = 32
     static let maxRows = 6
     /// 事件流二级视图一屏显示的行数。
@@ -362,6 +364,10 @@ private enum L {
         "footer.backToEvents": ["zh": "‹ 返回事件流", "en": "‹ Back"],
         "footer.backToList": ["zh": "‹ 返回列表", "en": "‹ Back"],
         "footer.backToResult": ["zh": "‹ 返回结果", "en": "‹ Back"],
+        // R3-H1：折叠桶明细页（同会话 N 条逐条列出、逐条可点）。
+        "panel.foldedTitle": ["zh": "同一会话的 %d 条", "en": "%d entries in this session"],
+        "panel.foldedQuestion": ["zh": "等你回答", "en": "waiting for your answer"],
+        "panel.foldedApproval": ["zh": "要批准", "en": "needs approval"],
         "footer.events": ["zh": "事件流", "en": "Events"],
         "footer.eventsCount": ["zh": "事件流 %d 条 ›", "en": "Events %d ›"],
         "footer.jump": ["zh": "跳到会话 ›", "en": "Open session ›"],
@@ -380,6 +386,8 @@ private enum L {
         "panel.noChildren": ["zh": "没有子会话", "en": "No child sessions"],
         "panel.scrollHint": ["zh": "滚轮翻页", "en": "scroll"],
         "panel.scrollRange": ["zh": "%d–%d/%d · 滚轮翻页", "en": "%d–%d of %d · scroll"],
+        // t42：feed 在 MAX_ITEMS 处截断，被丢掉的条数必须能看见（spec §2.6 可观测）。
+        "panel.moreNotShown": ["zh": "还有 %d 条未显示", "en": "%d more not shown"],
         "panel.tapMember": ["zh": "点成员跳转", "en": "tap a member to jump"],
         "panel.teamDone": ["zh": "已完成 %d/%d", "en": "%d/%d done"],
         "panel.title": ["zh": "任务", "en": "Tasks"],
@@ -389,6 +397,9 @@ private enum L {
         "pill.failedPrefix": ["zh": "失败：", "en": "Failed: "],
         "pill.qPrefix": ["zh": "等回答：", "en": "Q: "],
         "pill.qPrefixN": ["zh": "等回答(%d)：", "en": "Q (%d): "],
+        "pill.qPrefixPartial": ["zh": "等回答(%d+)：", "en": "Q (%d+): "],
+        // t42 F4：approval 的 partial 与 question 同形（多 agent 只有一个通道能答时写 N+）。
+        "pill.apPrefixPartial": ["zh": "要批准(%d+)：", "en": "A (%d+): "],
         "pill.questionGeneric": ["zh": "有问题要问你", "en": "An agent has a question"],
         "pill.questionNth": ["zh": "第 %d 个问题：", "en": "Question %d: "],
         "pill.reworkFallback": ["zh": "有任务需要返工", "en": "A task needs rework"],
@@ -413,11 +424,19 @@ private enum L {
         "row.childTaskMeta": ["zh": " · 任务 %@", "en": " · task %@"],
         "row.failureNoText": ["zh": "点击看日志", "en": "open for logs"],
         "row.qBackToDsh": ["zh": "回 DSH 里答", "en": "answer in DSH"],
+        "source.title": ["zh": "数据源", "en": "sources"],
+        "source.partial": ["zh": "部分", "en": "partial"],
+        "source.unavailable": ["zh": "不可用", "en": "unavailable"],
+        "source.notInstalled": ["zh": "未装", "en": "n/a"],
+        // t42：数据源条第 5 家起折叠成可点的小药丸，点开在面板内展开全部。
+        "source.collapse": ["zh": "收起", "en": "less"],
+        "toast.external": ["zh": "这条来自 %@，请在对应应用里处理", "en": "This one is from %@ - handle it there"],
         "row.qFree": ["zh": "点开看问题 · 就地输入", "en": "open to see the question · answer inline"],
         "row.qFreeAnswerInHud": ["zh": "等你回答 · 这条提问要自由文本，点「✎ 回答…」输入后发送；不答超时按拒绝处理", "en": "waiting · free text: tap ✎ Answer… to type; timeout counts as decline"],
         "row.qFreeTextOnly": ["zh": "等你回答 · 这条提问要自由文本，本次只能在 DSH 里回答", "en": "waiting · needs free text; answer in DSH"],
         "row.qMultiMeta": ["zh": "等你回答 · 多选：点选项切换，点「%@」发送；20s 没答自动回桌面卡", "en": "waiting · multi-select: toggle options, tap “%@” to send; reverts in 20s"],
         "row.qOptions": ["zh": "点选项即答", "en": "tap an option to answer"],
+        "row.partial": ["zh": " · 部分", "en": " · partial"],
         "row.qPickOption": ["zh": "等你回答 · 选一个选项 = 回执该选项；不答超时按拒绝处理", "en": "waiting · picking an option submits it; timeout counts as decline"],
         "row.qTapSubmit": ["zh": "等你回答 · 点一个选项即提交；20s 没答自动回桌面卡", "en": "waiting · tap an option to submit; reverts to the desktop card in 20s"],
         "row.reworkProgress": ["zh": "返工中 %d/2 · 点击看缺什么", "en": "rework %d/2 · open for findings"],
@@ -439,6 +458,12 @@ private enum L {
         "status.done": ["zh": "已完成", "en": "done"],
         "status.failed": ["zh": "失败", "en": "failed"],
         "status.idle": ["zh": "空闲", "en": "idle"],
+        // R5-M2：折叠页副标题要受控映射，不能把 feed 的英文 status 直接画出来。
+        "status.verifying": ["zh": "待验收", "en": "verifying"],
+        "status.rework": ["zh": "返工中", "en": "rework"],
+        "status.blocked": ["zh": "需你决定", "en": "blocked"],
+        "status.unverified": ["zh": "未验证", "en": "unverified"],
+        "common.unknown": ["zh": "未知", "en": "unknown"],
         "status.offline": ["zh": "离线", "en": "Offline"],
         "status.ready": ["zh": "就绪", "en": "Ready"],
         "status.running": ["zh": "进行中", "en": "running"],
@@ -561,10 +586,17 @@ private struct RadarCounts: Decodable {
     var verifying = 0
     var rework = 0
     var blocked = 0
+    /// 多 agent：哪些 kind 存在 partial 数据（胶囊写 `等回答(2+)`，行尾写「部分」）。
+    var partialKinds: [String] = []
+    /// 被规范化拒掉的事件数（排障用；不影响计数等式）。
+    var rejected = 0
+    /// 超出 MAX_ITEMS 被截断的条数（spec §2.6 要求可观测）。
+    var dropped = 0
 
     private enum CodingKeys: String, CodingKey {
         case pending, running, approvals, questions, failed, doneUnread, autoConfirmed
         case verifying, rework, blocked
+        case partialKinds, rejected, dropped
     }
 
     init() {}
@@ -581,6 +613,9 @@ private struct RadarCounts: Decodable {
         verifying = RadarCounts.int(c, .verifying)
         rework = RadarCounts.int(c, .rework)
         blocked = RadarCounts.int(c, .blocked)
+        partialKinds = (try? c.decodeIfPresent([String].self, forKey: .partialKinds)) ?? []
+        rejected = RadarCounts.int(c, .rejected)
+        dropped = RadarCounts.int(c, .dropped)
     }
 
     private static func int(_ c: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Int {
@@ -682,12 +717,22 @@ private struct RadarItem: Decodable {
     var jobs: Int?
     /// feed 给的一句补充说明（例如「验收未通过，未自动返工」「等裁决」）。
     var note: String?
+    /// 多 agent：这条数据的完整性（full/partial/unknown）。partial 要在行尾标「部分」（spec §3.2）。
+    var completeness: String?
+    /// 别家的会话不能按 DSH 的 sessionId 跳转：false 时点行只开详情，不发 jump（spec §4.6）。
+    var jumpable: Bool?
+    /// 别家自己的会话标识（只用于展示/排障，不参与跳转）。
+    var sessionRef: String?
+    /// R3-H1：被折叠进这一行的同会话其它条目（含代表行自身，`folded.count == count`）。
+    /// 没有它时，同会话 3 条待回答会被压成 1 行、另两条的正文与回执字段全部消失。
+    var folded: [RadarItem]?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, agent, title, status, finalAnswer, seen, updatedAt, approvalId, childCount, parentId, team, children
         case verdict, round, missing, path, approvalToken, runId, formatStatus, stages, startedAt, finishedAt, stale, questions
         case answerRequest, answerToken, answerExpiresInMs
         case error, priority, count, pidAlive, runningBy, jobs, note
+        case completeness, jumpable, sessionRef, folded
         }
 
     init(from decoder: Decoder) throws {
@@ -723,6 +768,10 @@ private struct RadarItem: Decodable {
         runningBy = try? c.decodeIfPresent(String.self, forKey: .runningBy)
         jobs = try? c.decodeIfPresent(Int.self, forKey: .jobs)
         note = try? c.decodeIfPresent(String.self, forKey: .note)
+        completeness = try? c.decodeIfPresent(String.self, forKey: .completeness)
+        jumpable = try? c.decodeIfPresent(Bool.self, forKey: .jumpable)
+        sessionRef = try? c.decodeIfPresent(String.self, forKey: .sessionRef)
+        folded = try? c.decodeIfPresent([RadarItem].self, forKey: .folded)
         stages = try? c.decodeIfPresent([RadarStage].self, forKey: .stages)
         // feed 里时间是毫秒；以前这些字段声明了却从不解码（R-16），详情页永远
         // 只说「刚刚」。这里统一转成秒。
@@ -811,8 +860,24 @@ private struct RadarPayload: Decodable {
 
     var clientHalf: ClientHalf?
 
+    /// 多 agent 数据源条（spec §3.2-a）：一家一行，顺序由宿主固定（dsh → codex → claude → 字母序）。
+    struct AdapterStatus: Decodable {
+        var id: String?
+        var label: String?
+        var channel: String?
+        var completeness: String?
+        var supported: Bool?
+        var installed: Bool?
+        var running: Bool?
+        var note: String?
+        var error: String?
+        var itemCount: Int?
+    }
+
+    var adapters: [AdapterStatus] = []
+
     private enum CodingKeys: String, CodingKey {
-        case ok, generatedAt, counts, items, total, dsh, clientHalf, doneUnreadIds
+        case ok, generatedAt, counts, items, total, dsh, clientHalf, doneUnreadIds, adapters
     }
 
     init(from decoder: Decoder) throws {
@@ -827,6 +892,7 @@ private struct RadarPayload: Decodable {
         dsh = try? c.decodeIfPresent(DshInfo.self, forKey: .dsh)
         clientHalf = try? c.decodeIfPresent(ClientHalf.self, forKey: .clientHalf)
         doneUnreadIds = (try? c.decodeIfPresent([String].self, forKey: .doneUnreadIds)) ?? []
+        adapters = (try? c.decodeIfPresent([AdapterStatus].self, forKey: .adapters)) ?? []
     }
 }
 
@@ -857,11 +923,16 @@ private struct RenderState {
     var items: [RadarItem] = []
     /// 宿主给的完整未读完成 id 清单（与 items 的 12 行截断无关），通知/清理共用它。
     var doneUnreadIds: [String] = []
+    /// 多 agent：数据源条与降级口径（spec §3.2）。
+    var adapters: [RadarPayload.AdapterStatus] = []
+    var partialKinds: [String] = []
     /// 九态里的三态（U-13）。feed 没给（老宿主/测试 fixture）时按 items.status 兜底，
     /// 绝不把这三态「推断」成 running/failed —— 那正是 R-06 判 FAIL 的原因。
     var verifying = 0
     var rework = 0
     var blocked = 0
+    /// 被 feed 上限截断、根本没收进 items 的条数（t42：列表底部要写「还有 N 条未显示」）。
+    var dropped = 0
 
     var blockedCount: Int { blocked > 0 ? blocked : items.filter { $0.status == "blocked" }.count }
     var reworkCount: Int { rework > 0 ? rework : items.filter { $0.status == "rework" }.count }
@@ -1006,6 +1077,29 @@ private struct RenderState {
         return Array(out.prefix(3))
     }
 
+    /// 数据源条（常驻一行）：最多 4 家，超出 `+N`；标记沿用 spec §3.2 的四值。
+    var sourceLine: (String, NSColor)? {
+        guard !adapters.isEmpty else { return nil }
+        let shown = adapters.prefix(4)
+        let parts = shown.map { adapter -> String in
+            let label = (adapter.label ?? adapter.id ?? "?").uppercased()
+            let mark: String
+            if adapter.error != nil || adapter.completeness == "unknown" {
+                mark = L.s("source.unavailable")
+            } else if adapter.completeness == "partial" {
+                mark = L.s("source.partial")
+            } else if adapter.completeness == "full" {
+                mark = "✓"
+            } else {
+                mark = L.s("source.notInstalled")
+            }
+            return "\(label) \(mark)"
+        }
+        let extra = adapters.count > shown.count ? " +\(adapters.count - shown.count)" : ""
+        return (L.s("source.title") + "  " + parts.joined(separator: "  ") + extra,
+                NSColor(calibratedWhite: 0.62, alpha: 0.72))
+    }
+
     var signature: String {
         let sessions = runningSessions
             .map { "\($0.agent ?? "-")|\($0.title ?? "-")" }
@@ -1104,6 +1198,8 @@ private enum DetailMode {
     case failure
     /// 双击会话行的确认卡：仅从雷达移除 / 跳到 DSH 删除 / 取消。
     case sessionMenu
+    /// R3-H1：折叠桶的明细页——同会话 N 条逐条列出、逐条可点处置。
+    case folded
 }
 
 /// 详情底部按钮。
@@ -1134,6 +1230,8 @@ private enum DetailAction {
     case dismiss
     /// U-37：正文超过 4 行时展开/收起全文（index 指向 questionBlocks）。
     case expandText(Int)
+    /// R3-H1：折叠桶明细页里点第 index 条（逐条处置）。
+    case foldEntry(Int)
 }
 
 // MARK: - 启动参数
@@ -1822,6 +1920,29 @@ private final class PanelContentView: PassthroughView {
     var growLeft = true
     var growUp = true
 
+    /// 数据源条是否展开（t42）：默认折叠成「前 4 家 + N」，点 +N 在面板内展开全部，再点收起。
+    private(set) var sourceExpanded = false
+    /// `+N` / 「收起」药丸的命中区（视图坐标），每次绘制时重建。
+    private var sourceToggleRect: NSRect?
+    /// 上一次记录过的 dropped 数：只在变化时打日志，别每 2s 刷一行。
+    private var lastDroppedLogged = -1
+    /// 上一次记录过的 `+N` 药丸矩形（零 TCC 自检要靠它定位点击坐标）。
+    private var lastSourceToggleLogged = ""
+
+    /// 摘要页数据源条上的 `+N` / 「收起」是否被点中。
+    func sourceToggleHit(at point: NSPoint) -> Bool {
+        guard let rect = sourceToggleRect else { return false }
+        return rect.insetBy(dx: -4, dy: -4).contains(point)
+    }
+
+    /// 切换数据源条的展开态，返回切换后的值（HUDController 用它打日志）。
+    @discardableResult
+    func toggleSourceExpanded() -> Bool {
+        sourceExpanded.toggle()
+        needsDisplay = true
+        return sourceExpanded
+    }
+
     override var isOpaque: Bool { false }
 
     /// 「完成未看」行的可点击区域（视图坐标），每次绘制时重建。
@@ -2203,6 +2324,8 @@ private final class PanelContentView: PassthroughView {
                 drawFailure(detail)
             case .sessionMenu:
                 drawSessionMenu(detail)
+            case .folded:
+                drawFolded(detail)
             }
             return
         }
@@ -2300,19 +2423,32 @@ private final class PanelContentView: PassthroughView {
                     artifactRowHits.append((rect: rect, path: path))
                 }
             }
+            // 底部两行：滚动位置（列表比可见行多）+ 被上限丢掉多少条（t42）。
+            // 两者是不同事实，不能互相顶掉：滚到下一页看不到的仍在上限内，被 dropped 的永远看不到。
+            let footAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10, weight: .regular),
+                .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.42),
+            ]
+            var footY = listTop - CGFloat(HUD.maxRows) * HUD.rowHeight - HUD.overflowHeight + 4
             if rows.count > HUD.maxRows {
-                let y = listTop - CGFloat(HUD.maxRows) * HUD.rowHeight - HUD.overflowHeight + 4
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .regular),
-                    .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.42),
-                ]
                 // N/M：让用户知道现在停在哪一页，而不是只看到「还有 N 条」。
                 let last = min(rows.count, listScrollRow + HUD.maxRows)
                 let indicator = L.f("panel.scrollRange", listScrollRow + 1, last, rows.count) as NSString
                 indicator.draw(
-                    in: NSRect(x: padding, y: y,
+                    in: NSRect(x: padding, y: footY,
                                width: bounds.width - 2 * padding, height: 16),
-                    withAttributes: attrs)
+                    withAttributes: footAttrs)
+                footY -= HUD.footLineGap
+            }
+            if state.dropped > 0 {
+                let more = L.f("panel.moreNotShown", state.dropped) as NSString
+                more.draw(in: NSRect(x: padding, y: footY,
+                                     width: bounds.width - 2 * padding, height: 16),
+                          withAttributes: footAttrs)
+                if lastDroppedLogged != state.dropped {
+                    lastDroppedLogged = state.dropped
+                    log("panel dropped n=\(state.dropped)")
+                }
             }
         }
 
@@ -2372,6 +2508,8 @@ private final class PanelContentView: PassthroughView {
         let textX = badgeRect.maxX + 10
         let textWidth = rect.maxX - textX
         var titleText = item.title?.isEmpty == false ? item.title! : L.s("common.untitled")
+        // 多 agent：partial 的行必须自己说出来（spec §3.2 面板行尾灰字「部分」）。
+        if item.completeness == "partial" { titleText += L.s("row.partial") }
         // 同 agent 同标题的连续 done 在 feed 里已折叠，这里把条数标出来（t14）。
         if let count = item.count, count > 1 { titleText += "  ×\(count)" }
         let titleAttrs: [NSAttributedString.Key: Any] = [
@@ -3297,6 +3435,79 @@ private final class PanelContentView: PassthroughView {
 
     /// 单条事件的原始 payload：等宽字体 + 逐行滚动。
     /// 子会话列表：父会话展开后看到它调用了哪些智能体、各自在干什么。
+    /// R3-H1：折叠桶的成员（含代表行），由控制器在开页时灌入。
+    var foldedEntries: [RadarItem] = []
+
+    /// 折叠明细页：每一行都能点，点进去就是那条自己的处置页（提问/审批/详情）。
+    private func drawFolded(_ detail: RadarDetail) {
+        let padding = HUD.contentPadding
+        let contentMaxY = bounds.height - padding
+        let headerY = contentMaxY - HUD.headerHeight
+        detailActionHits.removeAll()
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.92),
+        ]
+        (L.f("panel.foldedTitle", foldedEntries.count) as NSString).draw(
+            in: NSRect(x: padding, y: headerY + 11, width: bounds.width - 2 * padding, height: 17),
+            withAttributes: titleAttrs)
+        let sep = NSBezierPath()
+        sep.move(to: NSPoint(x: padding, y: headerY + 4))
+        sep.line(to: NSPoint(x: bounds.width - padding, y: headerY + 4))
+        NSColor(calibratedWhite: 1.0, alpha: 0.08).setStroke()
+        sep.lineWidth = 1
+        sep.stroke()
+
+        let listTop = headerY - 2
+        let rowH: CGFloat = 38
+        let titleRow: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+            .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.92),
+        ]
+        let metaRow: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.50),
+        ]
+        let maxRows = max(1, Int((listTop - padding - 24) / rowH))
+        for (index, entry) in foldedEntries.prefix(maxRows).enumerated() {
+            let y = listTop - CGFloat(index + 1) * rowH
+            let rect = NSRect(x: padding, y: y, width: bounds.width - 2 * padding, height: rowH)
+            // 每一行都注册命中区：R3-H1 的验收就是「展开后 4 条都能点」。
+            detailActionHits.append((rect: rect, action: .foldEntry(index)))
+            // R5-M2：status 走受控映射（未知回落 common.unknown），
+            // 不再把 feed 里的英文 status 原样画进中文界面。
+            let tail = foldedStatusText(entry)
+            let head = entry.title?.isEmpty == false ? entry.title! : L.s("common.untitled")
+            drawSingleLine(head, in: NSRect(x: rect.minX, y: y + 20, width: rect.width, height: 16),
+                           attributes: titleRow)
+            drawSingleLine("\((entry.agent ?? "?").uppercased()) · \(tail)",
+                           in: NSRect(x: rect.minX, y: y + 6, width: rect.width, height: 13),
+                           attributes: metaRow)
+        }
+        let footY = padding + 4
+        // R5-M1：`footer.back` 从来不在表里——zh/en 都会把 key 原文画到按钮上。
+        drawFooterButton(text: L.s("footer.backToList"), align: .right, action: .backToList)
+        _ = footY
+    }
+
+    /// R5-M2：折叠行副标题的状态词。只认表里的键，未知一律 `common.unknown`。
+    private func foldedStatusText(_ entry: RadarItem) -> String {
+        if entry.isQuestion { return L.s("panel.foldedQuestion") }
+        if entry.isApproval { return L.s("panel.foldedApproval") }
+        switch entry.status ?? "" {
+        case "done": return L.s("status.done")
+        case "failed": return L.s("status.failed")
+        case "running": return L.s("status.running")
+        case "verifying": return L.s("status.verifying")
+        case "rework": return L.s("status.rework")
+        case "blocked": return L.s("status.blocked")
+        case "unverified": return L.s("status.unverified")
+        case "idle": return L.s("status.idle")
+        default: return L.s("common.unknown")
+        }
+    }
+
     private func drawChildren(_ detail: RadarDetail) {
         let padding = HUD.contentPadding
         let contentMaxY = bounds.height - padding
@@ -3481,7 +3692,12 @@ private final class PanelContentView: PassthroughView {
     private func drawStats(in bandRect: NSRect) {
         drawClearDoneButton(in: bandRect)
         let lines = state.statLines
-        guard !lines.isEmpty else { return }
+        // 数据源条是**常驻**的（spec §3.2-a）：即使没有任何统计行也要画，
+        // 否则「都完整」这件事用户看不到，也无法判断某家为什么是空的。
+        if lines.isEmpty {
+            if let source = state.sourceLine { drawSourceLine(source, in: bandRect, centerY: bandRect.midY - 6) }
+            return
+        }
 
         let statsWidth = bounds.width - HUD.bandHeight - HUD.contentPadding * 2
         let statsX = growLeft
@@ -3503,6 +3719,85 @@ private final class PanelContentView: PassthroughView {
             if line.0.hasPrefix(L.s("panel.doneUnread")) {
                 doneStatsRect = lineRect.insetBy(dx: -4, dy: -3)
             }
+        }
+        // 数据源条（多 agent）：常驻一行，10pt tertiary，最多 4 家 +N（spec §3.2-a/b）。
+        if let source = state.sourceLine {
+            drawSourceLine(source, in: bandRect, centerY: bottom - 7)
+        }
+    }
+
+    /// 数据源条的绘制（两处调用：有统计行时贴在统计块下方；没有统计行时居中）。
+    /// 数据源条（t42）：默认「前 4 家 + `+N`」，`+N` 可点；展开后按行铺满全部，右侧变「收起」。
+    ///
+    /// 以前只把这行拼成一个字符串画一次，第 5 家起就只剩一个不会被渲染的 `+N`，
+    /// 用户既看不到还有谁、也没处点（t37 F7 的显示层后果）。
+    private func drawSourceLine(_ source: (String, NSColor), in bandRect: NSRect, centerY: CGFloat) {
+        sourceToggleRect = nil
+        let entries = adapterSourceEntries()
+        guard !entries.isEmpty else { return }
+        let font = NSFont.systemFont(ofSize: 10, weight: .regular)
+        let color = source.1.withAlphaComponent(state.offline ? 0.30 : 0.72)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let statsWidth = bounds.width - HUD.bandHeight - HUD.contentPadding * 2
+        let statsX = growLeft ? HUD.contentPadding : HUD.bandHeight + HUD.contentPadding
+        let hidden = max(0, entries.count - 4)
+        // 只有「确实还有没显示的」或「已经展开」时才给药丸，避免单家也挂一个空按钮。
+        let toggleText: String? = sourceExpanded
+            ? L.s("source.collapse")
+            : (hidden > 0 ? "+\(hidden)" : nil)
+        let toggleWidth: CGFloat = toggleText.map { ($0 as NSString).size(withAttributes: attrs).width + 14 } ?? 0
+        let title = L.s("source.title") + "  "
+        (title as NSString).draw(in: NSRect(x: statsX, y: centerY, width: statsWidth, height: 12), withAttributes: attrs)
+        var x = statsX + (title as NSString).size(withAttributes: attrs).width
+        let wrapLimit = statsX + statsWidth - (toggleWidth > 0 ? toggleWidth + 6 : 0)
+        var lineY = centerY
+        let shown = sourceExpanded ? entries : Array(entries.prefix(4))
+        for entry in shown {
+            let text = entry as NSString
+            let width = text.size(withAttributes: attrs).width
+            if x + width > wrapLimit, x > statsX + 1 {
+                x = statsX
+                lineY -= HUD.footLineGap
+            }
+            text.draw(in: NSRect(x: x, y: lineY, width: width + 2, height: 12), withAttributes: attrs)
+            x += width + 10
+        }
+        guard let toggleText else { return }
+        let rect = NSRect(x: statsX + statsWidth - toggleWidth, y: centerY - 1, width: toggleWidth, height: 14)
+        let pill = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        NSColor(calibratedWhite: 1.0, alpha: 0.10).setFill()
+        pill.fill()
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        let toggleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9.5, weight: .medium),
+            .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.80),
+            .paragraphStyle: para,
+        ]
+        (toggleText as NSString).draw(in: NSRect(x: rect.minX, y: rect.minY + 2, width: rect.width, height: 12),
+                                      withAttributes: toggleAttrs)
+        sourceToggleRect = rect
+        if lastSourceToggleLogged != NSStringFromRect(rect) {
+            lastSourceToggleLogged = NSStringFromRect(rect)
+            log("source toggle rect=\(lastSourceToggleLogged) expanded=\(sourceExpanded ? 1 : 0)")
+        }
+    }
+
+    /// 逐家拼「标签 + 四值标记」（spec §3.2）：与 `RenderState.sourceLine` 同一套口径。
+    private func adapterSourceEntries() -> [String] {
+        state.adapters.map { adapter in
+            let label = (adapter.label ?? adapter.id ?? "?").uppercased()
+            let mark: String
+            if adapter.error != nil || adapter.completeness == "unknown" {
+                mark = L.s("source.unavailable")
+            } else if adapter.completeness == "partial" {
+                mark = L.s("source.partial")
+            } else if adapter.completeness == "full" {
+                mark = "✓"
+            } else {
+                mark = L.s("source.notInstalled")
+            }
+            return "\(label) \(mark)"
         }
     }
 
@@ -3691,6 +3986,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     private var bannerProbeDone = false
     private var feedFailServed = false
     /// 宽胶囊视图与生长方向（右半屏=向左长，左半屏=向右长）。
+    /// R3-H1：折叠桶成员的 id → 条目索引（桶成员不在 state.items 里）。
+    private var foldedItems: [String: RadarItem] = [:]
     private var pillView: PillBadgeView?
     private var capsuleGrowLeft = true
     /// 正在弹输入框：这期间不做详情态对账，避免把用户正在输入的自由文本页刷掉（用户口径 2026-11-19）。
@@ -4489,6 +4786,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         case .children: return "children"
         case .failure: return "failure"
         case .sessionMenu: return "session-menu"
+        case .folded: return "folded"
         }
     }
 
@@ -4612,8 +4910,19 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             state.rework = counts.rework
             state.blocked = counts.blocked
             state.doneUnreadIds = payload.doneUnreadIds
+            state.adapters = payload.adapters
+            state.partialKinds = counts.partialKinds
+            state.dropped = counts.dropped
             state.autoConfirmed = counts.autoConfirmed
             state.items = payload.items
+            // R3-H1：桶内成员不在 state.items 里，但它们的处置页（openApproval/openDetail）
+            // 都按 id 查表——先登记一份索引，展开后点任意一条都能进对应页面。
+            foldedItems.removeAll()
+            for item in payload.items {
+                for entry in item.folded ?? [] {
+                    if let id = entry.id, !id.isEmpty { foldedItems[id] = entry }
+                }
+            }
             clientHalf = payload.clientHalf
             state.offline = false
             let renderStarted = Date()
@@ -4895,6 +5204,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 return HUD.bandHeight + HUD.contentPadding * 2 + HUD.headerHeight +
                     CGFloat(rows) * HUD.rowHeight + 22
             }
+            if detailMode == .folded {
+                // R3-H1：折叠明细页，一行一条（38pt），最多 8 行，底部留给「返回」。
+                let rows = min(max(1, (panelContent?.foldedEntries.count ?? 1)), 8)
+                return HUD.bandHeight + HUD.contentPadding * 2 + HUD.headerHeight +
+                    CGFloat(rows) * 38 + 22
+            }
             if detailMode == .approval {
                 // 提问页按真实内容算：每个问题 34 + 芯片行 + 自由回答行；多问还要提交行。
                 // 旧公式只看 bodyLines，多问时芯片会被 `y < padding + 52` 截掉（U-18 实拍）。
@@ -4916,7 +5231,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         let count = state.panelRowCount
         let rows = min(count, HUD.maxRows)
         let rowBlock = rows == 0 ? HUD.emptyRowHeight : CGFloat(rows) * HUD.rowHeight
-        let overflow = count > HUD.maxRows ? HUD.overflowHeight : 0
+        var overflow = count > HUD.maxRows ? HUD.overflowHeight : 0
+        // 「还有 N 条未显示」是额外一行，不预留高度就会被 padding 裁掉（t42 实拍踩过）。
+        if state.dropped > 0 { overflow += HUD.footLineGap }
         return HUD.bandHeight + HUD.contentPadding + HUD.headerHeight +
             rowBlock + overflow + HUD.contentPadding
     }
@@ -5999,7 +6316,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 noteInteraction()
                 panelContent?.scrollApprovalBody(by: event.scrollingDeltaY)
             }
-        case .children:
+        case .children, .folded:
             break
         }
     }
@@ -6036,6 +6353,8 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 let local = panelContent.convert(event.locationInWindow, from: nil)
                 if panelContent.bounds.contains(local) {
                     switch panelContent.detailActionHit(at: local) {
+                    case .foldEntry(let index):
+                        openFoldEntry(index)
                     case .expandText(let bi):
                         if panelContent.questionBlocks.indices.contains(bi) {
                             let qid = panelContent.questionBlocks[bi].id
@@ -6112,6 +6431,11 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                     }
                 }
             }
+        } else if sourceToggleHit(event) {
+            if let panelContent {
+                let expanded = panelContent.toggleSourceExpanded()
+                log("source toggle expanded=\(expanded) adapters=\(state.adapters.count)")
+            }
         } else if let row = rowHitByGeometry(event) {
             // 几何优先：draw 期间登记的命中区可能和视觉错位（本次 captain 真机点击全 no-op 的根因）。
             dispatchRowClick(row, event: event)
@@ -6150,6 +6474,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             log("single click: no-op")
         }
         dragMoved = false
+    }
+
+    /// 命中数据源条上的 `+N` / 「收起」药丸（t42）。
+    private func sourceToggleHit(_ event: NSEvent) -> Bool {
+        guard isExpanded, detail == nil, let panelContent else { return false }
+        let local = panelContent.convert(event.locationInWindow, from: nil)
+        return panelContent.sourceToggleHit(at: local)
     }
 
     /// 命中「清除已完成」按钮（摘要页底部）。
@@ -6229,7 +6560,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         if state.questions > 0 {
             // U-54：多条待答时胶囊必须带计数，不能只显示第一条（用户看不出还有几问答没处理）。
             let pending = max(state.questions, state.questionItems.count)
-            prefix = pending > 1 ? L.f("pill.qPrefixN", pending) : L.s("pill.qPrefix")
+            let partialQuestion = state.partialKinds.contains("question")
+            prefix = pending > 1
+                ? (partialQuestion ? L.f("pill.qPrefixPartial", pending) : L.f("pill.qPrefixN", pending))
+                : (partialQuestion ? L.f("pill.qPrefixPartial", max(pending, 1)) : L.s("pill.qPrefix"))
             accent = HUD.questionColor
             glyph = "?"
             if let item = state.items.first(where: { $0.isQuestion }) {
@@ -6250,7 +6584,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             }
             if firstSentence(body ?? "").isEmpty { body = L.s("pill.sessionWaiting") }
         } else if state.approvals > 0 {
-            prefix = L.s("pill.approvalPrefix")
+            // t42 F4：多 agent 下 approval 也可能是 partial（只有一家能把回执写回去），
+            // 文案与 question 的「等回答(N+)」同形，用户才知道有的事得回原工具处理。
+            let pending = max(state.approvals, state.approvalItems.count)
+            let partialApproval = state.partialKinds.contains("approval")
+            prefix = partialApproval
+                ? L.f("pill.apPrefixPartial", max(pending, 1))
+                : L.s("pill.approvalPrefix")
             accent = HUD.approvalColor
             glyph = "✓"
             if let item = state.items.first(where: { $0.isApproval }) {
@@ -6439,8 +6779,20 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             log("session menu double-click ignored (debounce)")
             return
         }
+        // R3-H1：折叠桶优先展开——桶里若是 3 条待回答，直接进处置页只会覆盖到代表行那一条。
+        if (item.count ?? 1) > 1, let folded = item.folded, !folded.isEmpty {
+            openFoldedDetail(item)
+            return
+        }
         if item.isApproval || item.isQuestion {
             openApproval((id: item.id ?? "", approvalId: item.approvalId ?? ""))
+        } else if item.kind == "session", item.jumpable == false {
+            // 多 agent（spec §4.6）：别家的 sessionRef 不是 DSH 的 sessionId，jump 过去必然失败；
+            // 这里只开详情并说明「去那个应用处理」，绝不假装能跳。
+            log("row external agent id=\(self.shortId(item.id ?? "")) agent=\(item.agent ?? "-") action=detail")
+            _ = showBanner(title: L.f("toast.external", (item.agent ?? "agent").uppercased()),
+                           body: item.title ?? "", onClick: nil)
+            if let id = item.id { openDetail(id) }
         } else if item.kind == "session" {
             // t12 跳转语义（用户 2026-11-19）：会话行**主点击就是跳回主会话**，
             // 子 agent 的会话窗口不是用户要去的地方。看详情是次级动作：按住 ⌥ 再点。
@@ -6492,7 +6844,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     /// 打开审批视图：一句话说明 agent 想干什么，底部直接批准/拒绝。
     private func openApproval(_ hit: (id: String, approvalId: String)) {
-        guard let item = state.items.first(where: { $0.id == hit.id }) else { return }
+        guard let item = state.items.first(where: { $0.id == hit.id }) ?? foldedItems[hit.id] else { return }
         pendingApprovalId = hit.approvalId
         pendingApprovalToken = item.approvalToken
         pendingQuestions = item.questions ?? []
@@ -7318,8 +7670,47 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         refreshExpandedGeometry(animated: false)
     }
 
+    /// R3-H1：打开折叠桶的明细页。桶里每条都列出来、都能点（否则同会话 3 条待回答
+    /// 会被压成 1 行，另两条永远处置不到）。
+    private func openFoldedDetail(_ item: RadarItem) {
+        let entries = item.folded ?? []
+        guard !entries.isEmpty else { return }
+        detailForcedMode = .folded
+        detailOpenedAt = Date()
+        detailLastSeq = 0
+        detailMode = .folded
+        panelContent?.foldedEntries = entries
+        let title = L.f("panel.foldedTitle", entries.count)
+        detail = RadarDetail(title: title,
+                             agent: item.agent ?? "unknown",
+                             meta: item.title ?? "",
+                             body: "",
+                             runId: item.id ?? "")
+        panelContent?.detail = detail
+        panelContent?.detailMode = .folded
+        log("folded detail open id=\(shortId(item.id ?? "")) n=\(entries.count)")
+        if !isExpanded { setExpanded(true, animated: true) }
+        refreshExpandedGeometry(animated: false)
+    }
+
+    /// 折叠明细页里点第 index 条：有回执通道就进处置页，否则进它自己的详情。
+    private func openFoldEntry(_ index: Int) {
+        guard let entries = panelContent?.foldedEntries, entries.indices.contains(index) else { return }
+        let entry = entries[index]
+        let id = entry.id ?? ""
+        log("folded entry click index=\(index) id=\(shortId(id)) kind=\(entry.kind ?? "-") answer=\(entry.answerRequest == nil ? 0 : 1)")
+        if entry.isQuestion || entry.isApproval {
+            openApproval((id: id, approvalId: entry.approvalId ?? id))
+        } else {
+            openDetail(id)
+        }
+    }
+
     private func openDetail(_ id: String, mode: DetailMode = .summary) {
-        guard let item = state.items.first(where: { $0.id == id }) else { return }
+        // t47：折叠桶的成员不在 state.items 里（它们只在桶的 folded[] 里）。
+        // openApproval 早已有 foldedItems 兜底，openDetail 漏了——于是桶里点非待办成员
+        // （session/run 类）时 guard 直接 return，用户看不到任何变化。
+        guard let item = state.items.first(where: { $0.id == id }) ?? foldedItems[id] else { return }
         log("open detail \(id) mode=\(mode)")
         detailForcedMode = mode
         detailOpenedAt = Date()
