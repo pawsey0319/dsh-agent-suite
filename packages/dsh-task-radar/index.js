@@ -302,6 +302,24 @@ function readSeen() {
   return raw !== null && typeof raw === 'object' ? raw : {}
 }
 
+/**
+ * 「已读」时间戳（t51 / CD-1）。
+ *
+ * 旧实现把 seen 当布尔集合：只要 id 在里面就算读过。两处踩坑：
+ * ① 为了让「又跑起来的会话」重新算未读，清账逻辑会无条件 `delete seen[id]`，
+ *    把用户刚刚置读的记录一起抹掉 —— clear-done 于是每轮都能「再清一次」，
+ *    counts 永远回到原值（真机 cleared=150 / passes=6 / doneUnread=25）。
+ * ② 同一会话再完成一次（finishedAt 变大）后，集合里那条旧记录会把**新的**完成吃掉。
+ * 现在统一成时间戳比较：unread ⟺ finishedAt > seenAt；数字即毫秒，
+ * 旧格式 `true`（只有「读过」没有时间）按「最新」算，避免把历史已读翻成未读。
+ */
+function seenAtOf(seen, id) {
+  const value = seen?.[id]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (value === true) return Number.MAX_SAFE_INTEGER
+  return 0
+}
+
 const VERIFY_DIR = join(BRIDGE_DIR, 'verify')
 
 /** 读 L1 判别层的裁决（没有就返回空）。 */
@@ -2946,7 +2964,15 @@ async function buildRadar(ctx) {
   // 于是「从雷达移除」对 adapter 行完全无效——下一轮 poll 又把它放回来。
   // 这里对 adapter 条目按三条键任一命中即隐藏：item.id / dedupKey / sessionRef。
   const hiddenKeys = readHiddenSessions()
+  const seenForAdapter = readSeen()
   for (const item of agentFeed.items) {
+    // t51 / CD-1：adapter 的完成行以前完全不看 seen —— clear-done 写进 seen.json 的
+    // 置读记录对它们无效，于是 counts.doneUnread 永远回到原值（真机 25 条 codex/dumate 完成）。
+    // 未读 ⟺ finishedAt > seenAt；等于或早于置读时间就算已读。
+    if (item.status === 'done') {
+      const finishedAt = Number(item.finishedAt ?? item.updatedAt ?? 0)
+      if (finishedAt > 0 && seenAtOf(seenForAdapter, String(item.id ?? '')) >= finishedAt) continue
+    }
     const hit = hiddenKeys[String(item.id ?? '')] !== undefined
       || (item.dedupKey !== undefined && hiddenKeys[String(item.dedupKey)] !== undefined)
       || (item.sessionRef !== undefined && hiddenKeys[String(item.sessionRef)] !== undefined)
@@ -3082,18 +3108,15 @@ async function buildRadar(ctx) {
     }
   } catch {}
   const nowMs = Date.now()
-  const seenSet = new Set(Object.keys(readSeen()))
+  const seenNow = readSeen()
   for (const session of sessions.items) {
     const id = session.id
     if (!id) continue
     if (session.title) track.titles[id] = session.title
     if (session.status === 'running') {
-      if (seenSet.has(id)) {
-        const seen = readSeen()
-        delete seen[id]
-        try { saveSeen(seen) } catch {}
-        seenSet.delete(id)
-      }
+      // t51 / CD-1：这里以前会 `delete seen[id]`（想让又跑起来的会话重新算未读）。
+      // 那是「按集合删除」，会连带抹掉用户刚置读的记录，也让 clear-done 的写入白做。
+      // 现在改为时间戳比较（见 seenAtOf）：这一轮结束后 finishedAt 会变大，自然重新算未读。
       track.running[id] = nowMs
       if (track.started[id] === undefined) track.started[id] = nowMs
       delete track.finished[id]
@@ -3135,7 +3158,8 @@ async function buildRadar(ctx) {
       delete track.started[id]
       continue
     }
-    if (nowMs - Number(at) > FINISHED_KEEP_MS || seenSet.has(id)) {
+    const finishedForSeen = Number(track.finishedAt[id] ?? at)
+    if (nowMs - Number(at) > FINISHED_KEEP_MS || seenAtOf(seenNow, id) >= finishedForSeen) {
       delete track.finished[id]
       delete track.started[id]
       delete track.finishedAt[id]
@@ -4043,10 +4067,22 @@ function radarRoute(ctx) {
       let cleared = 0
       let trackCleared = 0
       let passes = 0
+      let stuck = false
+      let previousKey = ''
       for (let pass = 0; pass < 6; pass += 1) {
         const fresh = await buildRadar(ctx)
         const ids = Array.isArray(fresh.doneUnreadIds) ? fresh.doneUnreadIds : []
         if (ids.length === 0) break
+        // t51 / CD-1：如果这一轮的待清 id 跟上一轮**完全一样**，说明置读没生效
+        //（以前正是这样静默循环 6 轮：cleared=150、doneUnread 不变）。
+        // 记一行 `pass.ineffective` 并停手，别把「清不动」伪装成「清完了」。
+        const key = ids.slice().sort().join('|')
+        if (key === previousKey) {
+          stuck = true
+          log(`pass.ineffective pass=${pass + 1} n=${ids.length} sample=${uslice(String(ids[0] ?? ''), 48)}`)
+          break
+        }
+        previousKey = key
         passes += 1
         const seen = readSeen()
         const now = Date.now()
@@ -4071,8 +4107,52 @@ function radarRoute(ctx) {
         cleared += ids.length
         invalidateSnapshot(ctx)
       }
-      log(`panel clear-done cleared=${cleared} track=${trackCleared} passes=${passes}`)
-      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes, snapshotRev }), {
+      log(`panel clear-done cleared=${cleared} track=${trackCleared} passes=${passes} stuck=${stuck ? 1 : 0}`)
+      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes, stuck, snapshotRev }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    }
+    if (tail === 'open-agent') {
+      // t51 / JUMP-1：adapter 行（dumate / workbuddy / 豆包…）没有 DSH sessionId，
+      // 走 `jump` 是死路：只写 jump.json，没有任何 client 消费方，用户点了完全没反应。
+      // 这里退一步——**打开那家的 App**，并把「能不能开」明确回给 HUD，
+      // 让点击永远有可见结果（HUD 失败时弹「该任务在 X 内，无法从雷达跳转」）。
+      const agent = String(url.searchParams.get('agent') ?? '').trim().toLowerCase()
+      const ref = uslice(String(url.searchParams.get('ref') ?? '').trim(), 200)
+      // 只认这张白名单：绝不允许路由参数变成任意命令。
+      const OPEN_AGENT_APPS = {
+        dumate: ['DuMate'],
+        workbuddy: ['WorkBuddy', 'Work Buddy'],
+        doubao: ['Doubao', '豆包'],
+        codex: [],
+        comate: [],
+      }
+      const candidates = OPEN_AGENT_APPS[agent]
+      if (candidates === undefined) {
+        log(`row activate agent=${agent || '-'} result=unsupported reason=unknown-agent`)
+        return new Response(JSON.stringify({ ok: false, opened: false, agent, ref, error: 'unsupported agent' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        })
+      }
+      // 测试钩子：`DSH_TASK_RADAR_NO_OPEN=1` 时不真的拉起 App（用例里不能开用户的 DuMate）。
+      const dryRun = process.env.DSH_TASK_RADAR_NO_OPEN === '1'
+      let opened = false
+      let app = null
+      for (const name of dryRun ? [] : candidates) {
+        try {
+          execFileSync('open', ['-a', name], { timeout: 2000, stdio: 'ignore' })
+          opened = true
+          app = name
+          break
+        } catch {}
+      }
+      log(`row activate agent=${agent || '-'} ref=${uslice(ref, 32)} result=${opened ? 'ok' : 'unsupported'} app=${app ?? '-'}${dryRun ? ' reason=dry-run' : ''}`)
+      return new Response(JSON.stringify({
+        ok: opened, opened, agent, app, ref, dryRun,
+        error: opened ? null : (dryRun ? 'dry-run' : 'no app to open'),
+      }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
