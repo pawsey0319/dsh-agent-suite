@@ -1,6 +1,6 @@
 {
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "description": "One install for the DSH agent suite: desktop radar HUD, external agent bridge, L1 judge and office artifact scanner.",
   "type": "module",
   "license": "MIT",

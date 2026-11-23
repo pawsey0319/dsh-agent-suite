@@ -1489,6 +1489,40 @@ const ADAPTER_EVENT_TTL_MS = 2 * 60 * 60 * 1000
 const adapterEventFresh = (event, now) => event?.kind === 'done' || event?.kind === 'failed'
   || now - Number(event?.ts ?? 0) <= ADAPTER_EVENT_TTL_MS
 const ADAPTER_MAX_EVENTS = 200
+/**
+ * t53：running 的终态兜底。
+ *
+ * 用户报的是「codex 任务永远显示运行中」：rollout 末行明明已经是 `task_complete`，胶囊却一直是 running。
+ * 两个原因都在这层：①终止事件没被识别（只有 task_complete，没有 abort/failed）→ 已补；
+ * ②**已经结束的那一轮留下的 running 事件没人收回**——store 里 running 与 done 并存时，
+ * 折叠代表行按「更严重」取 running，于是永远运行中。所以这里对**所有** adapter 统一兜底：
+ * running 超过 10 分钟、且这 10 分钟它的数据源没有任何新增（progress 没更新），就落 failed。
+ *
+ * 判「有没有进程」优先用 `processAlive()`（有 codex CLI 在跑才配叫 running）；
+ * 进程已经没了但日志没写终态 → `process-exited`；进程还在但十分钟没动静 → `stale-no-progress`。
+ */
+const ADAPTER_STALE_RUNNING_MS = (() => {
+  // 默认 10 分钟；用例需要把窗口压到几百毫秒才能在一轮测试里看到降级（与其它 env 钩子同风格）。
+  const override = Number(process.env.DSH_TASK_RADAR_STALE_RUNNING_MS)
+  return Number.isFinite(override) && override > 0 ? override : 10 * 60 * 1000
+})()
+/** 每家 adapter 最近一次「数据源有新增」的时刻（poll 出了事件/撤回/新增字节都算）。 */
+const adapterProgressAt = new Map()
+
+/** 本机是否有匹配的命令行进程（只读 `ps`，不看 UI、不点任何东西）。 */
+function cliProcessAlive(pattern) {
+  if (process.env.DSH_TASK_RADAR_FAKE_PROC === '1') return true
+  if (process.env.DSH_TASK_RADAR_FAKE_PROC === '0') return false
+  try {
+    const listing = execFileSync('ps', ['-Ao', 'command'], { encoding: 'utf8', timeout: 2000 })
+    for (const line of listing.split('\n')) {
+      if (line.trim() === '') continue
+      if (line.includes('RadarHUD') || line.includes('dsh-task-radar')) continue
+      if (pattern.test(line)) return true
+    }
+  } catch {}
+  return false
+}
 /** 心跳（t39 P1）：超过这么久没有一次成功探测，就标 stale 而不是继续冒充 full/partial。 */
 const ADAPTER_STALE_MS = 90 * 1000
 /** 熔断（t39 P1）：连续 3 次失败后 60s 内不再探测，避免每 2s 打一次挂掉的家。 */
@@ -1546,6 +1580,8 @@ const adapterStore = new Map()
 const adapterHealth = new Map()
 /** 被 poll 主动撤回的事件条数（t52：question.replied / 过期要能收回提示）。 */
 let adapterRetracted = 0
+/** t53：被终态兜底降级的 running 条数（进 /x-radar/adapters 与日志统计）。 */
+let adapterSettled = 0
 /** 故障隔离自测注入：id -> 'throw' | 'timeout'（只由 /x-radar/adapter-inject 写入） */
 const adapterFault = new Map()
 /** 文件类 adapter 的读取偏移：path -> { offset, ino }，避免每 2s 重读整个日志 */
@@ -1851,6 +1887,9 @@ function normalizeAdapterEvent(descriptor, raw, options) {
     questionRef: typeof raw.questionRef === 'string' && raw.questionRef !== '' ? uslice(raw.questionRef, 80) : undefined,
     // 别家若给出了对应的 DSH 会话（例如从 DSH 派出去的任务），点击优先跳 DSH。
     dshSession: typeof raw.dshSession === 'string' && raw.dshSession !== '' ? uslice(raw.dshSession, 120) : undefined,
+    // t53：降级/终止原因（task-complete / task-failed / aborted / process-exited / stale-no-progress）。
+    // 它决定了行文案与日志，不能让所有失败都写成同一个 `adapter-failed`。
+    reason: typeof raw.reason === 'string' && raw.reason !== '' ? uslice(raw.reason, 40) : undefined,
     completeness,
     toastOnly: raw.toastOnly === true,
   }
@@ -1877,6 +1916,56 @@ function pushAdapterEvent(descriptor, event) {
     for (const [key] of ordered.slice(0, store.size - ADAPTER_MAX_EVENTS)) store.delete(key)
   }
   adapterStore.set(descriptor.id, store)
+}
+
+/**
+ * t53：把所有 adapter 的 running 事件做终态兜底。
+ *
+ * 规则（对 codex / dumate / workbuddy 一视同仁）：
+ *   - running 的 ts 距今 < 10 分钟 → 不动（真在跑）。
+ *   - 进程已退出（`processAlive()` 明确返回 false）→ failed，reason=process-exited，文案带「进程已退出」。
+ *   - 进程还在但数据源 10 分钟没新增 → failed，reason=stale-no-progress。
+ *   - 无法判进程（adapter 没实现 processAlive）→ 只看「有没有新进展」。
+ * 降级后打一行日志，便于 grep 复盘；返回降级条数。
+ */
+function adapterSettleStaleRunning(descriptor, now) {
+  const store = adapterStore.get(descriptor.id)
+  if (store === undefined || store.size === 0) return 0
+  let settled = 0
+  for (const [key, event] of [...store.entries()]) {
+    if (event.kind !== 'running') continue
+    const seenAt = Number(event.ts ?? 0)
+    if (!Number.isFinite(seenAt) || now - seenAt < ADAPTER_STALE_RUNNING_MS) continue
+    const alive = typeof descriptor.processAlive === 'function' ? descriptor.processAlive() : null
+    const progressAt = Math.max(adapterProgressAt.get(descriptor.id) ?? 0, seenAt)
+    const idleMs = now - progressAt
+    if (alive !== false && idleMs < ADAPTER_STALE_RUNNING_MS) continue
+    const reason = alive === false ? 'process-exited' : 'stale-no-progress'
+    // 窗口文案按实际窗口给单位（用例会把窗口压到几百毫秒，写「0 分钟」就成了误导）。
+    const windowText = ADAPTER_STALE_RUNNING_MS >= 60000
+      ? `${Math.round(ADAPTER_STALE_RUNNING_MS / 60000)} 分钟`
+      : `${Math.max(1, Math.round(ADAPTER_STALE_RUNNING_MS / 1000))} 秒`
+    const detail = alive === false
+      ? `进程已退出：${descriptor.label} 的 CLI 不在运行，且日志没有写终态`
+      : `超过 ${windowText}没有新增日志（stale-no-progress）`
+    store.delete(key)
+    const failedKey = `${event.dedupeKey}:settled:${reason}`
+    store.set(failedKey, {
+      ...event,
+      kind: 'failed',
+      eventKind: 'failed',
+      ts: now,
+      dedupeKey: failedKey,
+      reason,
+      detail,
+      // 行文案：把「正在运行」换成「没有完成」，别让用户看到「运行中 · 进程已退出」这种自相矛盾。
+      title: uslice(String(event.title ?? '').replace(/正在运行|正在跑/, '没有完成'), 160),
+    })
+    adapterSettled += 1
+    settled += 1
+    log(`adapter stale id=${descriptor.id} key=${uslice(key, 48)} reason=${reason} ageMin=${Math.round((now - seenAt) / 60000)} idleMin=${Math.round(idleMs / 60000)}`)
+  }
+  return settled
 }
 
 /** 从偏移处读新增内容（只读、不写、不改 mtime）。文件被轮转（变小/inode 变）时从头读。 */
@@ -2248,6 +2337,10 @@ registerAdapter({
   completeness: 'partial',
   channel: 'log-sse',
   note: '读取 opencode 事件日志（增量 tail）；busy/idle 判运行、question.* 判等回答',
+  // t53：DuMate 的日志由桌面端进程写；进程没了却还留着 busy 状态时，不能继续说「正在运行」。
+  processAlive() {
+    return cliProcessAlive(/DuMate|qianfan-desktop/i)
+  },
   probe() {
     const installed = existsSync(DUMATE_DIR)
     let running = false
@@ -2484,6 +2577,10 @@ registerAdapter({
   completeness: 'partial',
   channel: 'audit-log',
   note: '只读 audit-log；就地处置需要 --remote-debugging-port=9333 重启（本分支不做）',
+  // t53：WorkBuddy 的命令行/守护进程还在才算 running（心跳文件也可能停在旧时间）。
+  processAlive() {
+    return cliProcessAlive(/WorkBuddy|workbuddy/i)
+  },
   probe() {
     const installed = existsSync(WORKBUDDY_DIR)
     let running = false
@@ -2588,6 +2685,8 @@ function codexTurnState(path) {
   let started = null
   let completed = null
   let failed = null
+  // t53：把「这是哪种终止」带出去，日志与行文案据此区分 task-complete / aborted / task-failed。
+  let failedKind = ''
   for (const line of tail) {
     let record
     try {
@@ -2598,10 +2697,20 @@ function codexTurnState(path) {
     const type = String(record.type ?? '')
     const payload = record.payload ?? {}
     if (type === 'turn_context' && typeof payload.cwd === 'string') cwd = payload.cwd
+    // t53：codex 的终止事件不止 task_complete。真机里还见过 `turn_aborted`（用户 Esc）
+    // 与 `task_failed`（工具/网络失败），以及裸 `error` 记录。旧实现只认 task_complete →
+    // 「一轮已经结束」的 rollout 永远停在 running（用户看到的「codex 一直显示运行中」）。
     if (type === 'error') failed = String(payload.message ?? record.message ?? 'codex error')
+    if (type === 'turn_aborted') failed = String(payload.reason ?? payload.message ?? 'turn aborted')
+    if (type === 'task_failed') failed = String(payload.error ?? payload.message ?? 'task failed')
     if (type === 'event_msg') {
       const inner = String(payload.type ?? '')
       if (inner === 'task_started') started = { ts: eventTimeMs(payload.started_at_ms, payload.started_at, Date.now()), turn: String(payload.turn_id ?? '') }
+      if (inner === 'task_failed' || inner === 'turn_aborted') {
+        // 失败/中断同样带 turn_id 与时间：用它的 ts 判定，而不是拿 mtime 当发生时间。
+        failed = String(payload.error ?? payload.message ?? payload.reason ?? (inner === 'turn_aborted' ? 'turn aborted' : 'task failed'))
+        failedKind = inner
+      }
       if (inner === 'task_complete') {
         completed = {
           // R3-M1：`*_ms` 优先；秒级 `completed_at` 也要认（否则会退化成「现在」，把历史完成伪装成刚完成）。
@@ -2612,7 +2721,7 @@ function codexTurnState(path) {
       }
     }
   }
-  return { cwd, started, completed, failed }
+  return { cwd, started, completed, failed, failedKind }
 }
 
 registerAdapter({
@@ -2637,6 +2746,9 @@ registerAdapter({
   },
   poll() {
     const events = []
+    // t53：终态必须把同 thread 的 running 收回去。否则 store 里同时存在 running 与 done，
+    // 折叠后代表行按「更严重」取 running → 这一轮明明结束了，胶囊却永远显示运行中。
+    const retract = new Set()
     for (const dir of codexDayDirs()) {
       if (!existsSync(dir)) continue
       let names = []
@@ -2666,17 +2778,31 @@ registerAdapter({
         const label = state.cwd !== '' ? basename(state.cwd) : uslice(thread, 8)
         if (state.failed !== null) {
           const key = `codex:${thread}:failed`
+          retract.add(`codex:${thread}:running`)
           if (!codexSeen.has(key)) {
             rememberCodexSeen(key)
-            events.push({ kind: 'failed', title: `Codex 失败：${label}`, detail: uslice(state.failed, 400), sessionRef: thread, ts: info.mtimeMs, dedupeKey: key, completeness: 'partial' })
+            const why = state.failedKind === '' ? '' : `（${state.failedKind}）`
+            events.push({
+              kind: 'failed',
+              title: `Codex 失败：${label}${why}`,
+              detail: uslice(state.failed, 400),
+              sessionRef: thread,
+              ts: info.mtimeMs,
+              dedupeKey: key,
+              reason: state.failedKind === 'turn_aborted' ? 'aborted' : 'task-failed',
+              completeness: 'partial',
+            })
+            log(`codex terminal thread=${uslice(thread, 24)} kind=${state.failedKind === '' ? 'error' : state.failedKind} -> failed`)
           }
           continue
         }
         if (state.completed !== null) {
           const key = `codex:${thread}:done:${state.completed.ts}`
+          retract.add(`codex:${thread}:running`)
           if (!codexSeen.has(key)) {
             rememberCodexSeen(key)
-            events.push({ kind: 'done', title: `Codex 完成：${label}`, detail: uslice(state.completed.text, 300), sessionRef: thread, ts: state.completed.ts || info.mtimeMs, dedupeKey: key, completeness: 'partial' })
+            events.push({ kind: 'done', title: `Codex 完成：${label}`, detail: uslice(state.completed.text, 300), sessionRef: thread, ts: state.completed.ts || info.mtimeMs, dedupeKey: key, reason: 'task-complete', completeness: 'partial' })
+            log(`codex terminal thread=${uslice(thread, 24)} kind=task_complete -> done`)
           }
           continue
         }
@@ -2685,7 +2811,12 @@ registerAdapter({
         }
       }
     }
-    return events
+    return { events, retract: [...retract] }
+  },
+  // t53：只有真的还有 codex CLI 在跑才算 running。没有进程时上层会把 running 降级成
+  // failed(reason=process-exited) 并在文案里写「进程已退出」，绝不伪造运行中。
+  processAlive() {
+    return cliProcessAlive(/codex/i)
   },
 })
 
@@ -2758,6 +2889,9 @@ function adapterItem(event) {
     sessionRef: event.sessionRef,
     // t52：点击时要用它「复制问题 ID」；没有就是 undefined（不画空占位）。
     questionRef: event.questionRef,
+    // t53：终态原因（task-complete / task-failed / aborted / process-exited / stale-no-progress）。
+    // done 行也要带——「这条为什么算完成」同样需要可复盘。
+    reason: event.reason,
     dshSession: event.dshSession,
     updatedAt: event.ts,
   }
@@ -2795,7 +2929,7 @@ function adapterItem(event) {
     // 所以这里同时给两份：`detail` 是规范字段，`error` 是给 HUD 的兼容别名，不是第二套语义。
     // F9 + R3-H2：detail 是规范字段、error 是给 HUD 的兼容别名；两者都必须是**人话**。
     const readable = humanText(event.detail)
-    return { ...base, kind: 'run', status: 'failed', title: event.title, detail: readable, error: readable, reason: 'adapter-failed', dedupKey: `${id}#failed` }
+    return { ...base, kind: 'run', status: 'failed', title: event.title, detail: readable, error: readable, reason: event.reason ?? 'adapter-failed', dedupKey: `${id}#failed` }
   }
   if (event.kind === 'done') {
     // done 的 dedupKey 必须与 HUD 的 doneKey 同形：`<id>#<finishedAt 毫秒>`（HUD 用它判「这条提醒过没」）。
@@ -2825,6 +2959,8 @@ async function observeAdapter(descriptor, ctx, now) {
   // 熔断中：跳过探测，也不清空已有事件（隔离要求：计数不清零），只把状态说清楚。
   if (health.breakerUntil > now) {
     const brokenFor = Math.max(0, Math.round((health.breakerUntil - now) / 1000))
+    // t53：熔断期间更要兜底——探测都跑不动了，running 留着就是纯骗人。
+    adapterSettleStaleRunning(descriptor, now)
     pushLive()
     const broken = {
       id: descriptor.id,
@@ -2876,7 +3012,15 @@ async function observeAdapter(descriptor, ctx, now) {
         polled += 1
       }
       health.pollMs = Date.now() - pollStartedAt
+      // t53：只要这一轮真的读到了新东西（事件/撤回/新增字节），就算「数据源有进展」，
+      // 后面的 stale 兜底据此区分「真在跑」与「卡住/进程没了」。
+      const stats = typeof descriptor.stats === 'function' ? descriptor.stats() : null
+      const grew = polled > 0 || rawRetract.length > 0 || (stats !== null && Number(stats.lastBytes ?? 0) > 0)
+      if (grew) adapterProgressAt.set(descriptor.id, Date.now())
     }
+    // t53：poll 之后立刻兜底——用户要的是「这一轮结束了就别再显示运行中」，
+    // 不能等到下一轮（甚至等不到：适配器如果不再产事件，running 就永远挂着）。
+    adapterSettleStaleRunning(descriptor, now)
     health.ok = true
     health.error = null
     health.consecutiveFailures = 0
@@ -4431,6 +4575,8 @@ function radarRoute(ctx) {
         ok: true,
         adapters: health,
         partialKinds: adapterPartialKinds(),
+        // t53：运行中条目被终态兜底降级的累计条数（便于复盘「不再无限 running」）。
+        settled: adapterSettled,
         declared,
         declaredDir: ADAPTER_DECL_DIR,
         kinds: [...ADAPTER_CANON_KINDS],
