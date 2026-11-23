@@ -729,6 +729,8 @@ private struct RadarItem: Decodable {
     /// 如果这条 adapter 行其实对应一个 DSH 会话（例如从 DSH 里派出去的任务），
     /// 有它就优先按 DSH 会话跳转（t51 / JUMP-1 的第 ① 种情况）。
     var dshSession: String?
+    /// 别家的提问 ID（DuMate 的 `que_…`）：点击后复制给用户，方便去原应用里对号（t52）。
+    var questionRef: String?
     /// R3-H1：被折叠进这一行的同会话其它条目（含代表行自身，`folded.count == count`）。
     /// 没有它时，同会话 3 条待回答会被压成 1 行、另两条的正文与回执字段全部消失。
     var folded: [RadarItem]?
@@ -738,7 +740,7 @@ private struct RadarItem: Decodable {
         case verdict, round, missing, path, approvalToken, runId, formatStatus, stages, startedAt, finishedAt, stale, questions
         case answerRequest, answerToken, answerExpiresInMs
         case error, priority, count, pidAlive, runningBy, jobs, note
-        case completeness, jumpable, sessionRef, folded, dshSession
+        case completeness, jumpable, sessionRef, folded, dshSession, questionRef
         }
 
     init(from decoder: Decoder) throws {
@@ -777,6 +779,7 @@ private struct RadarItem: Decodable {
         completeness = try? c.decodeIfPresent(String.self, forKey: .completeness)
         jumpable = try? c.decodeIfPresent(Bool.self, forKey: .jumpable)
         dshSession = try? c.decodeIfPresent(String.self, forKey: .dshSession)
+        questionRef = try? c.decodeIfPresent(String.self, forKey: .questionRef)
         sessionRef = try? c.decodeIfPresent(String.self, forKey: .sessionRef)
         folded = try? c.decodeIfPresent([RadarItem].self, forKey: .folded)
         stages = try? c.decodeIfPresent([RadarStage].self, forKey: .stages)
@@ -7757,12 +7760,19 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                 if opened {
                     log("row activate kind=session target=\(agentLabel) result=ok via=open-agent status=\(status)")
                     if item.status == "done" { self.markSeen([itemId]) }
-                    _ = self.showBanner(title: L.f("toast.openedAgent", agentLabel), body: item.title ?? "", onClick: nil)
+                    // t52：把 sessionID / 问题 ID 复制到剪贴板——DuMate 的深链只能把 App 拉到前台，
+                    // 具体是哪条会话还得用户自己粘进去对号，所以「打开」必须配一份可粘贴的 ref。
+                    let refText = self.externalRefText(item)
+                    if !refText.isEmpty { self.copyToPasteboard(refText, logTag: "agent ref \(agentLabel)") }
+                    _ = self.showBanner(title: L.f("toast.openedAgent", agentLabel),
+                                        body: refText.isEmpty ? (item.title ?? "") : refText, onClick: nil)
                 } else {
                     let reason = error?.localizedDescription ?? "status=\(status)"
                     log("row activate kind=session target=\(agentLabel) result=unsupported via=open-agent \(reason)")
+                    let refText = self.externalRefText(item)
+                    if !refText.isEmpty { self.copyToPasteboard(refText, logTag: "agent ref \(agentLabel)") }
                     _ = self.showBanner(title: L.f("toast.externalNoApp", agentLabel),
-                                        body: item.title ?? "", onClick: nil)
+                                        body: refText.isEmpty ? (item.title ?? "") : refText, onClick: nil)
                     if !itemId.isEmpty { self.openDetail(itemId) }
                 }
             }
@@ -7837,6 +7847,21 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     /// 失败页「复制错误」：完整错误进剪贴板（面板里只显示截断版）。
+    /// 别家行要复制的定位串：`sessionRef` + 可选 `questionRef`（t52）。
+    private func externalRefText(_ item: RadarItem) -> String {
+        var parts: [String] = []
+        if let ref = item.sessionRef, !ref.isEmpty { parts.append(ref) }
+        if let question = item.questionRef, !question.isEmpty { parts.append(question) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func copyToPasteboard(_ text: String, logTag: String) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+        log("copy \(logTag) chars=\(text.count)")
+    }
+
     private func copyErrorToPasteboard() {
         guard let detail else { return }
         let text = detail.body.isEmpty ? (state.items.first { $0.id == detail.runId }?.error ?? "") : detail.body

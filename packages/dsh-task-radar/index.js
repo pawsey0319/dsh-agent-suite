@@ -1544,6 +1544,8 @@ const adapterRegistry = new Map()
 const adapterStore = new Map()
 /** id -> { ok, error, at, probeMs, pollMs, rejected }：数据源条与排障用 */
 const adapterHealth = new Map()
+/** 被 poll 主动撤回的事件条数（t52：question.replied / 过期要能收回提示）。 */
+let adapterRetracted = 0
 /** 故障隔离自测注入：id -> 'throw' | 'timeout'（只由 /x-radar/adapter-inject 写入） */
 const adapterFault = new Map()
 /** 文件类 adapter 的读取偏移：path -> { offset, ino }，避免每 2s 重读整个日志 */
@@ -1845,6 +1847,10 @@ function normalizeAdapterEvent(descriptor, raw, options) {
     answerRequest: typeof raw.answerRequest === 'string' && raw.answerRequest !== '' ? uslice(raw.answerRequest, 80) : undefined,
     answerToken: typeof raw.answerToken === 'string' && raw.answerToken !== '' ? uslice(raw.answerToken, 80) : undefined,
     approvalId: typeof raw.approvalId === 'string' && raw.approvalId !== '' ? uslice(raw.approvalId, 120) : undefined,
+    // t52：DuMate 的 question ID（que_…）——HUD 用它做「复制问题 ID」与排障关联。
+    questionRef: typeof raw.questionRef === 'string' && raw.questionRef !== '' ? uslice(raw.questionRef, 80) : undefined,
+    // 别家若给出了对应的 DSH 会话（例如从 DSH 派出去的任务），点击优先跳 DSH。
+    dshSession: typeof raw.dshSession === 'string' && raw.dshSession !== '' ? uslice(raw.dshSession, 120) : undefined,
     completeness,
     toastOnly: raw.toastOnly === true,
   }
@@ -2173,12 +2179,41 @@ function claudeAccept(url) {
   return result
 }
 
-// ── DuMate / 百度搭子（内嵌 opencode 的 SSE 日志镜像，只读，partial）──────────
-const DUMATE_EVENT_LOG = join(homedir(), 'Library', 'Application Support', 'qianfan-desktop-app', 'log', 'desktop-main', 'AgtEvent.log')
+// ── DuMate / 百度搭子（内嵌 opencode 的事件日志镜像，只读，partial）──────────
+//
+// 事实来源（t52）：`~/Library/Application Support/qianfan-desktop-app/log/desktop-main/AgtEvent.log`。
+// 每行都带 shell 前缀，**必须先剥掉再解析**：
+//   `2026-11-23T17:07:12.345\tDEBUG\t\t[AgtEvent]\t-         \tevent: {"type":...}`
+// 实测事件（9.2MB 日志）：message.part.delta / message.part.updated / message.updated /
+// session.status(273) / session.updated(221) / session.turn.completed(23) / session.idle(23) /
+// question.asked(2) / question.replied(2) / question.deadline.updated(7)。
+// 四态映射：session.status.status.type=busy → running；idle 或 turn.completed → done；
+// question.asked → needs-input（replied / deadline 过期 → 收回）；error/exception/abort → failed。
+const DUMATE_EVENT_LOG = process.env.DSH_TASK_RADAR_DUMATE_LOG !== undefined && process.env.DSH_TASK_RADAR_DUMATE_LOG !== ''
+  ? process.env.DSH_TASK_RADAR_DUMATE_LOG
+  : join(homedir(), 'Library', 'Application Support', 'qianfan-desktop-app', 'log', 'desktop-main', 'AgtEvent.log')
 const DUMATE_DIR = join(homedir(), 'Library', 'Application Support', 'qianfan-desktop-app')
-/** sessionId -> { kind, title, ts, dedupeKey } */
-const dumateLive = new Map()
+const DUMATE_TAIL_BYTES = 256 * 1024
+const DUMATE_SESSION_TTL_MS = 6 * 60 * 60 * 1000
+const DUMATE_QUESTION_TTL_MS = 10 * 60 * 1000
+const DUMATE_TERMINAL_MS = 30 * 60 * 1000
+/** sessionId -> { sid, title, directory, status, since, at, idleAt, question, pendingDone, failed, doneTurn } */
+const dumateSessions = new Map()
 const dumateSeen = new Set()
+const dumateQuestionKeys = new Map()
+const dumateStats = { bytes: 0, lines: 0, emitted: 0, pollMs: 0, lastBytes: 0, retracted: 0, sessions: 0 }
+
+function dumateState(sid) {
+  let state = dumateSessions.get(sid)
+  if (state === undefined) {
+    state = {
+      sid, title: '', directory: '', status: 'unknown',
+      since: 0, at: 0, idleAt: 0, question: null, pendingDone: null, failed: null, doneTurn: null,
+    }
+    dumateSessions.set(sid, state)
+  }
+  return state
+}
 
 /** 日志行形如：`2026-11-23T11:01:18.820\tDEBUG\t\t[AgtEvent]\t-\t \tevent: {json}` */
 function parseDumateLine(line) {
@@ -2199,57 +2234,236 @@ function parseDumateLine(line) {
   return { event: parsed, ts }
 }
 
+function dumateNoteOf(question) {
+  const header = String(question?.header ?? '').trim()
+  if (header !== '') return uslice(redactSecrets(header), 80)
+  const text = String(question?.question ?? '').trim().split('\n')[0]
+  return uslice(redactSecrets(text), 80) || 'DuMate 在等你回答'
+}
+
 registerAdapter({
   id: 'dumate',
   label: 'DUMATE',
+  stats() { return { ...dumateStats } },
   completeness: 'partial',
   channel: 'log-sse',
-  note: 'opencode 私有事件日志；只有 turn 级状态，无「等回答」语义担保',
+  note: '读取 opencode 事件日志（增量 tail）；busy/idle 判运行、question.* 判等回答',
   probe() {
     const installed = existsSync(DUMATE_DIR)
     let running = false
+    let ageMs = null
     try {
-      running = statSync(DUMATE_EVENT_LOG).mtimeMs > Date.now() - 5 * 60 * 1000
+      const info = statSync(DUMATE_EVENT_LOG)
+      ageMs = Date.now() - info.mtimeMs
+      running = ageMs < 5 * 60 * 1000
     } catch {}
-    return { installed, running, completeness: installed ? 'partial' : 'unsupported', note: installed ? undefined : '未检测到 qianfan-desktop-app' }
+    return {
+      installed,
+      running,
+      completeness: installed ? 'partial' : 'unsupported',
+      note: installed ? (ageMs === null ? '日志不可读' : `日志 ${Math.round(ageMs / 1000)}s 前更新`) : '未检测到 qianfan-desktop-app',
+    }
   },
   poll() {
-    const text = readAppendedText(DUMATE_EVENT_LOG, 256 * 1024)
-    if (text === '') return []
-    const events = []
-    for (const line of text.split('\n')) {
-      const wrapped = parseDumateLine(line)
-      if (wrapped === null) continue
-      const parsed = wrapped.event
-      const ts = wrapped.ts
-      const type = String(parsed.type ?? '')
-      const props = parsed.properties ?? {}
-      const sid = String(props.sessionID ?? props.sessionId ?? '')
-      if (sid === '') continue
-      if (type === 'session.permission.asked' || type === 'session.permission.updated') {
-        // 有权限询问就一定能处置吗？不确定 → 标 partial、给「去 DuMate 处理」。
-        const key = `dumate:${sid}:approval:${props.permissionID ?? props.id ?? ''}`
-        if (dumateSeen.has(key)) continue
-        dumateSeen.add(key)
-        events.push({ kind: 'needs-approval', title: 'DuMate 在等批准', detail: uslice(String(props.title ?? props.permission ?? ''), 200), sessionRef: sid, ts, dedupeKey: key, completeness: 'partial' })
-      } else if (type === 'session.turn.completed') {
-        const key = `dumate:${sid}:done:${props.turnID ?? props.turnId ?? ''}`
-        if (dumateSeen.has(key)) continue
-        dumateSeen.add(key)
-        events.push({ kind: 'done', title: 'DuMate 任务完成', detail: uslice(String(props.title ?? ''), 200), sessionRef: sid, ts, dedupeKey: key + ':' + ts, completeness: 'partial' })
-      } else if (type === 'session.status') {
-        const status = String(props.status ?? '')
-        if (status === 'busy' || status === 'running') {
-          dumateLive.set(sid, { kind: 'running', ts, title: 'DuMate 正在运行', dedupeKey: `dumate:${sid}:running` })
-        } else if (status === 'idle') {
-          dumateLive.delete(sid)
+    const startedAt = Date.now()
+    const text = readAppendedText(DUMATE_EVENT_LOG, DUMATE_TAIL_BYTES)
+    const bytes = text === '' ? 0 : Buffer.byteLength(text, 'utf8')
+    dumateStats.lastBytes = bytes
+    dumateStats.pollMs = 0
+    const now = Date.now()
+    const retract = new Set()
+    if (text !== '') {
+      dumateStats.bytes += bytes
+      for (const line of text.split('\n')) {
+        const wrapped = parseDumateLine(line)
+        if (wrapped === null) continue
+        dumateStats.lines += 1
+        const parsed = wrapped.event
+        const ts = wrapped.ts
+        const type = String(parsed.type ?? '')
+        const props = parsed.properties ?? {}
+        const sid = String(props.sessionID ?? props.sessionId ?? props.info?.id ?? '')
+        if (sid === '') continue
+        const state = dumateState(sid)
+        state.at = Math.max(state.at, ts)
+
+        if (type === 'session.updated') {
+          const info = props.info ?? {}
+          if (typeof info.title === 'string' && info.title.trim() !== '') state.title = uslice(redactSecrets(info.title.trim()), 80)
+          if (typeof info.directory === 'string') state.directory = info.directory
+          continue
+        }
+        if (type === 'session.status') {
+          // 真实形状是 `status: { type: 'busy' | 'idle' }`（不是字符串）——旧实现读成
+          // `String(props.status)` 得到 `[object Object]`，于是 running 永远判不出来。
+          const status = props.status !== null && typeof props.status === 'object'
+            ? String(props.status.type ?? '')
+            : String(props.status ?? '')
+          if (status === 'busy' || status === 'running') {
+            if (state.status !== 'busy') state.since = ts
+            state.status = 'busy'
+            state.idleAt = 0
+            state.failed = null
+          } else if (status === 'idle') {
+            state.status = 'idle'
+            state.idleAt = Math.max(state.idleAt, ts)
+          }
+          continue
+        }
+        if (type === 'session.idle') {
+          state.status = 'idle'
+          state.idleAt = Math.max(state.idleAt, ts)
+          continue
+        }
+        if (type === 'session.turn.completed') {
+          const status = String(props.status ?? 'completed').toLowerCase()
+          const requestID = String(props.requestID ?? '')
+          if (status === 'completed' || status === 'success' || status === 'ok') {
+            state.doneTurn = { requestID, ts }
+          } else {
+            // status 是机器码（error/failed/abort…），别直接拼进标题（会得到「失败：error：」）。
+            state.failed = { ts, message: '这一轮没有完成', reason: uslice(redactSecrets(status), 40) }
+          }
+          continue
+        }
+        if (type === 'question.asked') {
+          state.question = {
+            id: String(props.id ?? ''),
+            questions: Array.isArray(props.questions) ? props.questions : [],
+            askedAt: ts,
+            deadlineAt: 0,
+          }
+          continue
+        }
+        if (type === 'question.replied') {
+          const requestID = String(props.requestID ?? '')
+          if (state.question !== null && (requestID === '' || state.question.id === requestID)) {
+            state.question = null
+          }
+          continue
+        }
+        if (type === 'question.deadline.updated') {
+          const requestID = String(props.requestID ?? '')
+          const deadlineAt = Number(props.deadlineAt)
+          if (state.question !== null && (requestID === '' || state.question.id === requestID)) {
+            if (Number.isFinite(deadlineAt) && deadlineAt > 0) state.question.deadlineAt = deadlineAt
+          }
+          continue
+        }
+        if (/(error|exception|failed|abort|rejected)/i.test(type)) {
+          const message = props.message ?? props.error ?? props.detail ?? props.reason ?? '这一轮没有完成'
+          state.failed = { ts, message: uslice(redactSecrets(String(message)), 160), reason: uslice(type, 40) }
+          continue
         }
       }
     }
-    for (const [sid, live] of dumateLive) {
-      events.push({ kind: 'running', title: live.title, sessionRef: sid, ts: live.ts, dedupeKey: live.dedupeKey, completeness: 'partial' })
+
+    const events = []
+    for (const state of [...dumateSessions.values()]) {
+      if (now - state.at > DUMATE_SESSION_TTL_MS) {
+        dumateSessions.delete(state.sid)
+        continue
+      }
+      const sid = state.sid
+      const suffix = state.title === '' ? '' : `：${state.title}`
+      // ① 等回答：一个问题一条事件（同会话折叠后展开就是逐题）
+      if (state.question !== null) {
+        const question = state.question
+        const expiredByDeadline = question.deadlineAt > 0 && now > question.deadlineAt
+        const expiredByTtl = question.deadlineAt === 0 && now - question.askedAt > DUMATE_QUESTION_TTL_MS
+        if (expiredByDeadline || expiredByTtl) {
+          for (const key of dumateQuestionKeys.get(sid) ?? []) retract.add(key)
+          dumateQuestionKeys.set(sid, [])
+          state.question = null
+        } else {
+          const keys = []
+          question.questions.forEach((ask, index) => {
+            const qid = question.id === '' ? `${sid}:${index}` : question.id
+            const key = `${sid}:question:${qid}:${index}`
+            keys.push(key)
+            const already = dumateSeen.has(key)
+            if (already) return
+            dumateSeen.add(key)
+            const options = Array.isArray(ask?.options)
+              ? ask.options.slice(0, 8).map((option) => uslice(redactSecrets(String(option?.label ?? option ?? '')), 60)).filter((label) => label !== '')
+              : []
+            events.push({
+              kind: 'needs-input',
+              title: `${dumateNoteOf(ask)}${suffix}`,
+              detail: uslice(redactSecrets(String(ask?.question ?? '')), 600),
+              options: options.length > 0 ? options : undefined,
+              sessionRef: sid,
+              questionRef: qid,
+              ts: question.askedAt,
+              dedupeKey: key,
+              completeness: 'partial',
+            })
+          })
+          dumateQuestionKeys.set(sid, keys)
+        }
+      } else if (dumateQuestionKeys.has(sid)) {
+        for (const key of dumateQuestionKeys.get(sid) ?? []) retract.add(key)
+        dumateQuestionKeys.delete(sid)
+      }
+      // ② 运行中：busy 期间一直有一条 running（同 key 覆盖，不刷屏）
+      if (state.status === 'busy') {
+        events.push({
+          kind: 'running',
+          title: `DuMate 正在运行${suffix}`,
+          sessionRef: sid,
+          ts: state.since > 0 ? state.since : state.at,
+          dedupeKey: `${sid}:running`,
+          completeness: 'partial',
+        })
+        continue
+      }
+      // ③ 失败：错误事件/非 completed 的 turn
+      // 失败优先：turn.completed 的 status 不是 completed 就已经定性了这一轮；
+      // 紧随其后的 session.idle 只是「不再忙」，不能把失败翻成完成（t52 实测翻车点）。
+      if (state.failed !== null) {
+        const key = `${sid}:failed:${Math.round(state.failed.ts / 1000)}`
+        if (!dumateSeen.has(key)) {
+          dumateSeen.add(key)
+          retract.add(`${sid}:running`)
+          events.push({
+            kind: 'failed',
+            title: `DuMate 任务失败：${state.failed.message}${suffix}`,
+            detail: state.failed.reason === undefined ? state.failed.message : `${state.failed.message}（${state.failed.reason}）`,
+            sessionRef: sid,
+            ts: state.failed.ts,
+            dedupeKey: key,
+            completeness: 'partial',
+          })
+        }
+        continue
+      }
+      // ④ 完成：idle（或 turn.completed 且已 idle）后一条 done
+      const idleAt = state.idleAt > 0 ? state.idleAt : (state.doneTurn !== null ? state.doneTurn.ts : 0)
+      if (idleAt > 0 && now - idleAt <= DUMATE_TERMINAL_MS) {
+        const requestID = state.doneTurn !== null ? state.doneTurn.requestID : ''
+        const key = `${sid}:done:${requestID === '' ? Math.round(idleAt / 1000) : requestID}`
+        if (!dumateSeen.has(key)) {
+          dumateSeen.add(key)
+          retract.add(`${sid}:running`)
+          events.push({
+            kind: 'done',
+            title: `DuMate 任务完成${suffix}`,
+            sessionRef: sid,
+            ts: idleAt,
+            dedupeKey: key,
+            completeness: 'partial',
+          })
+        }
+      }
     }
-    return events
+    dumateStats.sessions = dumateSessions.size
+    dumateStats.emitted += events.length
+    dumateStats.retracted += retract.size
+    dumateStats.pollMs = Date.now() - startedAt
+    if (bytes > 0 || retract.size > 0) {
+      log(`dumate poll bytes=${bytes} lines=${dumateStats.lines} live=${events.length} retract=${retract.size} sessions=${dumateSessions.size} ms=${dumateStats.pollMs}`)
+    }
+    return { events, retract: [...retract] }
   },
 })
 
@@ -2542,6 +2756,9 @@ function adapterItem(event) {
     // 别家的会话不能按 DSH 的 sessionId 跳转：HUD 据此把「跳到会话」换成「看详情」。
     jumpable: false,
     sessionRef: event.sessionRef,
+    // t52：点击时要用它「复制问题 ID」；没有就是 undefined（不画空占位）。
+    questionRef: event.questionRef,
+    dshSession: event.dshSession,
     updatedAt: event.ts,
   }
   if (event.kind === 'needs-input') {
@@ -2641,7 +2858,18 @@ async function observeAdapter(descriptor, ctx, now) {
     if (descriptor.poll !== undefined && (probe.installed === true || storeHasEvents)) {
       const pollStartedAt = Date.now()
       const raw = (await guardedAdapterCall(descriptor.id, 'poll', () => descriptor.poll(ctx, now))) ?? []
-      for (const candidate of raw) {
+      // t52：poll 可以回 `{ events, retract }` —— 有的源（DuMate 的 question.*）需要「撤回」：
+      // 问题答完了/过期了，之前推上去的那条 needs-input 必须能被收回，否则会一直挂在胶囊上。
+      const rawEvents = Array.isArray(raw) ? raw : (Array.isArray(raw.events) ? raw.events : [])
+      const rawRetract = Array.isArray(raw) || raw === null || typeof raw !== 'object' ? [] : (Array.isArray(raw.retract) ? raw.retract : [])
+      for (const key of rawRetract) {
+        if (typeof key !== 'string' || key === '') continue
+        if (store.delete(key)) {
+          adapterRetracted += 1
+          log(`adapter retract id=${descriptor.id} key=${uslice(key, 48)}`)
+        }
+      }
+      for (const candidate of rawEvents) {
         const event = normalizeAdapterEvent(descriptor, candidate)
         if (event === null) continue
         pushAdapterEvent(descriptor, event)
@@ -2881,6 +3109,9 @@ function adapterSnapshot() {
       channel: descriptor.channel,
       completeness,
       declared,
+      // t52：声明式/日志型 adapter 可以暴露自己的取数统计（增量读了多少字节、耗时多少），
+      // 供 `/x-radar/adapters` 与用例验证「不是每次重读全文件」。
+      stats: typeof descriptor.stats === 'function' ? descriptor.stats() : undefined,
       toastOnly: descriptor.capabilities?.toastOnly === true,
       // 能力声明（P0-3）：UI 只承诺 answer:true 的家能就地处置。
       capabilities: descriptor.capabilities ?? { observe: true, answer: false, toastOnly: false },
@@ -4140,7 +4371,20 @@ function radarRoute(ctx) {
       const dryRun = process.env.DSH_TASK_RADAR_NO_OPEN === '1'
       let opened = false
       let app = null
-      for (const name of dryRun ? [] : candidates) {
+      // t52：DuMate 自带 URL scheme `dumate://`（Info.plist CFBundleURLSchemes=[dumate]）。
+      // 先试深链（能把 DuMate 拉到前台、带上会话上下文），失败再退回 open -a。
+      const OPEN_AGENT_DEEP_LINKS = {
+        dumate: (value) => (value === '' ? 'dumate://' : `dumate://session/${encodeURIComponent(value)}`),
+      }
+      const deepLink = OPEN_AGENT_DEEP_LINKS[agent]
+      if (!dryRun && deepLink !== undefined) {
+        try {
+          execFileSync('open', [deepLink(ref)], { timeout: 2000, stdio: 'ignore' })
+          opened = true
+          app = 'deep-link'
+        } catch {}
+      }
+      for (const name of dryRun || opened ? [] : candidates) {
         try {
           execFileSync('open', ['-a', name], { timeout: 2000, stdio: 'ignore' })
           opened = true

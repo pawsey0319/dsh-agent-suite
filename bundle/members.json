@@ -1,8 +1,8 @@
 {
   "manifestVersion": 1,
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.9.9",
-  "generatedAt": "2026-11-23T07:12:48Z",
+  "version": "0.9.10",
+  "generatedAt": "2026-11-23T09:32:05Z",
   "platform": {
     "os": [
       "darwin"
