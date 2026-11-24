@@ -1488,6 +1488,14 @@ const ADAPTER_EVENT_TTL_MS = 2 * 60 * 60 * 1000
 // 按 TTL 过滤会把「这条跑完了」整条吃掉（复审实测 now−3h 被丢）。入库、出库都走这一个判断。
 const adapterEventFresh = (event, now) => event?.kind === 'done' || event?.kind === 'failed'
   || now - Number(event?.ts ?? 0) <= ADAPTER_EVENT_TTL_MS
+// 用户口径（2026-11-24）：外部 agent 的「已完成」行只占 3 小时，之后不再出现在列表里（不删账本，
+// 手动「清除已完成」照旧可清）。以前终态免疫全部 TTL，导致 34 小时前的自测 run 还占着胶囊。
+const ADAPTER_DONE_DISPLAY_MS = Math.max(1, Number(process.env.DSH_TASK_RADAR_DONE_HOURS ?? 3)) * 60 * 60 * 1000
+const adapterEventVisible = (event, now) => {
+  if (!adapterEventFresh(event, now)) return false
+  if (event?.kind !== 'done' && event?.kind !== 'failed') return true
+  return now - Number(event?.ts ?? 0) <= ADAPTER_DONE_DISPLAY_MS
+}
 const ADAPTER_MAX_EVENTS = 200
 /**
  * t53：running 的终态兜底。
@@ -3273,7 +3281,8 @@ async function adapterFeed(ctx) {
     statuses.push(budgetStatus)
     const store = adapterStore.get(entry.descriptor.id) ?? new Map()
     for (const event of store.values()) {
-      if (adapterEventFresh(event, now)) items.push(adapterItem(event))
+      // 可见性 = 新鲜度 + 终态 3 小时保留窗（账本不删，只是不再占列表）。
+      if (adapterEventVisible(event, now)) items.push(adapterItem(event))
     }
   }
   if (budgetHit) log(`adapter feed budget hit ms=${ADAPTER_FEED_BUDGET_MS} adapters=${descriptors.length}`)
