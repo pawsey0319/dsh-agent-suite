@@ -1866,9 +1866,17 @@ export function apply(ctx) {
     const parts = path.split('/').filter(Boolean)
     const method = request.method ?? 'GET'
 
-    // 0.9.16：市场收录复核指出 webServer 路由没做浏览器来源拦截，0.2.2 及以下宿主里网页可直接访问。
-    // 本机宿主没有 ctx.connection.requestRejection，所以入口只认浏览器必带的 `Sec-Fetch-Site`：
-    // 跨站/同站一律 403；命令行、CLI 与插件内部调用不带该头，行为不变。读接口也拦（run 结果同样敏感）。
+    // 0.9.17：市场收录复核指出 webServer 路由没做浏览器来源拦截，0.2.2 及以下宿主里网页可直读。
+    // 不直接调 ctx.connection.requestRejection() 的原因见 plugins/dsh-task-radar 同段注释：
+    // 它含 browserAuth 会话认证，会把没有浏览器 Cookie 的 CLI / 内部调用判成 401。
+    // 这里复刻围栏的两条：Host 必须回环（防 DNS rebinding）、`Sec-Fetch-Site` 跨站/同站一律拒。
+    const hostHeader = String(request?.headers?.get?.('host') ?? '')
+    const hostName = hostHeader.replace(/^\[/, '').split(']')[0].split(':')[0].toLowerCase()
+    // 没有 Host 的请求只可能来自进程内调用（浏览器与 curl 必带 Host），放过；带了就必须是回环。
+    if (hostHeader !== '' && !(hostName === '127.0.0.1' || hostName === 'localhost' || hostName === '::1')) {
+      log(`route guard path=${uslice(path, 40)} host=${uslice(hostHeader, 40)} -> 403`)
+      return json(response, 403, { ok: false, error: 'cross_origin_rejected', code: 'cross_origin_rejected', detail: `Host 不是回环地址：${uslice(hostHeader, 60)}` })
+    }
     const fetchSite = String(request?.headers?.get?.('sec-fetch-site') ?? '').toLowerCase()
     if (fetchSite === 'cross-site' || fetchSite === 'same-site') {
       log(`route guard path=${uslice(path, 40)} sec-fetch-site=${fetchSite} -> 403`)

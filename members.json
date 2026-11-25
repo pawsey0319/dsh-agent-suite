@@ -1,8 +1,8 @@
 {
   "manifestVersion": 1,
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.9.16",
-  "generatedAt": "2026-11-25T08:16:58Z",
+  "version": "0.9.17",
+  "generatedAt": "2026-11-25T08:38:30Z",
   "platform": {
     "os": [
       "darwin"
@@ -28,7 +28,7 @@
     {
       "label": "bridge",
       "name": "@local/dsh-agent-bridge",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "description": "把 Codex（app-server）作为外部 run 接入 DSH：结构化事件原样落盘 + HTTP/SSE 事件出口 + 审批队列（DSH one-console P1）",
       "package": "lib/bridge/package.json",
       "entry": "lib/bridge/index.js",
@@ -58,7 +58,7 @@
     {
       "label": "radar",
       "name": "@local/dsh-task-radar",
-      "version": "0.7.3",
+      "version": "0.7.4",
       "description": "桌面任务雷达：跨会话汇总运行中任务的小圆圈 HUD（悬停展开、双击跳转、待批准红色脉冲 + 面板内直接批准/拒绝、点会话行跳回 DSH）",
       "package": "lib/radar/package.json",
       "entry": "lib/radar/index.js",

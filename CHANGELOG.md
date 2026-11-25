@@ -2,6 +2,19 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.17 — 2026-11-25
+
+**成员版本**：`dsh-task-radar` 0.7.4、`dsh-agent-bridge` 0.5.2。
+
+### 安全加固补完：Host 围栏（防 DNS rebinding）
+
+0.9.16 只拦了 `Sec-Fetch-Site`。但 DNS rebinding 场景下浏览器会把攻击者域名解析到 127.0.0.1，此时 `Sec-Fetch-Site` 是 `same-origin`、挡不住（请求的 Host 是 `evil.com`）。
+
+- 两个插件在路由入口加 Host 围栏：**带了 Host 就必须是回环地址**（`127.0.0.1` / `localhost` / `::1`），否则 403 `cross_origin_rejected`；没有 Host 的请求只可能来自进程内调用（浏览器和 curl 必带 Host），放过。
+- 为什么不直接调 `ctx.connection.requestRejection()`：它在 0.2.2-rc.5 里**是存在的**（asar 里 16 处、含 TS 声明），但内部是「Host/Origin 围栏 + browserAuth 会话认证」，CLI 的 curl 与 HUD 的 URLSession 没有浏览器 Cookie，会被判 401，把胶囊和 CLI 一起打死；所以这里只复刻围栏两条判定（Host 回环 + `Sec-Fetch-Site`），认证层留给宿主。
+
+**自检**：83 → 84 条（新增 SEC-3）。
+
 ## 0.9.16 — 2026-11-25
 
 **成员版本**：`dsh-task-radar` 0.7.3、`dsh-agent-bridge` 0.5.1。
