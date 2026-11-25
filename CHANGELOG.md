@@ -2,6 +2,20 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.16 — 2026-11-25
+
+**成员版本**：`dsh-task-radar` 0.7.3、`dsh-agent-bridge` 0.5.1。
+
+### 安全加固（市场收录复核意见）
+
+awesome-dsh-plugin 维护者合并时按 main 上的实际代码补了一句：`webServer.register` 注册的路由没调用 `ctx.connection.requestRejection(req)`，也没用 `engines.dsh >= 0.2.3` 限定在默认鉴权的宿主上，所以 0.2.2 及以下宿主的浏览器页面能直接访问。
+
+- 本机宿主是 **0.2.2-rc.5**，没有 `ctx.connection.requestRejection`，也不能加 `engines.dsh >= 0.2.3`（会把自己挡在门外），所以两个插件都在路由入口自己拦：只认浏览器必带的 `Sec-Fetch-Site`，`cross-site` / `same-site` 一律 403 `cross_origin_rejected`。
+- 读接口也拦（会话标题、run 结果和写入一样敏感）；命令行、CLI、HUD 的 URLSession 不带该头，行为不变。
+- 实测：无头 `GET /x-radar/radar` → 200；带 `Sec-Fetch-Site: cross-site` → 403，日志 `route guard tail=radar sec-fetch-site=cross-site -> 403`。
+
+**自检**：81 → 83 条（新增 SEC-1/2 两条静态守卫）。
+
 ## 0.9.15 — 2026-11-25
 
 **成员版本**：`dsh-task-radar` 0.7.2（其余成员随包不变）。
