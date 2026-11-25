@@ -2,6 +2,17 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.15 — 2026-11-25
+
+**成员版本**：`dsh-task-radar` 0.7.2（其余成员随包不变）。
+
+### 胶囊（dsh-task-radar 0.7.2）
+
+- **codex「失败清不掉」的根因修复**：`normalizeAdapterEvent()` 入库前会削掉 `codex:` 前缀（store 键是 `<thread>:running`），而 codex 的 retract 一直写 `codex:<thread>:running` → `store.delete()` 永远 false 且**失败不打日志**；「先 poll 到 task_started、后 poll 到 task_complete」的时序（几乎必然）就留下幽灵 running，10 分钟后被 settle 改写成 `failed(stale-no-progress)`。现在 retract 消费端按同一套前缀规则归一化，未命中也会打 `adapter retract miss`。
+- **settle 兜底**：改写 failed 之前先看同会话是否已有 `ts >= running.ts` 的 done/failed，有就静默收回（`reason=superseded`）；带时间比较，所以 DuMate 同会话开新一轮的 running 不会被误删。
+
+**自检**：`node docs/verify/t43-repro/t43-checks.mjs` → 81/81（新增 RET-1/2/3 三条静态守卫）。
+
 ## 0.9.14 — 2026-11-25
 
 **成员版本**：`dsh-task-radar` 0.7.1（其余成员随包不变）。
