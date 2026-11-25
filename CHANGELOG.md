@@ -2,6 +2,17 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.14 — 2026-11-25
+
+**成员版本**：`dsh-task-radar` 0.7.1（其余成员随包不变）。
+
+### 胶囊（dsh-task-radar 0.7.1）
+
+- **只剩失败行时也能清**：清除按钮以前只在 `doneUnread > 0` 时出现，用户看到「codex 运行失败一直挂着」却没有入口；现在 `doneUnread > 0 || failed > 0` 都画按钮，文案按内容切换（`panel.clearDone` / `panel.clearFailed` / `panel.clearEnded`，zh/en 两份 locale 同步）。
+- **`GET /x-radar/clear-done` 顺带清失败行**：把 adapter 失败行写进 `hidden-runs.json` + `hidden-sessions.json`（与单行「清掉这条」同一账本），响应新增 `failed=N`，日志 `panel clear-done … failed=N` 可复核；实测老实现对该场景返回 `cleared=0` 且行不消失。
+
+**自检**：`node docs/verify/t43-repro/t43-checks.mjs` → 78/78；`bash native/build.sh` 重建 HUD（`e9317c7212e5`）。
+
 ## 0.9.0 — 2026-11-19
 
 **成员版本**：`dsh-task-radar` 0.6.13、`dsh-agent-bridge` 0.6.2、`dsh-judge` / `dsh-office-artifacts` 随整合包发布。

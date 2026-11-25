@@ -257,5 +257,9 @@
     "detail": "docs/DETAIL.md",
     "title": "任务雷达"
   },
-  "name": "任务雷达"
+  "name": "任务雷达",
+  "panel": {
+    "panel.clearEnded": "清除已结束",
+    "panel.clearFailed": "清除失败"
+  }
 }

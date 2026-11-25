@@ -257,5 +257,9 @@
     "detail": "docs/DETAIL.md",
     "title": "Task radar"
   },
-  "name": "Task Radar"
+  "name": "Task Radar",
+  "panel": {
+    "panel.clearEnded": "Clear ended",
+    "panel.clearFailed": "Clear failed"
+  }
 }

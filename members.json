@@ -1,8 +1,8 @@
 {
   "manifestVersion": 1,
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.9.13",
-  "generatedAt": "2026-11-24T07:06:50Z",
+  "version": "0.9.14",
+  "generatedAt": "2026-11-25T07:42:03Z",
   "platform": {
     "os": [
       "darwin"
@@ -58,7 +58,7 @@
     {
       "label": "radar",
       "name": "@local/dsh-task-radar",
-      "version": "0.7.0",
+      "version": "0.7.1",
       "description": "桌面任务雷达：跨会话汇总运行中任务的小圆圈 HUD（悬停展开、双击跳转、待批准红色脉冲 + 面板内直接批准/拒绝、点会话行跳回 DSH）",
       "package": "lib/radar/package.json",
       "entry": "lib/radar/index.js",

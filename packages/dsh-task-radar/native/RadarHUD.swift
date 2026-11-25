@@ -384,6 +384,8 @@ private enum L {
         "menu.snooze": ["zh": "隐藏 5 分钟", "en": "Hide for 5 minutes"],
         "menu.topmost": ["zh": "置顶开/关", "en": "Always on top on/off"],
         "panel.clearDone": ["zh": "清除已完成", "en": "Clear done"],
+        "panel.clearEnded": ["zh": "清除已结束", "en": "Clear ended"],
+        "panel.clearFailed": ["zh": "清除失败", "en": "Clear failed"],
         "panel.doneUnread": ["zh": "完成未看", "en": "Done · unread"],
         "panel.empty": ["zh": "暂无任务", "en": "No tasks"],
         "panel.items": ["zh": "%d 项", "en": "%d items"],
@@ -3835,11 +3837,21 @@ private final class PanelContentView: PassthroughView {
         }
     }
 
-    /// 一键清除已完成（t14 bug 4）：没有未读完成时不画按钮，避免空按钮占位。
+    /// 一键清除已结束（t14 bug 4）：没有未读完成时不画按钮，避免空按钮占位。
+    /// 2026-11-25 修：只剩失败行时按钮也必须出现（以前 doneUnread==0 就不画，
+    /// 用户看到「codex 运行失败一直挂在上面」却没有入口）；文案按当前有什么切换。
     private func drawClearDoneButton(in bandRect: NSRect) {
-        guard state.doneUnread > 0, !state.offline, detailMode == .summary else {
+        guard state.doneUnread > 0 || state.failed > 0, !state.offline, detailMode == .summary else {
             clearDoneRect = nil
             return
+        }
+        let clearLabel: String
+        if state.doneUnread > 0 && state.failed > 0 {
+            clearLabel = L.s("panel.clearEnded")
+        } else if state.doneUnread > 0 {
+            clearLabel = L.s("panel.clearDone")
+        } else {
+            clearLabel = L.s("panel.clearFailed")
         }
         let width: CGFloat = 78
         let height: CGFloat = 18
@@ -3859,7 +3871,7 @@ private final class PanelContentView: PassthroughView {
             .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.78),
             .paragraphStyle: centered,
         ]
-        (L.s("panel.clearDone") as NSString).draw(
+        (clearLabel as NSString).draw(
             in: NSRect(x: rect.minX, y: rect.midY - 7, width: rect.width, height: 14),
             withAttributes: attrs)
         clearDoneRect = rect

@@ -4655,8 +4655,35 @@ function radarRoute(ctx) {
         cleared += ids.length
         invalidateSnapshot(ctx)
       }
-      log(`panel clear-done cleared=${cleared} track=${trackCleared} passes=${passes} stuck=${stuck ? 1 : 0}`)
-      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, passes, stuck, snapshotRev }), {
+      // 2026-11-25 用户口径「codex 运行失败就一直显示、清除不了」：老实现只清完成行，
+      // 失败行（adapter 的 settled/process-exited 等）根本没有批量出口，而完成按钮又只在
+      // doneUnread>0 时才画 → 只剩失败行时按钮消失，用户无从下手。这里把 adapter 失败行
+      // 一并写进 hidden-runs / hidden-sessions（与单行「清掉这条」同一账本，永久不再出现）。
+      let failedCleared = 0
+      try {
+        const fresh = await buildRadar(ctx)
+        const failedIds = (Array.isArray(fresh.items) ? fresh.items : [])
+          .filter((item) => item.status === 'failed' && typeof item.id === 'string' && item.id.includes('#'))
+          .map((item) => item.id)
+        if (failedIds.length > 0) {
+          const seenNow = readSeen()
+          const nowMs = Date.now()
+          for (const id of failedIds) {
+            hideRun(id)
+            hideSession(id)
+            seenNow[id] = nowMs
+            failedCleared += 1
+          }
+          try {
+            saveSeen(seenNow)
+          } catch {}
+          invalidateSnapshot(ctx)
+        }
+      } catch (error) {
+        log(`clear-done failed-clear error ${uslice(String(error && error.message ? error.message : error), 120)}`)
+      }
+      log(`panel clear-done cleared=${cleared} track=${trackCleared} failed=${failedCleared} passes=${passes} stuck=${stuck ? 1 : 0}`)
+      return new Response(JSON.stringify({ ok: true, cleared, track: trackCleared, failed: failedCleared, passes, stuck, snapshotRev }), {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
       })
