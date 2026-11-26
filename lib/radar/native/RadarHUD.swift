@@ -6825,6 +6825,27 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
             log("session menu double-click ignored (debounce)")
             return
         }
+        // JUMP-2（2026-11-26 用户现场）：「点击 dumate 的已完成，有时候跳转有时候不动」。
+        // 根因是顺序：外部 agent 的完成行常被折成桶（count>1），而「折叠桶优先展开」排在跳转前面，
+        // 于是第一次点击永远只弹「折叠详情」列表——看起来就是「没反应」；只有未折叠的那次才跳转。
+        // 现在外部 agent 的完成行**主点击就是打开那家 App**（有 dshSession 则跳 DSH），
+        // 看折叠明细改成按 ⌥ 再点（详情能力不丢，只是让位于主路径）。
+        let agentKey = (item.agent ?? "").lowercased()
+        let isExternalAgent = !agentKey.isEmpty && agentKey != "dsh"
+        let optionHeld = event?.modifierFlags.contains(.option) ?? false
+        if isExternalAgent, !optionHeld, item.status == "done" {
+            log("row click external done -> jump agent=\(agentKey) id=\(shortId(item.id ?? ""))")
+            activateExternalRow(item)
+            return
+        }
+        if isExternalAgent, optionHeld, let id = item.id {
+            if (item.count ?? 1) > 1, let folded = item.folded, !folded.isEmpty {
+                openFoldedDetail(item)
+            } else {
+                openDetail(id)
+            }
+            return
+        }
         // R3-H1：折叠桶优先展开——桶里若是 3 条待回答，直接进处置页只会覆盖到代表行那一条。
         if (item.count ?? 1) > 1, let folded = item.folded, !folded.isEmpty {
             openFoldedDetail(item)
@@ -7777,7 +7798,7 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         components.path += "/open-agent"
         components.percentEncodedQueryItems = encodedQueryItems([
             URLQueryItem(name: "agent", value: (item.agent ?? "").lowercased()),
-            URLQueryItem(name: "ref", value: item.sessionRef ?? ""),
+            URLQueryItem(name: "ref", value: externalJumpRef(item)),
         ])
         guard let url = components.url else {
             log("row activate kind=session target=\(agentLabel) result=unsupported reason=bad-url")
@@ -7917,6 +7938,16 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
 
     /// 失败页「复制错误」：完整错误进剪贴板（面板里只显示截断版）。
     /// 别家行要复制的定位串：`sessionRef` + 可选 `questionRef`（t52）。
+    /// 外部 agent 行要交给那家 App 的会话标识：代表行没有 sessionRef 时，
+    /// 从折叠桶里找第一个非空的（折叠桶的代表行只保证「有一条」，不保证条条带 ref）。
+    private func externalJumpRef(_ item: RadarItem) -> String {
+        if let ref = item.sessionRef, !ref.isEmpty { return ref }
+        for entry in item.folded ?? [] {
+            if let ref = entry.sessionRef, !ref.isEmpty { return ref }
+        }
+        return ""
+    }
+
     private func externalRefText(_ item: RadarItem) -> String {
         var parts: [String] = []
         if let ref = item.sessionRef, !ref.isEmpty { parts.append(ref) }

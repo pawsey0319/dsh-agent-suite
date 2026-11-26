@@ -2,6 +2,12 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.18 — 2026-11-26
+
+- 修：DuMate 等外部 agent 的**已完成行**，第一次点击只弹「折叠详情」列表、不进 App（用户「有时候跳转有时候不动」）。根因是折叠桶分支排在跳转之前；现在完成行主点击先跳转，折叠明细改为 ⌥ 再点（`RadarHUD.swift`）。
+- 修：折叠桶代表行缺 `sessionRef` 时，跳转 ref 从 `folded` 里取第一个非空（`externalJumpRef`）。
+- 自检 86/86（新增 JUMP-2 / JUMP-2b 静态守卫）；`dsh-task-radar` 0.7.5。
+
 ## 0.9.17 — 2026-11-25
 
 **成员版本**：`dsh-task-radar` 0.7.4、`dsh-agent-bridge` 0.5.2。
