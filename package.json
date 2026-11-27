@@ -40,7 +40,8 @@
     "cordis.patch.yml",
     "members.json",
     "README.md",
-    "lib/"
+    "lib/",
+    "packages/radar-hud/"
   ],
   "dsh": {
     "manifestVersion": 1,
