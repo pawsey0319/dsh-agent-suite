@@ -8185,6 +8185,9 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     private func closeDetail() {
+        // 详情关掉后不再留着「上一次是哪个条目」：否则后续 DSH 跳转会被旧的外部 agent
+        // 记录带偏（走 open-agent 而不是跳会话）。
+        pendingItem = nil
         guard detail != nil else { return }
         stopLiveDetail()
         log("close detail")
