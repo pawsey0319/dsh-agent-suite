@@ -43,6 +43,21 @@ function uslice(value, count) {
 export const name = 'dsh-task-radar'
 export const inject = ['webServer']
 
+/**
+ * 事件模型版本（R18 / A07「两宿主同一事件模型」）。
+ *
+ * 值必须与 packages/radar-core/src/version.js 的 EVENT_MODEL_VERSION 完全一致
+ * （spec §2.1：两个宿主的 GET /x-radar/health 都必须返回 "eventModel":"1.0.0"）。
+ *
+ * 为什么用本地常量而不是 `import ... from '../../packages/radar-core/src/version.js'`：
+ * 本插件的 release 副本是 release/agent-suite/{lib/radar,packages/dsh-task-radar}/index.js，
+ * 而 release/agent-suite/packages/ 下**没有** radar-core 目录（core 由 agent-radar 独立分发）。
+ * 相对 import 在仓内能跑、在 release 副本里会 ERR_MODULE_NOT_FOUND 直接炸掉整个宿主。
+ * 所以这里固定字面量 + 注明来源，同步口径由 spec §2.1 保证；两边取值不一致时
+ * R18-A07（两条 curl 的 .eventModel 都是 1.0.0）会立刻失败。
+ */
+export const EVENT_MODEL_VERSION = '1.0.0'
+
 const LOG_DIR = '/tmp/dsh-task-radar'
 // DSH_AGENT_BRIDGE_DIR 只给测试/自检用：默认仍是 ~/.dsh/agent-bridge。
 // 有了它，声明式 adapter 的自检才能把 bridge 目录挪到 /tmp，不碰真实用户目录。
@@ -258,7 +273,7 @@ function useHostState(port) {
   log(`state.host port=${port} dir=${dir}`)
   return dir
 }
-const HUD_BIN = join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'native', 'RadarHUD')
+const HUD_BIN = fileURLToPath(new URL('../../packages/radar-hud/RadarHUD', import.meta.url))
 const PREFERRED = ['/x-radar', '/x-radar-b', '/x-radar-c', '/x-radar-d']
 
 // 日志轮转（t5 F-05）：beacon.log 单文件超过 10MB 就滚成 .1/.2/.3，最多留三份。
@@ -1459,6 +1474,10 @@ function dshQuestionItems(ctx, sessions) {
       status: 'needs-answer',
       updatedAt: Number(tap?.at ?? nowMs),
       // 被接管才有回执通道：HUD 拿这组字段直接提交，字段缺失=只能提醒（回 DSH 里答）。
+      // answerChannel 是给 HUD 的**动作路由**：inline=就地作答；jump=只能跳回原窗口答。
+      // 没有这个字段时 HUD 只能猜，猜错就把「回答」发成 approval-decide（真机 bug：
+      // claude 行显示「服务端未确认，已本地关闭」，DSH 行则静默丢弃用户输入）。
+      answerChannel: held === undefined ? 'jump' : 'inline',
       ...(held === undefined ? {} : {
         answerRequest: held.requestId,
         answerToken: held.token,
@@ -3050,6 +3069,11 @@ function adapterItem(event) {
       // 有回执通道才「就地可答」；没有就只能是「回原工具里答」。
       answerRequest: event.answerRequest,
       answerToken: event.answerToken,
+      // 除 DSH 外没有一家实现 answer()（见 registerAdapter 的 capabilities），
+      // 所以 adapter 行永远只能 jump：HUD 据此把「✎ 回答…」换成「回 <Agent> 里答」，
+      // 而不是拿一个空的 approval id 去打 approval-decide（真机 bug）。
+      answerChannel: typeof event.answerRequest === 'string' && event.answerRequest !== '' ? 'inline' : 'jump',
+      agentLabel: adapterRegistry.get(String(event.agent))?.label ?? String(event.agent ?? ''),
       dedupKey: `${id}#needs-input`,
       questions: event.options === undefined
         ? undefined
@@ -3989,6 +4013,9 @@ async function buildRadar(ctx) {
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
+    // R18-A07 的姊妹项（spec §3.3 的 RadarPayload 键集含 eventModel；t5 H-3 要求 feed 顶层一并补）。
+    // 增量键：HUD 的 RadarPayload 解码按缺失键兜底、多余键忽略，客户端与 t43 的 86 条回归都不受影响。
+    eventModel: EVENT_MODEL_VERSION,
     counts,
     // 与 items 里的 done 行一一对应（t22 / B-4 口径一致）；折叠行只保留代表 id（行上有 count）。
     doneUnreadIds,
@@ -4285,6 +4312,9 @@ function radarRoute(ctx) {
       const clientLive = hasLiveWebClient(ctx) === true
       return new Response(JSON.stringify({
         ok: true,
+        // R18-A07：两个宿主的 health 必须报同一个事件模型版本（spec §2.1 / §3.4）。
+        // 这是本次唯一新增的键，其余键与历史响应逐字不动（HUD / 门禁都只认增量）。
+        eventModel: EVENT_MODEL_VERSION,
         clientLive,
         clientHalf,
         host: { port: STATE_PORT ?? null, dir: STATE_DIR, clientBuild: CLIENT_BUILD || null },

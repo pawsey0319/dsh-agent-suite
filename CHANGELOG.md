@@ -2,6 +2,13 @@
 
 整合包 `@pawsey0319/dsh-agent-suite`。逐条对应可验证的行为与证据位置，不写「优化体验」这类无法核对的话。
 
+## 0.9.19 — 2026-11-27
+
+- 修：**待批准/等回答点「回答」后提示「服务端未确认，已本地关闭」**（用户现场）。根因是 HUD 的自由回答入口不问渠道，最后一律走 `decideApproval()`；外部 agent 行没有 approval id，请求到服务端就是 `missing id`。现在按服务端下发的 `answerChannel` 路由：`inline` 才就地作答，`jump` 直接换成「回 <Agent> 里答」按钮并打开那家的 App（同时复制问题 ref）。
+- 修：**DSH 等回答在胶囊里输入答案后 DSH 不响应**（用户现场）。根因同上：文本被送进 approval-decide 后静默丢弃。被接管的 DSH 提问（`answerChannel=inline`）现在走 `/x-radar/question-answer` 的数组回执；未接管（DSH 桌面卡是权威入口）时按钮变成「回 DSH 里答」，点击直接跳到对应会话。
+- 补：`plugins/dsh-task-radar` 的 adapter 提问行与 DSH 提问行都下发 `answerChannel` / `agentLabel`；HUD 缺省按 `jump` 处理，宁可说清楚也不发一个必然失败的请求。
+- 自检 91/91（新增 ANS-1…ANS-5 静态守卫，含「自由回答不得再走 approval-decide」与「空 approval id 不再发请求」）；`dsh-task-radar` 0.7.6。
+
 ## 0.9.18 — 2026-11-26
 
 - 修：DuMate 等外部 agent 的**已完成行**，第一次点击只弹「折叠详情」列表、不进 App（用户「有时候跳转有时候不动」）。根因是折叠桶分支排在跳转之前；现在完成行主点击先跳转，折叠明细改为 ⌥ 再点（`RadarHUD.swift`）。

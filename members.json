@@ -1,8 +1,8 @@
 {
   "manifestVersion": 1,
   "name": "@pawsey0319/dsh-agent-suite",
-  "version": "0.9.18",
-  "generatedAt": "2026-11-26T08:09:54Z",
+  "version": "0.9.19",
+  "generatedAt": "2026-11-27T08:50:51Z",
   "platform": {
     "os": [
       "darwin"
@@ -20,9 +20,9 @@
     "route": "/agent-suite/health"
   },
   "native": {
-    "hud": "lib/radar/native/RadarHUD",
-    "source": "lib/radar/native/RadarHUD.swift",
-    "build": "lib/radar/native/build.sh"
+    "hud": "packages/radar-hud/RadarHUD",
+    "source": "packages/radar-hud/RadarHUD.swift",
+    "build": "packages/radar-hud/build.sh"
   },
   "members": [
     {
@@ -58,7 +58,7 @@
     {
       "label": "radar",
       "name": "@local/dsh-task-radar",
-      "version": "0.7.5",
+      "version": "0.7.6",
       "description": "桌面任务雷达：跨会话汇总运行中任务的小圆圈 HUD（悬停展开、双击跳转、待批准红色脉冲 + 面板内直接批准/拒绝、点会话行跳回 DSH）",
       "package": "lib/radar/package.json",
       "entry": "lib/radar/index.js",

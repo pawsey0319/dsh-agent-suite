@@ -1,0 +1,1 @@
+{"name":"@pawsey0319/radar-hud","version":"1.0.0","private":true,"type":"module","os":["darwin"],"cpu":["arm64"],"files":["RadarHUD","RadarHUD.swift","build.sh","README.md"]}

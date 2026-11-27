@@ -264,6 +264,8 @@ private enum L {
         "action.submit": ["zh": "✓ 提交答案", "en": "✓ Submit"],
         "alert.answerHead": ["zh": "回答：%@", "en": "Answer: %@"],
         "alert.answerInDsh": ["zh": "本次只能在 DSH 里回答", "en": "It can only be answered in DSH this time"],
+        "alert.answerInApp": ["zh": "请回 %@ 里回答", "en": "Answer in %@"],
+        "alert.answerInAppHint": ["zh": "胶囊没拿到这条提问的回执通道，输入不会送达；已打开能回答的地方", "en": "The capsule has no receipt channel for this question; your input would not be delivered"],
         "alert.answerNth": ["zh": "回答 %d/%d", "en": "Answer %d/%d"],
         "alert.answerOne": ["zh": "回答这个提问", "en": "Answer this question"],
         "alert.backToDsh": ["zh": "回 DSH 里回答", "en": "Answer in DSH"],
@@ -709,6 +711,12 @@ private struct RadarItem: Decodable {
     var answerRequest: String?
     var answerToken: String?
     var answerExpiresInMs: Int?
+    /// 服务端给的动作路由：inline=就地作答；jump=只能跳回原窗口答（缺省按 jump）。
+    /// 以前没有这个字段，HUD 只能猜——真机 bug：claude 行把「回答」发成 approval-decide
+    /// （服务端回 missing id，界面弹「服务端未确认，已本地关闭」），DSH 行则把输入静默丢掉。
+    var answerChannel: String?
+    /// 外部 agent 的显示名（用于「回 Codex 里答」这类提示）。
+    var agentLabel: String?
     /// 详情页的阶段/起止时间（R-16：以前声明了却从不解码）。
     var stages: [RadarStage]?
     var startedAt: Double?
@@ -2057,6 +2065,12 @@ private final class PanelContentView: PassthroughView {
     var questionChoices: [(questionId: String, label: String)] = []
     /// 当前详情是不是「提问」类（无选项时把底部按钮换成「回复 / 取消」）。
     var isQuestionDetail = false
+    /// 这条提问能不能在胶囊里就地作答（服务端 answerChannel=inline）。
+    /// false 时底部不给「回答」——给了也只会把输入丢掉（真机 bug：DSH 不响应、
+    /// 「服务端未确认，已本地关闭」），改成「回 X 里答」直接跳过去。
+    var answersInlineAllowed = true
+    /// 不能就地作答时底部按钮的文案（`回 Claude Code 里答`）。
+    var answerJumpLabel = ""
     /// 无选项提问时用来回执的 question id（取第一个问题的 id）。
     var questionIdFallback: String?
     /// 提问页按「问题」分组渲染：每个问题先出正文，再出它自己的选项芯片；
@@ -3102,9 +3116,17 @@ private final class PanelContentView: PassthroughView {
             drawFooterButton(text: L.s("action.cancelCross"), align: .left, action: .reject,
                              color: NSColor.white.withAlphaComponent(0.95),
                              background: NSColor.systemRed.withAlphaComponent(0.72))
-            drawFooterButton(text: L.s("action.answer"), align: .right, action: .confirmAnswer,
-                             color: NSColor.white.withAlphaComponent(0.98),
-                             background: NSColor.systemBlue.withAlphaComponent(0.72))
+            if answersInlineAllowed {
+                drawFooterButton(text: L.s("action.answer"), align: .right, action: .confirmAnswer,
+                                 color: NSColor.white.withAlphaComponent(0.98),
+                                 background: NSColor.systemBlue.withAlphaComponent(0.72))
+            } else {
+                // 没有回执通道：不假装能答，直接把用户送到真正能回答的地方。
+                drawFooterButton(text: answerJumpLabel.isEmpty ? L.s("row.qBackToDsh") : answerJumpLabel,
+                                 align: .right, action: .jumpSession,
+                                 color: NSColor.white.withAlphaComponent(0.98),
+                                 background: NSColor.systemBlue.withAlphaComponent(0.72))
+            }
             return
         }
         // U-21/U-53：原地完成 + 1.5s 内变「已批准 / 已拒绝」，并且审批不可撤销要说清。
@@ -4050,6 +4072,10 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 当前审批视图对应的桥内审批 id（点击批准/拒绝时用）。
     private var pendingApprovalId: String?
     /// DSH 会话内提问的就地回执（plugin 接管后才给 requestId/token）。
+    private var pendingAnswerChannel: String?
+    /// 当前审批/提问视图对应的原始条目（外部 agent 的「回 X 里答」要用它开 App）。
+    private var pendingItem: RadarItem?
+    private var pendingAgentLabel: String?
     private var pendingAnswerRequest: String?
     private var pendingAnswerToken: String?
     private var pendingAnswerQuestionId: String?
@@ -6446,6 +6472,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
                         closeDetail()
                     case .jumpSession:
                         log("jump session click target=\(detail?.jumpSessionId ?? "-") run=\(detail?.runId ?? "-")")
+                        // 外部 agent 的提问：DSH 没有这条会话可跳，改为打开它自己的 App 并复制 ref。
+                        if let item = pendingItem, (item.agent ?? "dsh") != "dsh" {
+                            log("jump session -> external agent=\(item.agent ?? "-")")
+                            closeDetail()
+                            activateExternalRow(item)
+                            return
+                        }
                         let target = detail?.jumpSessionId.isEmpty == false
                             ? (detail?.jumpSessionId ?? "")
                             : (detail?.runId ?? "")
@@ -6915,6 +6948,13 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         pendingApprovalToken = item.approvalToken
         pendingQuestions = item.questions ?? []
         // 会话内提问被插件接管时才有回执通道（requestId + 一次性 token）。
+        pendingItem = item
+        pendingAnswerChannel = item.answerChannel
+        pendingAgentLabel = item.agentLabel
+        // 缺省按 jump 处理：宁可说「回原工具里答」，也不要把输入发到一个必然失败的口子。
+        let inline = (item.answerChannel ?? (item.answerRequest == nil ? "jump" : "inline")) == "inline"
+        panelContent?.answersInlineAllowed = inline
+        panelContent?.answerJumpLabel = L.f("alert.answerInApp", item.agentLabel ?? "原工具")
         pendingAnswerRequest = item.answerRequest
         pendingAnswerToken = item.answerToken
         pendingAnswerQuestionId = (item.questions ?? []).first?.id
@@ -7033,9 +7073,23 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     /// 多问题逐个输入；任何一次取消都整体放弃，绝不半提交。
     /// 边界：这是 HUD 内的轻量输入，不支持多行富文本；需要长答案请在会话里回答。
     private func promptAnswers() {
-        if pendingAnswerRequest != nil {
-            log("prompt blocked: dsh question is answered in place only")
-            _ = showBanner(title: L.s("alert.freeTextOnly"), body: L.s("alert.answerInDsh"), onClick: nil)
+        // 动作路由：inline=就地作答（只有被接管的 DSH 提问有回执通道）；jump=只能回原窗口答。
+        // 真机 bug（2026-11-27）：这里以前不问渠道，最后一律 decideApproval()——
+        // claude 行拿空 approval id 打 approval-decide（服务端 missing id → 「服务端未确认」），
+        // DSH 行则直接丢弃用户刚输入的文本（用户看到「DSH 不响应」）。
+        let channel = pendingAnswerChannel ?? (pendingAnswerRequest == nil ? "jump" : "inline")
+        guard channel == "inline", let request = pendingAnswerRequest, let token = pendingAnswerToken else {
+            let label = pendingAgentLabel ?? "原工具"
+            log("free-answer blocked channel=\(channel) agent=\(label)")
+            if let approvalId = pendingApprovalId, approvalId.hasPrefix("question:") {
+                let sessionId = String(approvalId.dropFirst("question:".count))
+                if !sessionId.isEmpty {
+                    log("free-answer redirect: jump to dsh session \(sessionId.prefix(12))")
+                    jumpToSession(sessionId)
+                    return
+                }
+            }
+            _ = showBanner(title: L.f("alert.answerInApp", label), body: L.s("alert.answerInAppHint"), onClick: nil)
             return
         }
         let asks = pendingQuestions
@@ -7060,7 +7114,14 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
         }
         guard !collected.isEmpty else { return }
         log("question free-text answered count=\(collected.count) keys=\(collected.keys.sorted().joined(separator: ","))")
-        decideApproval(approve: true, answers: collected)
+        let entries: [(id: String, selected: [String], custom: String?)] = collected
+            .sorted { lhs, rhs in
+                let li = answerOrder.firstIndex(of: lhs.key) ?? Int.max
+                let ri = answerOrder.firstIndex(of: rhs.key) ?? Int.max
+                return li < ri
+            }
+            .map { (id: $0.key, selected: [], custom: $0.value) }
+        submitAnswer(request: request, token: token, entries: entries)
     }
 
     /// 一次单行文本输入（NSAlert + accessory NSTextField）。取消返回 nil。
@@ -7261,7 +7322,12 @@ private final class HUDController: NSObject, NSApplicationDelegate, NSMenuDelega
     }
 
     private func decideApproval(approve: Bool, answers: [String: String]? = nil) {
-        guard let approvalId = pendingApprovalId else { return }
+        // 空 id 以前会真的发出 approval-decide?id=，服务端只能回 missing id。
+        guard let approvalId = pendingApprovalId, !approvalId.isEmpty else {
+            log("approval decide blocked: empty approval id")
+            _ = showBanner(title: L.s("alert.onlyInDsh"), body: L.s("alert.noChannel"), onClick: nil)
+            return
+        }
         // 会话内提问（feed 里 source=dsh）没有桥审批对象：面板只能展示，回执必须回到 DSH 界面。
         // 不拦的话点「回答/批准」会拿 question:<sessionId> 去打 approval-decide → 桥 404 → 假失败。
         if approvalId.hasPrefix("question:") {

@@ -18,7 +18,7 @@
 - 单实例、位置持久化、SIGTERM/SIGINT 清理 pid
 
 对应需求：`docs/PRD.md` R3（任务雷达）的桌面悬浮形态扩展。本文档只覆盖
-`plugins/dsh-task-radar/native/` 下的独立进程，不改动插件其它文件。
+`packages/radar-hud/` 下的独立进程，DSH 插件与 agent-radar 共用同一份源码与二进制。
 
 ## 文件
 
@@ -31,7 +31,7 @@
 ## 构建
 
 ```bash
-cd plugins/dsh-task-radar/native
+cd packages/radar-hud
 bash build.sh
 ```
 
@@ -227,9 +227,9 @@ window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationar
 ### 1. 编译
 
 ```text
-$ cd plugins/dsh-task-radar/native && bash build.sh
+$ cd packages/radar-hud && bash build.sh
 ==> swiftc -O -framework AppKit RadarHUD.swift -o RadarHUD
-==> built: .../plugins/dsh-task-radar/native/RadarHUD
+==> built: .../packages/radar-hud/RadarHUD
 $ file RadarHUD
 RadarHUD: Mach-O 64-bit executable arm64
 ```
@@ -451,7 +451,7 @@ another RadarHUD instance is running, exit 0
 spawn(RadarHUDPath, ['--url', 'auto', '--interval', '2'], { detached: true, stdio: 'ignore' }).unref()
 ```
 
-`RadarHUDPath` 建议为 `<workspace>/plugins/dsh-task-radar/native/RadarHUD`；插件每次
+`RadarHUDPath` 建议为 `<workspace>/packages/radar-hud/RadarHUD`；插件每次
 apply 时同时写 `~/.dsh/agent-bridge/radar-url.json`（`url` + `port` + `updatedAt`），
 HUD 会在下一轮自动切换端口。若插件更愿意传显式 URL，`--url http://127.0.0.1:<port>/x-radar/radar`
 同样可用（端口变化时需重启 HUD）。
